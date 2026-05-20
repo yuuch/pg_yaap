@@ -1,0 +1,107 @@
+name: pg_yaap CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          meson \
+          ninja-build \
+          pkg-config \
+          libreadline-dev \
+          zlib1g-dev \
+          libssl-dev \
+          libxml2-dev \
+          libxslt1-dev \
+          libperl-dev \
+          python3-dev \
+          tcl-dev \
+          wget \
+          gnupg \
+          lsb-release \
+          libicu-dev \
+          bison \
+          flex \
+          git
+
+    - name: Install LLVM toolchain from official apt (try highest available)
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        VERSIONS="24 23 22 21 20 19 18 17 16 15 14 13"
+        LLVM_INSTALLED=""
+        for v in $VERSIONS; do
+          echo "Attempting LLVM $v"
+          wget -q -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh $v || { echo "Install script failed for $v"; continue; }
+          sudo apt-get update
+          if sudo apt-get install -y "clang-$v" "clang++-$v"; then
+            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$v 100
+            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-$v 100
+            LLVM_INSTALLED=$v
+            break
+          fi
+        done
+        if [ -z "$LLVM_INSTALLED" ]; then
+          echo "Failed to install any LLVM version" >&2
+          exit 1
+        fi
+        echo "Installed LLVM $LLVM_INSTALLED"
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "CXX=clang++" >> $GITHUB_ENV
+        echo "LLVM_VERSION=$LLVM_INSTALLED" >> $GITHUB_ENV
+
+    - name: Checkout PostgreSQL
+      run: |
+        git clone https://github.com/postgres/postgres.git
+        cd postgres
+        git checkout REL_18_3
+
+    - name: Build and Install PostgreSQL
+      run: |
+        cd postgres
+        meson setup build \
+          --prefix=$GITHUB_WORKSPACE/pg_install \
+          -Dllvm=enabled \
+          -Dicu=enabled \
+          -Dreadline=enabled \
+          -Dbuildtype=release
+        ninja -C build install
+
+    - name: Build and Install pg_yaap
+      run: |
+        # Make pg_config available so Meson can query the installation paths
+        export PATH=$GITHUB_WORKSPACE/pg_install/bin:$PATH
+        
+        # Build out-of-tree standalone
+        meson setup build -Dbuildtype=release
+        
+        # Install into the PostgreSQL installation discovered via pg_config
+        ninja -C build install
+
+    - name: Run smoke test
+      run: |
+        export PATH=$GITHUB_WORKSPACE/pg_install/bin:$PATH
+        
+        # Initialize a temporary database for testing
+        initdb -D test_db
+        pg_ctl -D test_db -l log start
+        sleep 2
+        
+        # Load extension and display a configuration parameter to verify it works
+        psql -d postgres -c "LOAD 'pg_yaap'; SHOW pg_yaap.enabled;"
+        
+        pg_ctl -D test_db stop

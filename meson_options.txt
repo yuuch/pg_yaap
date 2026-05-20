@@ -1,0 +1,13 @@
+option(
+  'pg_config',
+  type: 'string',
+  value: 'pg_config',
+  description: 'Path to the PostgreSQL pg_config binary to build against',
+)
+
+option(
+  'llvm_config',
+  type: 'string',
+  value: '',
+  description: 'Optional path to llvm-config; required when pg_config.h enables USE_LLVM',
+)
