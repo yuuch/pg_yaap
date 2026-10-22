@@ -44,8 +44,6 @@ public:
 	HashAggSharedPayload *payload = nullptr;
 	HashAggPartition     *partitions = nullptr;
 	uint32_t              partition_count = 0;
-	uint32_t              source_partition = 0;
-	uint32_t              source_cursor = 0;
 	bool                  finalized = false;
 };
 
@@ -56,6 +54,7 @@ public:
 	 * radix partition before dedupe/update. */
 	dsa_pointer          local_partitions_dp = InvalidDsaPointer;
 	HashAggPartition    *local_partitions = nullptr;
+	PgVector<buffer::YaapSegmentedTdc> segmented_writers;
 	const TupleDataLayout *layout = nullptr;
 	dsa_pointer          layout_dp = InvalidDsaPointer;
 	uint32_t             partition_count = 0;
@@ -77,6 +76,9 @@ public:
 class HashAggLocalSourceState final : public LocalSourceState {
 public:
 	bool initialized = false;
+	uint32_t source_partition = UINT32_MAX;
+	uint32_t source_cursor = 0;
+	dsa_pointer source_segment_desc_dp = InvalidDsaPointer;
 };
 
 class HashAggOperatorState final : public OperatorState {

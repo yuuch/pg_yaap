@@ -36,6 +36,7 @@ extern "C" {
 #include "parallel/pipeline/physical_filter.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
+#include "parallel/pipeline/physical_hash_join_probe.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/physical_order.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
@@ -366,6 +367,14 @@ EmitHashJoin(const PhysicalHashJoin &op, OpDescriptor &out)
 }
 
 static void
+EmitHashJoinProbe(const PhysicalHashJoinProbe &op, OpDescriptor &out)
+{
+	EmitHashJoin(op.join(), out);
+	out.kind = OpKind::HASH_JOIN_PROBE;
+	out.body.hash_join.probe_shared_payload = InvalidDsaPointer;
+}
+
+static void
 EmitCrossProduct(const PhysicalCrossProduct &op, OpDescriptor &out)
 {
 	out.kind = OpKind::CROSS_PRODUCT;
@@ -552,7 +561,9 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 		}
 
 		case OpKind::HASH_JOIN:
-			return std::make_unique<PhysicalHashJoin>(
+		case OpKind::HASH_JOIN_PROBE:
+		{
+			auto join = std::make_unique<PhysicalHashJoin>(
 				op.body.hash_join.left_input_schema,
 				op.body.hash_join.right_input_schema,
 				op.body.hash_join.output_schema,
@@ -577,6 +588,11 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.hash_join.n_right_keys,
 				op.body.hash_join.max_rows,
 				const_cast<OpDescriptor *>(&op));
+			if (op.kind == OpKind::HASH_JOIN_PROBE)
+				return std::make_unique<PhysicalHashJoinProbe>(
+					std::move(join), const_cast<OpDescriptor *>(&op));
+			return join;
+		}
 
 		case OpKind::CROSS_PRODUCT:
 			return std::make_unique<PhysicalCrossProduct>(
@@ -664,6 +680,11 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 			case PhysicalOperatorType::PROJECTION:
 				EmitProjection(static_cast<const PhysicalProjection &>(*pipeline.source), ops[idx++], dsa);
 				break;
+			case PhysicalOperatorType::HASH_JOIN_PROBE:
+				EmitHashJoinProbe(static_cast<const PhysicalHashJoinProbe &>(*pipeline.source), ops[idx]);
+				static_cast<PhysicalHashJoinProbe &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
+				break;
 			case PhysicalOperatorType::HASH_JOIN:
 				EmitHashJoin(static_cast<const PhysicalHashJoin &>(*pipeline.source), ops[idx]);
 				static_cast<PhysicalHashJoin &>(*pipeline.source).AttachDescriptor(&ops[idx]);
@@ -699,6 +720,11 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 					static_cast<PhysicalHashJoin *>(mid)->AttachDescriptor(&ops[idx]);
 					idx++;
 					break;
+				case PhysicalOperatorType::HASH_JOIN_PROBE:
+					EmitHashJoinProbe(static_cast<const PhysicalHashJoinProbe &>(*mid), ops[idx]);
+					static_cast<PhysicalHashJoinProbe *>(mid)->AttachDescriptor(&ops[idx]);
+					idx++;
+					break;
 				case PhysicalOperatorType::CROSS_PRODUCT:
 					EmitCrossProduct(static_cast<const PhysicalCrossProduct &>(*mid), ops[idx]);
 					static_cast<PhysicalCrossProduct *>(mid)->AttachDescriptor(&ops[idx]);
@@ -727,6 +753,10 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 			case PhysicalOperatorType::OUTPUT:
 				EmitOutput(static_cast<const OutputSink &>(*pipeline.sink), ops[idx]);
 				static_cast<OutputSink &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
+				break;
+			case PhysicalOperatorType::HASH_JOIN_PROBE:
+				EmitHashJoinProbe(static_cast<const PhysicalHashJoinProbe &>(*pipeline.sink), ops[idx]);
+				static_cast<PhysicalHashJoinProbe &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
 				break;
 			case PhysicalOperatorType::HASH_JOIN:
 				EmitHashJoin(static_cast<const PhysicalHashJoin &>(*pipeline.sink), ops[idx]);
@@ -862,6 +892,20 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 				output->desc()->body.output.shared_payload = payload_dp;
 			break;
 		}
+		case PhysicalOperatorType::HASH_JOIN_PROBE:
+		{
+			const auto *probe = static_cast<const PhysicalHashJoinProbe *>(op);
+			bool stored = false;
+			for (OpDescriptor *desc : probe->descs())
+				if (desc != nullptr)
+				{
+					desc->body.hash_join.probe_shared_payload = payload_dp;
+					stored = true;
+				}
+			if (!stored && probe->desc() != nullptr)
+				probe->desc()->body.hash_join.probe_shared_payload = payload_dp;
+			break;
+		}
 		case PhysicalOperatorType::HASH_JOIN:
 		{
 			const auto *join = static_cast<const PhysicalHashJoin *>(op);
@@ -945,6 +989,11 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 		{
 			OpDescriptor *desc = static_cast<const OutputSink *>(op)->desc();
 			return desc != nullptr ? desc->body.output.shared_payload : InvalidDsaPointer;
+		}
+		case PhysicalOperatorType::HASH_JOIN_PROBE:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalHashJoinProbe *>(op)->desc();
+			return desc != nullptr ? desc->body.hash_join.probe_shared_payload : InvalidDsaPointer;
 		}
 		case PhysicalOperatorType::HASH_JOIN:
 		{

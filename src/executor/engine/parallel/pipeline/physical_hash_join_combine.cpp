@@ -8,6 +8,8 @@ extern "C" {
 #include <cstring>
 
 #include "core/data_chunk.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
+#include "buffer_manager/yaap_buffer_shared.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
@@ -250,7 +252,8 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 			? ComputeHashTableCapacity(static_cast<uint32_t>(total_rows))
 			: 0u;
 
-		SpinLockAcquire(&payload->mutex);
+		/* combine_prepare_state elects exactly one preparer; followers wait
+		 * for state 2 below. No allocation needs the payload spinlock. */
 		EnsureEmptyJoinGlobalCapacity(ctx,
 			global.build_key_layout,
 			global.build_key_layout_dp,
@@ -274,6 +277,15 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 		}
 		if (static_cast<uint32_t>(total_rows) > 0)
 		{
+			const uint64_t directory_bytes = static_cast<uint64_t>(payload->hash_table_capacity) *
+				sizeof(uint32_t) + total_rows * (2 * sizeof(uint32_t) + sizeof(uint16_t));
+			auto *buffer_state = ctx.control != nullptr &&
+				DsaPointerIsValid(ctx.control->buffer_state_root)
+				? static_cast<buffer::YaapBufferSharedState *>(
+					dsa_get_address(ctx.dsa, ctx.control->buffer_state_root)) : nullptr;
+			buffer::YaapBufferChargeExternalBytes(buffer_state, directory_bytes,
+				"hash join combine directory");
+			payload->directory_charged_bytes += directory_bytes;
 			payload->hash_table_dp = dsa_allocate(ctx.dsa,
 				static_cast<size_t>(payload->hash_table_capacity) * sizeof(uint32_t));
 			payload->hash_buckets_dp = dsa_allocate(ctx.dsa,
@@ -286,7 +298,6 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 				0xFF,
 				static_cast<size_t>(payload->hash_table_capacity) * sizeof(uint32_t));
 		}
-		SpinLockRelease(&payload->mutex);
 
 		payload->combined_row_count = static_cast<uint32_t>(total_rows);
 		payload->combined_key_heap_used = static_cast<uint32_t>(total_key_heap);

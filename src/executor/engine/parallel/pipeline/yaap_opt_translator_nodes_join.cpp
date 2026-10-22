@@ -295,6 +295,10 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	{
 		return false;
 	}
+	if (pg_yaap_trace_hooks)
+		elog(LOG, "pg_yaap: hash join extracted keys left=%zu right=%zu residuals=%zu left_cols=%zu right_cols=%zu",
+			left_keys.size(), right_keys.size(), residuals.size(),
+			left_child.cols.size(), right_child.cols.size());
 	const size_t left_rows = join.children[0] != nullptr ? join.children[0]->estimated_cardinality : 0;
 	const size_t right_rows = join.children[1] != nullptr ? join.children[1]->estimated_cardinality : 0;
 	const bool left_scalar = IsScalarPhysicalNode(join.children[0].get());

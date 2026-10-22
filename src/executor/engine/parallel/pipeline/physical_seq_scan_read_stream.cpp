@@ -26,13 +26,25 @@ ParallelScanBlockCount(const ParallelBlockTableScanDesc pbscan)
 }
 
 static uint32_t
-ComputeAggressiveChunkSize(BlockNumber scan_nblocks, uint32_t default_chunk_size)
+ComputeAggressiveChunkSize(BlockNumber scan_nblocks, uint32_t default_chunk_size, uint32_t workers)
 {
 	uint32_t aggressive = pg_nextpower2_32(std::max<uint32_t>(scan_nblocks / kYaapParallelSeqScanChunkDivisor, 1u));
 	aggressive = std::max(aggressive, default_chunk_size);
 	aggressive = std::max(aggressive, static_cast<uint32_t>(io_combine_limit) * 64u);
 	aggressive = std::max(aggressive, kYaapParallelSeqScanMinChunkSize);
 	aggressive = std::min(aggressive, kYaapParallelSeqScanMaxChunkSize);
+	/* The allocation chunk is worker-owned work, not the ReadStream I/O
+	 * quota. Keep at least four chunks per worker on smaller relations so
+	 * early scanners cannot reserve the entire probe side (Q13 customer).
+	 * Retain combine-sized sequential runs and PG's tail ramp-down. */
+	const uint32_t balanced = pg_prevpower2_32(static_cast<uint32_t>(
+		std::max<uint64_t>(1, scan_nblocks / (4ull * std::max(1u, workers)))));
+	const uint32_t balance_limit = std::max(balanced, static_cast<uint32_t>(io_combine_limit));
+	/* Tiny relations cannot provide four combine-sized runs per worker.
+	 * Keep their previous sequential allocation rather than multiplying
+	 * downstream per-producer partition tails for a few hundred pages. */
+	if (scan_nblocks / (4ull * std::max(1u, workers)) >= static_cast<uint32_t>(io_combine_limit))
+		aggressive = std::min(aggressive, balance_limit);
 	aggressive = std::min(aggressive, static_cast<uint32_t>(std::max<BlockNumber>(scan_nblocks, 1)));
 	return aggressive;
 }
@@ -94,7 +106,7 @@ PgYaapSeqScanReadNextParallel(ReadStream *stream,
 		                                         pbscanwork,
 		                                         pbscan);
 		pbscanwork->phsw_chunk_size = ComputeAggressiveChunkSize(scan_nblocks,
-		                                                         pbscanwork->phsw_chunk_size);
+		                                                         pbscanwork->phsw_chunk_size, state->worker_count);
 		scan->rs_inited = true;
 		if (state->trace_enabled)
 		{
@@ -132,6 +144,7 @@ InstallAggressiveParallelSeqScanReadStream(HeapScanDesc scan,
                                            Relation rel,
                                            SeqScanReadStreamState &state,
                                            int worker_index,
+                                           uint32_t worker_count,
                                            bool trace_enabled)
 {
 	Assert(scan != nullptr);
@@ -148,6 +161,7 @@ InstallAggressiveParallelSeqScanReadStream(HeapScanDesc scan,
 
 	state.scan = scan;
 	state.worker_index = worker_index;
+	state.worker_count = std::max(1u, worker_count);
 	state.trace_enabled = trace_enabled;
 	state.chunk_sequence = 0;
 

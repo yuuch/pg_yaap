@@ -47,7 +47,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 
 ## GUCs (defined in `pg_yaap.c::_PG_init`)
 
-9 GUCs are registered. All are `PGC_USERSET`.
+12 GUCs are registered. All are `PGC_USERSET`.
 
 | GUC | Default | Range | Purpose |
 |-----|---------|-------|---------|
@@ -61,6 +61,9 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 | `pg_yaap.parallel_leader_participation` | `true` | bool | Leader runs pipeline tasks alongside workers. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | `false` | bool | Reserved; **no effect in greenfield** (HashJoin removed). Kept registered to avoid breaking existing config files. |
 | `pg_yaap.profile` | `false` | bool | Emit per-stage pipeline timing after each offloaded query. Fine-grained scan stages add visible overhead; use for diagnosis, not benchmark timing. |
+| `pg_yaap.hash_join_partition_probe` | `true` | bool | Stream rows for the resident Build batch directly; partition and spill deferred Probe rows for matching later batches. Only equality-key joins use this path. Off retains the non-hybrid YAAP path for controlled comparisons. |
+| `pg_yaap.memory_limit` | `256MB` | 64MB–`INT_MAX` bytes | Hard shared breaker-payload budget; DSA can reserve up to 50% (capped at 4GB) additional metadata/allocator space. |
+| `pg_yaap.memory_soft_limit` | `-1` | -1–`INT_MAX` bytes | Spill threshold; `-1` uses 75% of `memory_limit`. |
 
 `pg_yaap.parallel_morsel_nblocks` is no longer registered. The active SeqScan
 path uses an atomic block pool consumed by each worker's local read stream

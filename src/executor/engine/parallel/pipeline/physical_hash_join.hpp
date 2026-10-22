@@ -9,6 +9,8 @@ extern "C" {
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
+#include "buffer_manager/yaap_spill_store.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -44,6 +46,15 @@ public:
 	const TupleDataLayout *build_layout = nullptr;
 	TupleDataCollection   *build_keys = nullptr;
 	TupleDataCollection   *build_rows = nullptr;
+	buffer::YaapSegmentedTdc key_segmented;
+	buffer::YaapSegmentedTdc row_segmented;
+	PgVector<buffer::YaapSegmentedTdc> partition_key_segmented;
+	PgVector<buffer::YaapSegmentedTdc> partition_row_segmented;
+	dsa_pointer partition_state_dp = InvalidDsaPointer;
+	dsa_pointer key_refs_dp = InvalidDsaPointer;
+	dsa_pointer row_refs_dp = InvalidDsaPointer;
+	bool segmented_writer_initialized = false;
+	uint32_t spill_scan_ticks = 0;
 	uint64_t build_input_rows = 0;
 };
 
@@ -161,10 +172,19 @@ public:
 	SinkResultType                  SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
 	SinkCombineResultType           Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
 	SinkFinalizeType                Finalize(ExecCtx &ctx, GlobalSinkState &gstate) override;
+	SinkFinalizeType                FinalizePartition(ExecCtx &ctx,
+										 GlobalSinkState &gstate,
+										 uint32_t partition_id);
 
 	std::unique_ptr<OperatorState> GetOperatorState(ExecCtx &ctx) override;
+	void SetProbeBatch(OperatorState &state, dsa_pointer batch_dp);
+	void BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t partition_id);
 	OperatorResultType Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state) override;
 	void ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx);
+	void ReleaseBuildPayloadAtQueryEnd(ExecCtx &ctx);
+	bool EvictUnusedBuildSegment(ExecCtx &ctx, const buffer::YaapSegmentHandle &exclude);
+	void ReleaseBuildPartitionAfterProbe(ExecCtx &ctx, uint32_t partition_id);
+
 
 	dsa_pointer left_input_schema_dp() const { return left_input_schema_dp_; }
 	dsa_pointer right_input_schema_dp() const { return right_input_schema_dp_; }
@@ -194,6 +214,7 @@ public:
 	void AttachDescriptor(OpDescriptor *desc) { desc_ = desc; desc_list_.push_back(desc); }
 
 private:
+	std::unique_ptr<PhysicalOperator> probe_stage_;
 	dsa_pointer  left_input_schema_dp_;
 	dsa_pointer  right_input_schema_dp_;
 	dsa_pointer  output_schema_dp_;

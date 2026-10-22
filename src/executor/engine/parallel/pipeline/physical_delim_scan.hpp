@@ -28,6 +28,9 @@ public:
 	uint32_t            source_cursor = 0;
 	uint32_t            row_count = 0;
 	TupleDataCollection *tdc = nullptr;
+	dsa_pointer         segment_desc_dp = InvalidDsaPointer;
+	uint32_t            segment_row_cursor = 0;
+	bool                segment_backed = false;
 };
 
 class PhysicalDelimScan final : public PhysicalOperator {

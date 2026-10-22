@@ -32,6 +32,7 @@ enum class PhysicalOperatorType : uint8_t {
 	OUTPUT,
 	FILTER,
 	PROJECTION,
+	HASH_JOIN_PROBE,
 };
 
 class MetaPipeline;

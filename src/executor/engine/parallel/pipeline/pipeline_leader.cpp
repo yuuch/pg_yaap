@@ -21,6 +21,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
@@ -28,12 +29,14 @@ extern "C" {
 #include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/physical_cross_product.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
+#include "parallel/pipeline/physical_hash_join_probe.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
 #include "parallel/pipeline/pipeline_leader.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
+#include "parallel/pipeline/pipeline_timeline.hpp"
 #include "parallel/pipeline/query_state.hpp"
 #include "parallel/pipeline/runtime_dsm.hpp"
 #include "parallel/pipeline/task.hpp"
@@ -46,6 +49,7 @@ extern bool pg_yaap_parallel_leader_participation;
 extern bool pg_yaap_trace_hooks;
 extern char pg_yaap_bgworker_library_path[];
 extern bool pg_yaap_trace_execution_path;
+extern void pg_yaap_proc_exit_release_jit_contexts(int code, Datum arg);
 }
 
 namespace pg_yaap {
@@ -133,6 +137,34 @@ WaitForBackgroundWorkerShutdownTimed(BackgroundWorkerHandle *handle, long timeou
 }
 
 static void
+DetectUnexpectedWorkerExit(PipelineSharedControl *control,
+							 const PgVector<BackgroundWorkerHandle *> &handles)
+{
+	if (control == nullptr || pg_atomic_read_u32(&control->shutdown_requested) != 0 ||
+		pg_atomic_read_u32(&control->worker_error) != 0)
+		return;
+	for (size_t i = 0; i < handles.size(); ++i)
+	{
+		BackgroundWorkerHandle *handle = handles[i];
+		if (handle == nullptr)
+			continue;
+		pid_t pid = 0;
+		const BgwHandleStatus status = GetBackgroundWorkerPid(handle, &pid);
+		if (status != BGWH_STOPPED && status != BGWH_POSTMASTER_DIED)
+			continue;
+		uint32 expected = 0;
+		if (pg_atomic_compare_exchange_u32(&control->worker_error, &expected, 1u))
+		{
+			std::snprintf(control->worker_error_msg,
+				PIPELINE_WORKER_ERROR_MSG_LEN,
+				"pg_yaap worker %zu (pid %d) exited unexpectedly",
+				i, static_cast<int>(pid));
+		}
+		return;
+	}
+}
+
+static void
 SignalShutdownAndWait(const LeaderCleanupState &cleanup,
 					  bool terminate_workers = false)
 {
@@ -179,6 +211,8 @@ ShutdownAndDestroy(const LeaderCleanupState &cleanup,
 				   bool terminate_workers = false)
 {
 	SignalShutdownAndWait(cleanup, terminate_workers);
+	PipelineTimelineReport(cleanup.control,
+		cleanup.state ? cleanup.state->runtime_dsa : nullptr, false);
 	if (cleanup.state != nullptr)
 		DestroyRuntimeDsm(cleanup.state);
 }
@@ -273,6 +307,10 @@ DispatchConsumerResourceCleanup(ExecCtx &ctx,
 
 	switch (op->type())
 	{
+		case PhysicalOperatorType::HASH_JOIN_PROBE:
+			if (role == PipelineRunCleanupRole::SOURCE || role == PipelineRunCleanupRole::OPERATOR)
+				static_cast<PhysicalHashJoinProbe *>(op)->ReleaseAfterConsumerRun(ctx);
+			return;
 		case PhysicalOperatorType::HASH_JOIN:
 			if (role == PipelineRunCleanupRole::OPERATOR)
 				static_cast<PhysicalHashJoin *>(op)->ReleaseBuildPayloadAfterConsumerRun(ctx);
@@ -293,6 +331,34 @@ PipelinePostConsumerRunCleanup(ExecCtx &ctx, Pipeline &consumer)
 	for (PhysicalOperator *op : consumer.ops)
 		DispatchConsumerResourceCleanup(ctx, op, PipelineRunCleanupRole::OPERATOR);
 	DispatchConsumerResourceCleanup(ctx, consumer.sink, PipelineRunCleanupRole::SINK);
+}
+
+static void
+ReleaseHashJoinPayloadsAtQueryEnd(ExecCtx &ctx, MetaPipelineBundle &bundle)
+{
+	std::vector<PhysicalHashJoin *> seen;
+	for (auto &pipeline_uptr : bundle.pipelines)
+	{
+		std::vector<PhysicalOperator *> candidates;
+		candidates.reserve(pipeline_uptr->ops.size() + 2);
+		for (PhysicalOperator *op : pipeline_uptr->ops)
+			candidates.push_back(op);
+		if (pipeline_uptr->source != nullptr)
+			candidates.push_back(pipeline_uptr->source);
+		if (pipeline_uptr->sink != nullptr)
+			candidates.push_back(pipeline_uptr->sink);
+		for (PhysicalOperator *op : candidates)
+		{
+			if (op == nullptr || op->type() != PhysicalOperatorType::HASH_JOIN)
+				continue;
+			auto *join = static_cast<PhysicalHashJoin *>(op);
+			if (std::find(seen.begin(), seen.end(), join) == seen.end())
+			{
+				seen.push_back(join);
+				join->ReleaseBuildPayloadAtQueryEnd(ctx);
+			}
+		}
+	}
 }
 
 static void
@@ -354,12 +420,28 @@ ExecuteLeaderTask(TaskDescriptor desc,
 			task = std::make_unique<PipelineFinalizeTask>(desc.event_id,
 								pipeline,
 								leader_rt,
-								desc.worker_index);
+												desc.worker_index,
+												desc.partition_id);
 			break;
 	}
 
 	Assert(task != nullptr);
 	return task->Execute();
+}
+
+static bool
+UsesWorkerPartitionedHashJoinFinalize(Pipeline *pipeline, dsa_area *dsa)
+{
+	if (pipeline == nullptr || pipeline->sink == nullptr || dsa == nullptr ||
+		pipeline->sink->type() != PhysicalOperatorType::HASH_JOIN)
+		return false;
+	auto *join = static_cast<PhysicalHashJoin *>(pipeline->sink);
+	const dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(join);
+	if (!DsaPointerIsValid(payload_dp))
+		return false;
+	auto *payload = static_cast<HashJoinSharedPayload *>(dsa_get_address(dsa, payload_dp));
+	return payload != nullptr && payload->direct_segmented_build &&
+		payload->build_partition_count > 1 && !payload->partition_probe_mode;
 }
 
 }  /* namespace */
@@ -427,8 +509,11 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 	cleanup.handles = &handles;
 
+	bool success = false;
 	PG_TRY();
 	{
+		/* Return from the lambda, then restore PG exception stacks at END_TRY. */
+		success = [&]() -> bool {
 		if (wait_event_id == 0)
 			wait_event_id = WaitEventExtensionNew("pg_yaap leader");
 
@@ -457,7 +542,6 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		{
 			return FailEarly(failure_reason, "pg_yaap: pg_yaap.parallel_max_workers must be >= 1", cleanup, state);
 		}
-
 		if (state->runtime_dsm == nullptr || state->runtime_dsa == nullptr)
 		{
 			const char *err = nullptr;
@@ -661,8 +745,9 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 							  worker_pid);
 		}
 
-		if (leader_participate)
-			registered_pids.push_back(MyProcPid);
+		/* The producer must wake when consumers make room, even without
+		 * leader task participation. */
+		registered_pids.push_back(MyProcPid);
 
 		queue->RegisterWorkerPids(registered_pids.data(),
 						 static_cast<uint32>(registered_pids.size()));
@@ -710,10 +795,11 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		{
 			CHECK_FOR_INTERRUPTS();
 
+			DetectUnexpectedWorkerExit(control, handles);
 			if (pg_atomic_read_u32(&control->worker_error) != 0)
 				RaiseWorkerFailure(control, handles, state);
 
-			bool progress = false;
+			bool progress = scheduler.DispatchPendingTasks();
 
 			for (uint32_t event_id = 0; event_id < scheduler.event_count(); ++event_id)
 			{
@@ -738,6 +824,8 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 				{
 					Pipeline *pipeline = leader_lookup.Resolve(event->pipeline_id());
 					Assert(pipeline != nullptr);
+					if (UsesWorkerPartitionedHashJoinFinalize(pipeline, dsa))
+						continue;
 
 					TaskDescriptor desc{};
 					desc.pipeline_id = static_cast<uint32_t>(pipeline->id);
@@ -772,6 +860,11 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 						Pipeline *pipeline = leader_lookup.Resolve(event->pipeline_id());
 						Assert(pipeline != nullptr);
 						PipelinePostConsumerRunCleanup(leader_rt.exec_ctx, *pipeline);
+						scheduler.NotifyPartitionProbeRunFinished(event_id);
+							/* A completed breaker/consumer phase may have freed many
+							 * DSA objects. Return fully empty spans before a later phase
+							 * grows its directories, while preserving any live segments. */
+							dsa_trim(dsa);
 						run_cleanup_done[event_id] = 1;
 					}
 					event->FinishEvent();
@@ -828,6 +921,7 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		 * already use it.
 		 */
 		SignalShutdownAndWait(cleanup);
+		ReleaseHashJoinPayloadsAtQueryEnd(leader_rt.exec_ctx, scheduler.bundle());
 
 		phase.mark("T7_events_done");
 
@@ -866,25 +960,52 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 								  elapsed);
 		}
 		PipelineProfileReport(control, dsa);
+		PipelineTimelineReport(control, dsa, true);
 
 		DestroyRuntimeDsm(state);
 		state->parallel_scheduler = nullptr;
 		return true;
+		}();
 	}
 	PG_CATCH();
 	{
+		/* Preserve the query error while best-effort profile export handles
+		 * and flushes any error of its own. Keep the saved ErrorData in a
+		 * query context that survives FlushErrorState and DSM teardown. */
+		MemoryContextSwitchTo(leader_mcxt);
+		ErrorData *query_error = CopyErrorData();
+		FlushErrorState();
 		state->parallel_plan = nullptr;
 		state->parallel_scheduler = nullptr;
-		ShutdownAndDestroy(cleanup, true);
+		/* These handles live in escaped cleanup/query state; stack locals
+		 * assigned inside PG_TRY are indeterminate after longjmp. */
+		PipelineSharedControl *error_control = cleanup.control;
+		dsa_area *error_dsa = cleanup.state ? cleanup.state->runtime_dsa : nullptr;
+		if (state->runtime_dsm != nullptr) {
+			shm_toc *error_toc = shm_toc_attach(PIPELINE_DSM_MAGIC, dsm_segment_address(state->runtime_dsm));
+			if (error_toc != nullptr)
+				error_control = static_cast<PipelineSharedControl *>(shm_toc_lookup(error_toc, PIPELINE_DSM_KEY_CONTROL, false));
+			cleanup.control = error_control;
+		}
+		PipelineTimelineAbortProcess(error_control, error_dsa, LEADER_WORKER_INDEX,
+			query_error->sqlerrcode == ERRCODE_QUERY_CANCELED);
+		SignalShutdownAndWait(cleanup, true);
+		PipelineTimelineReport(error_control, error_dsa, false);
+		if (cleanup.state != nullptr)
+			DestroyRuntimeDsm(cleanup.state);
+		/* PG_RE_THROW skips operator destructors. Drain the raw-pointer
+		 * registry before transaction abort releases its ResourceOwner. */
+		pg_yaap_proc_exit_release_jit_contexts(1, (Datum) 0);
 		/*
 		 * Bug L: do NOT DestroyLeaderMemoryContext here. PG_RE_THROW
 		 * longjmps over C++ destructors, so PgVector containers above
 		 * never pfree(). leader_mcxt is a child of the caller's context
 		 * and dies on AbortCurrentTransaction / ExecutorEnd cleanup.
 		 */
-		PG_RE_THROW();
+		ReThrowError(query_error);
 	}
 	PG_END_TRY();
+	return success;
 }
 
 }  /* namespace pipeline */

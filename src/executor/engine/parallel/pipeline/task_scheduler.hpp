@@ -56,6 +56,7 @@ extern "C" {
 
 #include "core/memory.hpp"
 #include "parallel/pipeline/event.hpp"
+#include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/operator.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
@@ -175,6 +176,12 @@ public:
 	 * dispatches by Event::kind() and fans out N TaskDescriptors. */
 	void EnqueueTasks(Event &event);
 
+	/* Release the query-wide paired-probe RUN slot after consumer cleanup. */
+	void NotifyPartitionProbeRunFinished(EventId event_id);
+
+	/* Leader-owned overflow; queued tasks retain their completion counters. */
+	bool DispatchPendingTasks();
+
 	/* Read-side accessors (used by task bodies in C6 + leader loop in C7). */
 	MetaPipelineBundle           &bundle()              { return *bundle_; }
 	MemoryContext                 mcxt()          const { return mcxt_; }
@@ -211,6 +218,10 @@ private:
 
 	PgVector<std::shared_ptr<Event>>               events_owned_;
 	PgVector<uint32_t>                             run_task_counts_;
+	PgVector<TaskDescriptor>                       pending_tasks_;
+	PgVector<Event *>                              pending_partition_probe_runs_;
+	EventId                                        active_partition_probe_run_ = INVALID_EVENT_ID;
+	size_t                                         pending_cursor_ = 0;
 	uint32_t                                       next_event_id_ = 0;
 
 	/* C1 NEW: shared runtime pointers (bound by BindRuntime; not owned). */

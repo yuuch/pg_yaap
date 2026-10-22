@@ -26,6 +26,7 @@ public:
 	PerfectHashAggSharedPayload *payload = nullptr;
 	TupleDataCollection         *global_tdc = nullptr;
 	uint32_t                     source_cursor = 0;
+	bool                         segment_retired = false;
 	bool                         finalized = false;
 };
 

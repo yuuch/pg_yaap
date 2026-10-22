@@ -111,6 +111,7 @@ pg_yaap_optimize_args = [
 
 pg_yaap_inc = include_directories(
   'src/bridge',
+  'src/executor',
   'src/executor/engine',
   'src/optimizer',
 )

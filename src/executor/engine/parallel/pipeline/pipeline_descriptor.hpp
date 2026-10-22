@@ -69,6 +69,7 @@ enum class OpKind : uint8_t {
 	OUTPUT         = 8,
 	FILTER         = 9,
 	PROJECTION     = 10,
+	HASH_JOIN_PROBE = 11,
 };
 
 /* -------------------------------------------------------------------------
@@ -348,6 +349,7 @@ struct HashJoinOpBody {
 	dsa_pointer filter_steps;  /* FilterStep[n_filter_steps] */
 	dsa_pointer filter_string_consts; /* char[filter_string_const_bytes] */
 	dsa_pointer shared_payload;
+	dsa_pointer probe_shared_payload;
 	uint16_t    n_left_keys;
 	uint16_t    n_right_keys;
 	uint16_t    output_column_count;
@@ -389,6 +391,11 @@ struct SeqScanSharedPayload {
 struct HashJoinLocalBuildRegistryEntry {
 	dsa_pointer build_keys_dp;
 	dsa_pointer build_rows_dp;
+	dsa_pointer build_key_segment_desc_dp;
+	dsa_pointer build_row_segment_desc_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	dsa_pointer partition_state_dp; /* HashJoinLocalPartitionState[build_partition_count] */
 	uint32_t    row_count;
 	uint32_t    key_heap_used;
 	uint32_t    row_heap_used;
@@ -397,8 +404,83 @@ struct HashJoinLocalBuildRegistryEntry {
 	uint32_t    global_row_heap_offset;
 };
 
+/* Per-worker partition metadata. Segment payloads are worker-owned and
+ * immutable after COMBINE; row-reference tables remain partition-local. */
+struct HashJoinLocalPartitionState {
+	dsa_pointer build_key_segment_desc_dp;
+	dsa_pointer build_row_segment_desc_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	uint32_t    row_count;
+	uint32_t    _pad;
+};
+
+/* A partition is exclusively combined by one COMBINE task.  All fields are
+ * DSA offsets so the same payload can be reconstructed in every backend. */
+struct HashJoinBatchRowRef {
+	uint32_t segment_index;
+	uint32_t row_offset; /* byte offset from the segment payload/TDC base */
+};
+
+struct HashJoinBatchSegment {
+	dsa_pointer descriptor_dp;
+	dsa_pointer payload_dp;
+	uint32_t arena_id;
+	uint32_t segment_id;
+	uint32_t generation;
+	uint32_t capacity;
+};
+
+/* One immutable hash directory shared by a resident batch of radix partitions.
+ * Segment payloads stay pinned until every batch probe worker has finished. */
+struct HashJoinBatch {
+	uint64_t partition_mask;
+	uint64_t charged_bytes;
+	uint32_t row_count;
+	uint32_t hash_capacity;
+	uint32_t segment_count;
+	uint32_t segment_map_count;
+	dsa_pointer segments_dp;
+	dsa_pointer segment_map_dp; /* uint32_t[segment_map_count], indexed by segment_id */
+	dsa_pointer hash_table_dp; /* pg_atomic_uint32[hash_capacity] */
+	dsa_pointer hash_links_dp;
+	dsa_pointer hash_salts_dp;
+	dsa_pointer key_refs_dp; /* HashJoinBatchRowRef[row_count] */
+	dsa_pointer row_refs_dp;
+	uint32_t partition_offsets[64];
+	/* One allocation/table, with disjoint bucket ranges per radix owner. */
+	uint32_t bucket_offsets[64];
+	uint32_t bucket_masks[64];
+	pg_atomic_uint32 next_pin;
+	pg_atomic_uint32 pinned_workers;
+	pg_atomic_uint32 directory_ready;
+	pg_atomic_uint32 next_partition;
+	pg_atomic_uint32 built_workers;
+	pg_atomic_uint32 probe_done;
+	pg_atomic_uint32 released_workers;
+	pg_atomic_uint32 cleanup_state;
+};
+
+struct HashJoinPartition {
+	dsa_pointer build_keys_dp;
+	dsa_pointer build_rows_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	dsa_pointer build_row_slots_dp;
+	dsa_pointer build_row_local_idxs_dp;
+	dsa_pointer hash_table_dp;
+	dsa_pointer hash_links_dp;
+	dsa_pointer hash_salts_dp;
+	dsa_pointer hash_key_values_dp; /* optional exact INT32/INT64 keys replacing salts */
+	uint64_t   directory_charged_bytes;
+	uint32_t    hash_table_capacity;
+	uint32_t    row_count;
+};
+
 struct HashJoinSharedPayload {
 	slock_t     mutex;
+	uint64_t    directory_charged_bytes; /* non-spillable heads/links/salts */
+	uint64_t    owner_tag;
 	uint32_t    local_state_slot_count;
 	uint32_t    build_partition_count;
 	uint32_t    hash_table_capacity;
@@ -407,6 +489,7 @@ struct HashJoinSharedPayload {
 	bool        build_rows_shared_local;
 	bool        build_rows_use_keys;
 	bool        finalized;
+	bool        partition_probe_mode;
 	uint8_t     _pad0[2];
 	pg_atomic_uint32 release_state;       /* 0=live, 1=releasing, 2=released */
 	pg_atomic_uint32 combine_prepare_state; /* 0=pending, 1=preparing, 2=ready */
@@ -422,6 +505,21 @@ struct HashJoinSharedPayload {
 	dsa_pointer hash_buckets_dp;         /* uint32_t[build_rows.row_count] cached bucket indices */
 	dsa_pointer hash_links_dp;           /* uint32_t[build_rows.row_count] next indices */
 	dsa_pointer hash_salts_dp;           /* uint16_t[build_rows.row_count] high-hash salts */
+	dsa_pointer partitions_dp;           /* HashJoinPartition[build_partition_count] */
+	uint32_t    partition_mask;
+	uint32_t    partition_shift;
+	pg_atomic_uint32 combine_partitions_done;
+	pg_atomic_uint32 finalize_partitions_done;
+	/* Immutable segmented build representation, installed after hash finalize. */
+	dsa_pointer segment_arena_dp;
+	dsa_pointer build_key_segment_desc_dp;
+	dsa_pointer build_row_segment_desc_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	uint32_t    segmented_row_count;
+	bool        segmented_build;
+	bool        direct_segmented_build;
+	uint8_t     _segmented_pad[2];
 };
 
 struct CrossProductLocalBuildRegistryEntry {
@@ -438,6 +536,27 @@ struct CrossProductSharedPayload {
 	uint32_t    combined_row_count;
 	dsa_pointer local_build_registry_dp; /* CrossProductLocalBuildRegistryEntry[local_state_slot_count] */
 	dsa_pointer build_rows_dp;           /* global build-side row store */
+	dsa_pointer segment_arena_dp;
+	dsa_pointer segment_first_desc_dp;
+	dsa_pointer segment_desc_dp;
+	uint32_t    segment_id;
+	uint32_t    segment_generation;
+	uint32_t    segment_row_count;
+	bool        segment_backed;
+	uint8_t     _segment_pad[3];
+};
+
+struct OutputSharedPayload {
+	dsa_pointer tdc_dp;
+	dsa_pointer segment_arena_dp;
+	dsa_pointer segment_first_desc_dp;
+	dsa_pointer segment_desc_dp;
+	uint32_t segment_id;
+	uint32_t segment_generation;
+	uint32_t segment_row_count;
+	bool segment_backed;
+	bool finalized;
+	uint8_t _pad[2];
 };
 
 /*
@@ -538,7 +657,7 @@ struct OutputOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer layout;              /* TupleDataLayout serialized from input_schema */
 	dsa_pointer sort_keys;           /* SortKeyDesc[n_sort_keys] for final top-N pruning */
-	dsa_pointer shared_payload;      /* TupleDataCollection; lazy-init on first GetGlobalSinkState */
+	dsa_pointer shared_payload;      /* OutputSharedPayload; lazy-init on first GetGlobalSinkState */
 	uint16_t    n_sort_keys;
 	uint16_t    _pad0;
 	uint32_t    tdc_max_rows;        /* row capacity bound (clamp(plan_rows*1.5, 1024, 1<<20)) */

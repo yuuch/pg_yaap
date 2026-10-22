@@ -68,7 +68,9 @@ DsmTaskQueue::AttachInPlace(void *buffer)
 void
 DsmTaskQueue::RegisterWorkerPids(const pid_t *pids, uint32 count)
 {
-	Assert(count <= kMaxWorkerPids);
+	if (count > kMaxWorkerPids)
+		elog(ERROR, "pg_yaap: task queue wake registry supports at most %u processes, requested %u",
+		     kMaxWorkerPids, count);
 	worker_pid_count_ = count;
 	for (uint32 i = 0; i < count; ++i)
 		worker_pids_[i] = pids[i];

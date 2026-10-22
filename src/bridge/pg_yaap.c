@@ -51,8 +51,44 @@ bool pg_yaap_parallel_leader_participation = true;
 bool pg_yaap_parallel_experimental_hash_pipeline = false;
 bool pg_yaap_disable_jit_for_parallel_worker = false;
 bool pg_yaap_profile = false;
+extern int pg_yaap_profile_timeline;
+extern int pg_yaap_profile_trace_capacity;
+extern char *pg_yaap_profile_trace_file;
+int pg_yaap_profile_timeline = 0;
+int pg_yaap_profile_trace_capacity = 8192;
+char *pg_yaap_profile_trace_file = NULL;
+static const struct config_enum_entry pg_yaap_profile_timeline_options[] = {
+	{"off", 0, false},
+	{"basic", 1, false},
+	{"trace", 2, false},
+	{NULL, 0, false}
+};
+extern bool pg_yaap_hash_join_partition_probe;
+bool pg_yaap_hash_join_partition_probe = true;
+/* GUC storage is in MB so an int-valued PostgreSQL GUC can express query
+ * budgets above 2GB; runtime_dsm converts these to 64-bit byte counts. */
+int pg_yaap_memory_limit_mb = 256;
+int pg_yaap_memory_soft_limit_mb = -1;
 char pg_yaap_bgworker_library_path[MAXPGPATH] = "pg_yaap";
 static int pg_yaap_utility_nesting = 0;
+
+static bool
+pg_yaap_check_profile_trace_file(char **newval, void **extra, GucSource source)
+{
+	if (**newval == '\0')
+		return true;
+	if (!is_absolute_path(*newval))
+	{
+		GUC_check_errdetail("Trace file prefix must be an absolute path or empty.");
+		return false;
+	}
+	if (strlen(*newval) + 80 >= MAXPGPATH)
+	{
+		GUC_check_errdetail("Trace file prefix is too long to append the query suffix.");
+		return false;
+	}
+	return true;
+}
 
 #if PG_VERSION_NUM >= 190000
 static PlannedStmt *pg_yaap_planner_hook(Query *parse, const char *query_string,
@@ -345,8 +381,49 @@ _PG_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL,
-							 NULL,
-							 NULL);
+																 NULL,
+																 NULL);
+	DefineCustomEnumVariable("pg_yaap.profile_timeline",
+							 "Record pipeline and worker task execution intervals.",
+							 NULL, &pg_yaap_profile_timeline, 0,
+							 pg_yaap_profile_timeline_options, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_yaap.profile_trace_capacity",
+							"Maximum detailed timeline events recorded per process.",
+							NULL, &pg_yaap_profile_trace_capacity, 8192, 1, 65536,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("pg_yaap.profile_trace_file",
+							   "Absolute file prefix for uniquely named Perfetto timeline exports.",
+							   NULL, &pg_yaap_profile_trace_file, "", PGC_SUSET, 0,
+							   pg_yaap_check_profile_trace_file, NULL, NULL);
+	DefineCustomBoolVariable("pg_yaap.hash_join_partition_probe",
+							 "Stream probe rows against budgeted resident hash partitions and defer the remainder.",
+							 NULL, &pg_yaap_hash_join_partition_probe, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_yaap.memory_limit",
+										 "Maximum shared memory reserved by a YAAP query.",
+										 NULL,
+									 &pg_yaap_memory_limit_mb,
+									 256,
+									 64,
+											 INT_MAX / 1024,
+									 PGC_USERSET,
+									 GUC_UNIT_MB,
+										 NULL,
+							NULL,
+							NULL);
+	DefineCustomIntVariable("pg_yaap.memory_soft_limit",
+						 "Soft shared-memory threshold that triggers operator-aware spill (-1 uses 75%% of memory_limit).",
+						 NULL,
+								&pg_yaap_memory_soft_limit_mb,
+								-1,
+								-1,
+								INT_MAX / 1024,
+								PGC_USERSET,
+								GUC_UNIT_MB,
+						 NULL,
+						 NULL,
+						 NULL);
 
 	pg_yaap_init_state_table();
 	before_shmem_exit(pg_yaap_proc_exit_release_jit_contexts, (Datum) 0);

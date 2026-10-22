@@ -32,6 +32,7 @@
 extern "C" {
 #include "postgres.h"
 #include "storage/spin.h"
+#include "storage/lwlock.h"
 #include "utils/dsa.h"
 }
 
@@ -39,6 +40,8 @@ extern "C" {
 
 #include "tuple_data_collection.hpp"
 #include "tuple_data_layout.hpp"
+#include "buffer_manager/yaap_segment_row_refs.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
 #include "types.hpp"
 
 namespace pg_yaap {
@@ -71,6 +74,8 @@ struct AggregateHashTable
 	uint32_t   capacity;       /* power of two; mask = capacity - 1 */
 	uint32_t   capacity_mask;  /* capacity - 1, cached */
 	dsa_pointer tdc_dp;        /* -> TupleDataCollection backing canonical rows */
+	dsa_pointer row_refs_dp;   /* optional segment row-reference sidecar */
+	uint32_t    row_ref_capacity;
 
 	/* mutator-side guard. Insert and lookup-then-insert both take this. */
 	slock_t    mutex;
@@ -83,9 +88,18 @@ struct AggregateHashTable
 
 struct HashAggPartition
 {
-	slock_t     mutex;
+	LWLock      mutex;
 	dsa_pointer aht_dp;
 	dsa_pointer tdc_dp;
+	dsa_pointer segment_arena_dp;
+	uint32_t    segment_arena_id;
+	dsa_pointer segment_first_desc_dp;
+	dsa_pointer segment_desc_dp;
+	uint32_t    segment_id;
+	uint32_t    segment_generation;
+	uint32_t    segment_row_count;
+	bool        segment_backed;
+	uint8_t     _segment_pad[3];
 };
 
 struct HashAggSharedPayload
@@ -100,6 +114,8 @@ struct HashAggSharedPayload
 	pg_atomic_uint32 source_partition_next;
 	dsa_pointer partitions_dp;  /* HashAggPartition[partition_count] */
 	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
+	dsa_pointer publication_dp; /* YaapSegmentPublicationDirectory, optional */
+	pg_atomic_uint32 combine_partitions_done;
 };
 
 struct PerfectHashAggSharedPayload
@@ -110,6 +126,12 @@ struct PerfectHashAggSharedPayload
 	bool        finalized;
 	uint8_t     _pad[3];
 	dsa_pointer global_tdc_dp;                /* TupleDataCollection */
+	dsa_pointer segment_arena_dp;
+	dsa_pointer segment_desc_dp;
+	uint32_t    segment_id;
+	uint32_t    segment_generation;
+	bool        segment_backed;
+	uint8_t     _segment_pad[3];
 	dsa_pointer global_index_dp;              /* uint32_t[perfect_hash_capacity] */
 	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
 };
@@ -158,11 +180,39 @@ uint32_t HashAggPartitionShift(uint32_t partition_mask);
  */
 void AggregateHashTableInit(AggregateHashTable *aht,
 						 uint32_t capacity,
-						 dsa_pointer tdc_dp = InvalidDsaPointer);
+							 dsa_pointer tdc_dp = InvalidDsaPointer);
+
+void AggregateHashTableEnableSegmentRefs(dsa_area *dsa,
+										 AggregateHashTable *aht,
+										 uint32_t row_capacity);
+
+bool AggregateHashTableRecordSegmentRow(dsa_area *dsa,
+										 AggregateHashTable *aht,
+										 uint32_t row_index,
+										 dsa_pointer arena_dp,
+										 dsa_pointer segment_desc_dp,
+										 const buffer::YaapSegmentHandle &segment,
+										 uint32_t segment_row_index = UINT32_MAX);
+
+void AggregateHashTableCopySegmentRefs(dsa_area *dsa,
+										const AggregateHashTable *src,
+										AggregateHashTable *dst);
+
+const uint8_t *AggregateHashTableResolveRow(dsa_area *dsa,
+										 const AggregateHashTable *aht,
+										 const TupleDataCollection *flat_tdc,
+										 uint32_t row_index,
+										 dsa_pointer arena_dp);
 
 void AggregateHashTableRehash(AggregateHashTable *aht,
                               TupleDataCollection *tdc,
                               const TupleDataLayout *layout);
+
+void AggregateHashTableRehashSegmented(AggregateHashTable *aht,
+                                       dsa_area *dsa,
+                                       dsa_pointer arena_dp,
+                                       TupleDataCollection *flat_tdc,
+                                       const TupleDataLayout *layout);
 
 bool AggregateHashTableShouldResize(const AggregateHashTable *aht,
                                     TupleDataCollection *tdc);
@@ -206,7 +256,22 @@ void AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
                                          PipelineChunk &chunk,
                                          const AggregateHashTableBatchProbeInput *inputs,
                                          uint16_t count,
-                                         AggregateHashTableBatchProbeResult *results);
+                                         AggregateHashTableBatchProbeResult *results,
+                                         dsa_area *segment_dsa = nullptr,
+                                         dsa_pointer segment_arena_dp = InvalidDsaPointer);
+
+bool AggregateHashTableFindOrInsertSegmented(AggregateHashTable *aht,
+									 dsa_area *dsa,
+									 dsa_pointer arena_dp,
+									 buffer::YaapBufferSharedState *buffer_state,
+									 buffer::YaapSegmentedTdc *segmented_tdc,
+									 uint32_t *row_count,
+									 const TupleDataLayout *layout,
+									 PipelineChunk &chunk,
+									 uint16_t input_row_idx,
+									 uint64_t hash,
+									 TupleDataCollection **row_store,
+									 uint8_t **row);
 
 /*
  * Atomic combine: probe AHT for a row matching src_row's group cols; on
@@ -233,6 +298,20 @@ void AggregateHashTableCombineRow(AggregateHashTable *aht,
 								  const TupleDataCollection *src_tdc,
                                   const uint8_t *src_row,
                                   uint64_t hash);
+
+/* Combine into a segmented canonical-row store.  row_index is the stable
+ * global AHT row id; the segmented writer supplies the physical segment and
+ * per-segment row id. */
+void AggregateHashTableCombineRowSegmented(AggregateHashTable *aht,
+									 dsa_area *dsa,
+									 dsa_pointer arena_dp,
+									 buffer::YaapBufferSharedState *buffer_state,
+									 buffer::YaapSegmentedTdc *segmented_tdc,
+									 uint32_t *row_count,
+									 const TupleDataLayout *layout,
+									 const TupleDataCollection *src_tdc,
+									 const uint8_t *src_row,
+									 uint64_t hash);
 
 }  /* namespace pipeline */
 }  /* namespace pg_yaap */

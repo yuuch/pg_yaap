@@ -19,6 +19,7 @@ extern "C" {
 #include "utils/elog.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "storage/sharedfileset.h"
 }
 
 #include <cstdio>
@@ -33,6 +34,7 @@ extern "C" {
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
+#include "parallel/pipeline/pipeline_timeline.hpp"
 #include "parallel/pipeline/task.hpp"
 #include "parallel/pipeline/types.hpp"
 
@@ -114,6 +116,7 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 
 		dsa_area *dsa = dsa_attach_in_place(dsa_buf, seg);
 		DsmTaskQueue *queue = DsmTaskQueue::AttachInPlace(queue_buf);
+		SharedFileSetAttach(&ctl->spill_fileset, seg);
 
 		int32_t worker_index = -1;
 		/* TODO(Step 11c): finalize worker_index handoff via bgw_extra layout. */
@@ -229,30 +232,29 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 					                                            desc.partition_id);
 					break;
 				case TaskKind::FINALIZE:
-				{
-					uint32 expected = 0;
-					if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
-					{
-						snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
-						         "pg_yaap worker %d: received FINALIZE descriptor (forbidden)",
-						         worker_index);
-					}
-					goto cleanup_and_exit;
-				}
+						if (desc.partition_id == UINT32_MAX)
+						{
+							uint32 expected = 0;
+							if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
+							{
+								snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
+										 "pg_yaap worker %d: received unpartitioned FINALIZE descriptor",
+									 worker_index);
+							}
+							goto cleanup_and_exit;
+						}
+						task = std::make_unique<PipelineFinalizeTask>(desc.event_id,
+							pipeline, &rt, desc.worker_index, desc.partition_id);
+						break;
 			}
 
 			PG_TRY();
 			{
-				TaskExecutionResult tres = task->Execute();
-				if (tres == TaskExecutionResult::TASK_NOT_FINISHED)
-				{
-					bool re_pushed = queue->TryPush(desc);
-					if (!re_pushed)
-						ereport(ERROR,
-						        (errmsg("pg_yaap worker %d: TryPush re-enqueue failed",
-						                worker_index)));
-					continue;
-				}
+				/* Keep the resumable task on its owning worker. Re-enqueueing
+				 * could deadlock when the bounded queue is full, or fail a
+				 * healthy query. Execute checks cancellation each chunk. */
+				while (task->Execute() == TaskExecutionResult::TASK_NOT_FINISHED)
+					CHECK_FOR_INTERRUPTS();
 				uint32 remaining = pg_atomic_sub_fetch_u32(&event_shm->tasks_remaining, 1);
 				if (remaining == 0)
 				{
@@ -264,11 +266,17 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			PG_CATCH();
 			{
 				ErrorData *edata = CopyErrorData();
+				PipelineTimelineAbortProcess(ctl, dsa, worker_index,
+					edata->sqlerrcode == ERRCODE_QUERY_CANCELED);
 				uint32 expected = 0;
 				if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
 				{
 					snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
-					         "%s", edata->message ? edata->message : "(no message)");
+					         "worker=%d kind=%u pipeline=%u partition=%u: %s%s%s",
+					         worker_index, desc.kind, desc.pipeline_id, desc.partition_id,
+					         edata->message ? edata->message : "(no message)",
+					         edata->detail ? " | " : "",
+					         edata->detail ? edata->detail : "");
 				}
 				FreeErrorData(edata);
 				pg_atomic_write_u32(&ctl->shutdown_requested, 1u);
@@ -292,6 +300,11 @@ cleanup_and_exit:
 		ReportWorkerStartupError(ctl, edata->message);
 		FreeErrorData(edata);
 		FlushErrorState();
+		/* Drain the YAAP registry while its ResourceOwner is still alive.
+		 * Abort frees registered contexts without removing YAAP pointers;
+		 * letting the exit callback see them would double-release LLVM. */
+		pg_yaap_proc_exit_release_jit_contexts(1, (Datum) 0);
+		AbortCurrentTransaction();
 		proc_exit(1);
 	}
 	PG_END_TRY();

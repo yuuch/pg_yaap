@@ -37,6 +37,7 @@ struct HashJoinProbeCursorState {
 	bool have_build_cursor = false;
 	uint16_t probe_salt = 0;
 	bool probe_matched = false;
+	uint32_t partition_id = UINT32_MAX;
 };
 
 void InitializeHashJoinFastProbeState(HashJoinFastProbeState &state,

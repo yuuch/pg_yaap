@@ -28,6 +28,7 @@
 
 extern "C" {
 #include "postgres.h"
+
 #include "utils/elog.h"
 }
 

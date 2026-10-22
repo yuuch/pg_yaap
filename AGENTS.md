@@ -164,7 +164,7 @@ The parallel executor is structured as a DAG of pipelines connected at pipeline-
 
 **Operator implementations:**
 - `PhysicalSeqScan` — Parallel table scan with atomic block pool. Workers claim blocks via atomic counter, read through PG's `ReadStream` API.
-- `PhysicalHashJoin` — Radix-partitioned (256-way) parallel hash join with bloom filter pre-filtering and linear-probe hash table.
+- `PhysicalHashJoin` — Adaptive radix-partitioned parallel hash join (8–32 partitions), with worker-local spillable build segments, one shared hash table per resident batch, and partition-aware parallel probe with bounded file prefetch.
 - `PhysicalHashAggregate` — Hash-based aggregation with `AggregateHashTable`.
 - `PhysicalPerfectHashAggregate` — Optimized path when group count is small enough to fit in a direct-mapped array.
 - `PhysicalOrder` — Parallel sort using PG's `tuplesort` via `TuplesortInstrumentation`.
@@ -200,6 +200,8 @@ All defined in `pg_yaap.c::_PG_init`. All are `PGC_USERSET`.
 | `pg_yaap.parallel_leader_participation` | bool | `on` | Leader runs pipeline tasks alongside workers. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | bool | `off` | Legacy GUC — registered but has no effect. |
 | `pg_yaap.profile` | bool | `off` | Emit per-stage pipeline timing after each query. |
+| `pg_yaap.memory_limit` | int | `256MB` | Hard budget for shared breaker payloads; DSA has bounded headroom (up to 50%, capped at 4GB) for directories and allocator metadata. |
+| `pg_yaap.memory_soft_limit` | int | `-1` | Spill threshold; `-1` uses 75% of `memory_limit`. |
 
 ---
 

@@ -60,6 +60,15 @@ SeqScanTraceEnabled(const ExecCtx &ctx)
 		pg_atomic_read_u32(&ctx.control->trace_execution_path) != 0;
 }
 
+static inline bool
+SeqScanJitDeformEnabled(const ExecCtx &ctx)
+{
+	/* The session GUC is not propagated to PostgreSQL bgworker processes. */
+	return ctx.control != nullptr
+		? ctx.control->jit_deform != 0
+		: pg_yaap_jit_deform;
+}
+
 static void
 LogSeqScanDeformerJitDecision(const ExecCtx &ctx,
 							 const char *kind,
@@ -988,6 +997,7 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		                                           local->rel,
 		                                           local->read_stream_state,
 		                                           ctx.worker_index,
+		                                           ctx.control != nullptr ? ctx.control->num_workers : 1u,
 		                                           SeqScanTraceEnabled(ctx));
 	local->read_stream = local->scan_desc->rs_read_stream;
 	if (local->read_stream == nullptr)
@@ -1081,7 +1091,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			const bool allow_proj_worker_jit =
 				!pg_yaap_disable_jit_for_parallel_worker ||
 				ctx.worker_index == LEADER_WORKER_INDEX;
-			if (pg_yaap_jit_deform && allow_proj_worker_jit)
+			if (SeqScanJitDeformEnabled(ctx) && allow_proj_worker_jit)
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1103,7 +1113,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 						(err != nullptr && err[0] != '\0') ?
 						err : "compile returned false without failure reason";
 			}
-			else if (!pg_yaap_jit_deform)
+			else if (!SeqScanJitDeformEnabled(ctx))
 				proj_jit_reason = "disabled by pg_yaap.jit_deform";
 			else
 				proj_jit_reason = "disabled for parallel worker";
@@ -1143,7 +1153,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			const bool allow_filter_worker_jit =
 				!pg_yaap_disable_jit_for_parallel_worker ||
 				ctx.worker_index == LEADER_WORKER_INDEX;
-			if (pg_yaap_jit_deform && allow_filter_worker_jit)
+			if (SeqScanJitDeformEnabled(ctx) && allow_filter_worker_jit)
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1165,7 +1175,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 						(err != nullptr && err[0] != '\0') ?
 						err : "compile returned false without failure reason";
 			}
-			else if (!pg_yaap_jit_deform)
+			else if (!SeqScanJitDeformEnabled(ctx))
 				filter_jit_reason = "disabled by pg_yaap.jit_deform";
 			else
 				filter_jit_reason = "disabled for parallel worker";

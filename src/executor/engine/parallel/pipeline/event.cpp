@@ -5,6 +5,8 @@
  */
 
 #include "parallel/pipeline/event.hpp"
+#include "parallel/pipeline/task_scheduler.hpp"
+#include "parallel/pipeline/pipeline_timeline.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -59,6 +61,8 @@ Event::Abort()
 	                                  std::memory_order_acq_rel);
 	if (prev == EventState::ABORTED)
 		return;
+	PipelineTimelineFinished(scheduler_->control(), scheduler_->dsa(),
+		static_cast<uint32_t>(pipeline_id_), true);
 	NotifyDependents(true);
 }
 
@@ -69,6 +73,9 @@ Event::FinishEvent()
 	                                  std::memory_order_acq_rel);
 	if (prev == EventState::FINISHED || prev == EventState::ABORTED)
 		return;
+	if (kind() == TaskKind::FINALIZE)
+		PipelineTimelineFinished(scheduler_->control(), scheduler_->dsa(),
+			static_cast<uint32_t>(pipeline_id_));
 	NotifyDependents(false);
 }
 
