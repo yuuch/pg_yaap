@@ -1,3 +1,4 @@
+#include "core/dsa_allocation.hpp"
 /*
  * pipeline/tuple_data_collection.cpp
  *
@@ -140,10 +141,7 @@ TupleDataCollectionAllocate(dsa_area *dsa,
 	const size_t alloc_size = TupleDataCollectionCheckedAllocSize(row_capacity,
 		row_width,
 		heap_capacity);
-	int flags = DSA_ALLOC_ZERO;
-	if (!AllocSizeIsValid(alloc_size))
-		flags |= DSA_ALLOC_HUGE;
-	return dsa_allocate_extended(dsa, alloc_size, flags);
+	return YaapDsaAllocateZero(dsa, alloc_size);
 }
 
 uint32_t

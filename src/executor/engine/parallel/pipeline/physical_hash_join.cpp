@@ -1,3 +1,4 @@
+#include "core/dsa_allocation.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_hash_join_probe.hpp"
 
@@ -2555,8 +2556,9 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 			if (buffer_state == nullptr || local_partitions == nullptr || ctx.control == nullptr)
 				elog(ERROR, "pg_yaap: partitioned segmented hash join local state missing");
 
-			/* Segments are partition-local, while the small row-reference tables
-			 * are the per-worker radix buffers. Spill completed blocks periodically;
+			/* Segments are partition-local. Hybrid batches reconstruct row
+			 * references from their chains, avoiding permanent per-row directories.
+			 * Spill completed blocks periodically;
 			 * only spill an active tail when the next input chunk could overflow it. */
 			if ((local.spill_scan_ticks++ % 8u) == 0u &&
 				PartitionedHashJoinShouldSpill(buffer_state))
@@ -2615,7 +2617,7 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 				if (partition_id >= global.payload->build_partition_count)
 					elog(ERROR, "pg_yaap: hash join local radix partition out of range");
 				auto &part = local_partitions[partition_id];
-				if (!DsaPointerIsValid(part.build_key_refs_dp))
+				if (!global.payload->partition_probe_mode && !DsaPointerIsValid(part.build_key_refs_dp))
 					part.build_key_refs_dp = buffer::YaapSegmentRowRefTableCreate(ctx.dsa, 8192u);
 				auto &key_writer = local.partition_key_segmented[partition_id];
 				initialize_writer(key_writer, local.build_key_layout,
@@ -2629,7 +2631,7 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 						in, row_idx), &key_handle, &key_store, &key_row))
 					ereport(ERROR, (errmsg("pg_yaap: local radix build-key append failed")));
 				ScatterGroupOnly(local.build_key_layout, key_store, key_row, in, row_idx);
-				if (buffer::YaapSegmentRowRefAppend(ctx.dsa,
+				if (!global.payload->partition_probe_mode && buffer::YaapSegmentRowRefAppend(ctx.dsa,
 					static_cast<buffer::YaapSegmentRowRefTable *>(dsa_get_address(ctx.dsa,
 						part.build_key_refs_dp)),
 					buffer::YaapSegmentRowRef{key_handle.segment, key_handle.row_index}) ==
@@ -2641,7 +2643,7 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 				}
 				else
 				{
-					if (!DsaPointerIsValid(part.build_row_refs_dp))
+					if (!global.payload->partition_probe_mode && !DsaPointerIsValid(part.build_row_refs_dp))
 						part.build_row_refs_dp = buffer::YaapSegmentRowRefTableCreate(ctx.dsa, 8192u);
 					auto &row_writer = local.partition_row_segmented[partition_id];
 					initialize_writer(row_writer, local.build_layout,
@@ -2655,7 +2657,7 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 							in, row_idx), &row_handle, &row_store, &row))
 						ereport(ERROR, (errmsg("pg_yaap: local radix build-payload append failed")));
 					ScatterGroupOnly(local.build_layout, row_store, row, in, row_idx);
-					if (buffer::YaapSegmentRowRefAppend(ctx.dsa,
+					if (!global.payload->partition_probe_mode && buffer::YaapSegmentRowRefAppend(ctx.dsa,
 						static_cast<buffer::YaapSegmentRowRefTable *>(dsa_get_address(ctx.dsa,
 							part.build_row_refs_dp)),
 						buffer::YaapSegmentRowRef{row_handle.segment, row_handle.row_index}) ==
@@ -2838,6 +2840,11 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 						SpillDirectHashJoinPublishedSegments(ctx, row_writer, "radix-payload", true);
 				}
 			}
+			if (global.payload->partition_probe_mode &&
+				(key_writer.row_count != part.row_count ||
+				 (!global.payload->build_rows_use_keys &&
+				  local.partition_row_segmented[part_idx].row_count != part.row_count)))
+				elog(ERROR, "pg_yaap: local radix writer row count mismatch");
 			if (DsaPointerIsValid(part.build_key_refs_dp))
 				part.row_count = pg_atomic_read_u32(
 					&static_cast<buffer::YaapSegmentRowRefTable *>(
@@ -3093,9 +3100,9 @@ PhysicalHashJoin::FinalizePartition(ExecCtx &ctx,
 		if (evicted_for_directory)
 			dsa_trim(ctx.dsa);
 		part.directory_charged_bytes = directory_bytes;
-		part.build_row_slots_dp = dsa_allocate(ctx.dsa,
+		part.build_row_slots_dp = YaapDsaAllocate(ctx.dsa,
 			static_cast<size_t>(part.row_count) * sizeof(uint32_t));
-		part.build_row_local_idxs_dp = dsa_allocate(ctx.dsa,
+		part.build_row_local_idxs_dp = YaapDsaAllocate(ctx.dsa,
 			static_cast<size_t>(part.row_count) * sizeof(uint32_t));
 		auto *row_slots = static_cast<uint32_t *>(dsa_get_address(ctx.dsa,
 			part.build_row_slots_dp));
@@ -3124,13 +3131,13 @@ PhysicalHashJoin::FinalizePartition(ExecCtx &ctx,
 		}
 		if (offset != part.row_count)
 			elog(ERROR, "pg_yaap: radix hash join row mapping count mismatch");
-		part.hash_table_dp = dsa_allocate(ctx.dsa,
+		part.hash_table_dp = YaapDsaAllocate(ctx.dsa,
 			static_cast<size_t>(capacity) * sizeof(uint32_t));
-		part.hash_links_dp = dsa_allocate(ctx.dsa,
+		part.hash_links_dp = YaapDsaAllocate(ctx.dsa,
 			static_cast<size_t>(part.row_count) * sizeof(uint32_t));
-		part.hash_key_values_dp = cache_keys ? dsa_allocate(ctx.dsa,
+		part.hash_key_values_dp = cache_keys ? YaapDsaAllocate(ctx.dsa,
 			static_cast<size_t>(part.row_count) * key_col.width) : InvalidDsaPointer;
-		part.hash_salts_dp = cache_keys ? InvalidDsaPointer : dsa_allocate(ctx.dsa,
+		part.hash_salts_dp = cache_keys ? InvalidDsaPointer : YaapDsaAllocate(ctx.dsa,
 			static_cast<size_t>(part.row_count) * sizeof(uint16_t));
 		auto *heads = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, part.hash_table_dp));
 		auto *links = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, part.hash_links_dp));
@@ -3278,9 +3285,9 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 			buffer::YaapBufferChargeExternalBytes(ResolveBufferState(ctx), directory_bytes,
 				"hash join partition directory");
 			global.payload->directory_charged_bytes += directory_bytes;
-			part.hash_table_dp = dsa_allocate(ctx.dsa, static_cast<size_t>(capacity) * sizeof(uint32_t));
-			part.hash_links_dp = dsa_allocate(ctx.dsa, static_cast<size_t>(row_count) * sizeof(uint32_t));
-			part.hash_salts_dp = dsa_allocate(ctx.dsa, static_cast<size_t>(row_count) * sizeof(uint16_t));
+			part.hash_table_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(capacity) * sizeof(uint32_t));
+			part.hash_links_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(row_count) * sizeof(uint32_t));
+			part.hash_salts_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(row_count) * sizeof(uint16_t));
 			auto *heads = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, part.hash_table_dp));
 			auto *links = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, part.hash_links_dp));
 			auto *salts = static_cast<uint16_t *>(dsa_get_address(ctx.dsa, part.hash_salts_dp));
@@ -3419,11 +3426,11 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 				buffer::YaapBufferChargeExternalBytes(buffer_state, directory_bytes,
 				"hash join directory");
 			global.payload->directory_charged_bytes += directory_bytes;
-			global.payload->hash_table_dp = dsa_allocate(ctx.dsa,
+			global.payload->hash_table_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(hash_capacity) * sizeof(uint32_t));
-			global.payload->hash_links_dp = dsa_allocate(ctx.dsa,
+			global.payload->hash_links_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(row_count) * sizeof(uint32_t));
-			global.payload->hash_salts_dp = dsa_allocate(ctx.dsa,
+			global.payload->hash_salts_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(row_count) * sizeof(uint16_t));
 			auto *heads = static_cast<uint32_t *>(dsa_get_address(ctx.dsa,
 				global.payload->hash_table_dp));
@@ -3509,11 +3516,11 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 			buffer::YaapBufferChargeExternalBytes(ResolveBufferState(ctx), directory_bytes,
 				"hash join directory");
 			global.payload->directory_charged_bytes += directory_bytes;
-			global.payload->hash_table_dp = dsa_allocate(ctx.dsa,
+			global.payload->hash_table_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(hash_capacity) * sizeof(uint32_t));
-			global.payload->hash_links_dp = dsa_allocate(ctx.dsa,
+			global.payload->hash_links_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(row_count) * sizeof(uint32_t));
-			global.payload->hash_salts_dp = dsa_allocate(ctx.dsa,
+			global.payload->hash_salts_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(row_count) * sizeof(uint16_t));
 			auto *bucket_heads = static_cast<uint32_t *>(dsa_get_address(ctx.dsa, global.payload->hash_table_dp));
 			auto *buckets = DsaPointerIsValid(global.payload->hash_buckets_dp)
@@ -3597,7 +3604,7 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, batch_dp));
 	auto *payload = ResolvePayload(ctx.dsa, DsaPointerIsValid(shared_payload_dp_)
 		? shared_payload_dp_ : LoadSharedPayloadFromDescriptor(this));
-	if (payload == nullptr || partition_id >= payload->build_partition_count || partition_id >= 64 ||
+	if (payload == nullptr || !payload->partition_probe_mode || partition_id >= payload->build_partition_count || partition_id >= 64 ||
 		((batch->partition_mask >> partition_id) & 1u) == 0 || batch->hash_capacity == 0 ||
 		batch->bucket_offsets[partition_id] >= batch->hash_capacity)
 		elog(ERROR, "pg_yaap: invalid batch hash join build partition");
@@ -3647,6 +3654,54 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 			elog(ERROR, "pg_yaap: batch hash join compact row offset out of bounds");
 		return HashJoinBatchRowRef{ordinal, static_cast<uint32_t>(offset)};
 	};
+	/* COMBINE publishes append-ordered chains. The batch pins their payloads
+	 * before dispatching builders, so chain cursors need neither a second
+	 * lease nor a permanent per-row directory. Key and payload chains have
+	 * independent boundaries (in particular when string heaps fill). */
+	struct ChainCursor {
+		dsa_pointer next_dp = InvalidDsaPointer;
+		buffer::YaapSharedSegmentDesc *segment = nullptr;
+		uint32_t row = 0;
+		uint32_t count = 0;
+		uint32_t visited = 0;
+	};
+	auto initialize_cursor = [&](dsa_pointer desc_dp, uint32_t expected_rows) {
+		const auto *desc = buffer::YaapSegmentedTdcResolveDesc(ctx.dsa, desc_dp);
+		if (desc == nullptr || desc->arena_dp != payload->segment_arena_dp ||
+			desc->row_count != expected_rows)
+			elog(ERROR, "pg_yaap: batch hash join chain row count mismatch");
+		ChainCursor cursor;
+		cursor.next_dp = desc->first_desc_dp;
+		return cursor;
+	};
+	auto next_ref = [&](ChainCursor &cursor, buffer::YaapSegmentRowRef *ref) {
+		while (cursor.row == cursor.count) {
+			if (!DsaPointerIsValid(cursor.next_dp)) return false;
+			if (++cursor.visited > batch->segment_count)
+				elog(ERROR, "pg_yaap: batch hash join chain contains a cycle");
+			cursor.segment = static_cast<buffer::YaapSharedSegmentDesc *>(
+				dsa_get_address(ctx.dsa, cursor.next_dp));
+			const auto *segment = cursor.segment;
+			if (segment->segment_id >= batch->segment_map_count)
+				elog(ERROR, "pg_yaap: batch hash join chain segment missing");
+			const uint32_t ordinal = segment_map[segment->segment_id];
+			if (ordinal >= batch->segment_count || segments[ordinal].descriptor_dp != cursor.next_dp ||
+				!DsaPointerIsValid(segments[ordinal].payload_dp) ||
+				segment->payload_dp != segments[ordinal].payload_dp ||
+				segment->capacity < offsetof(TupleDataCollection, rows))
+				elog(ERROR, "pg_yaap: batch hash join chain is not pinned");
+			const auto *tdc = static_cast<const TupleDataCollection *>(
+				dsa_get_address(ctx.dsa, segments[ordinal].payload_dp));
+			cursor.count = pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&tdc->row_count));
+			if (cursor.count > tdc->row_capacity)
+				elog(ERROR, "pg_yaap: batch hash join chain row count out of bounds");
+			cursor.row = 0;
+			cursor.next_dp = segment->chain_next_dp;
+		}
+		*ref = buffer::YaapSegmentRowRef{{cursor.segment->arena_id,
+			cursor.segment->segment_id, cursor.segment->generation}, cursor.row++};
+		return true;
+	};
 	uint32_t row_idx = batch->partition_offsets[partition_id];
 	uint32_t row_end = batch->row_count;
 	for (uint32_t next = partition_id + 1; next < payload->build_partition_count && next < 64; ++next)
@@ -3660,26 +3715,28 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 		auto &part = parts[partition_id];
 		expected_rows += part.row_count;
 		if (part.row_count == 0) continue;
-		if (!DsaPointerIsValid(part.build_key_refs_dp) || !DsaPointerIsValid(part.build_row_refs_dp))
-			elog(ERROR, "pg_yaap: batch hash join local row references missing");
-		const auto *keys = static_cast<const buffer::YaapSegmentRowRefTable *>(dsa_get_address(ctx.dsa, part.build_key_refs_dp));
-		const auto *rows = static_cast<const buffer::YaapSegmentRowRefTable *>(dsa_get_address(ctx.dsa, part.build_row_refs_dp));
-		if (pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&keys->count)) != part.row_count ||
-			pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&rows->count)) != part.row_count)
-			elog(ERROR, "pg_yaap: batch hash join local row reference count mismatch");
+		ChainCursor keys = initialize_cursor(part.build_key_segment_desc_dp, part.row_count);
+		ChainCursor rows;
+		if (row_refs != key_refs)
+			rows = initialize_cursor(part.build_row_segment_desc_dp, part.row_count);
 		for (uint32_t local_idx = 0; local_idx < part.row_count; ++local_idx, ++row_idx) {
 			if ((local_idx & 1023u) == 0) CHECK_FOR_INTERRUPTS();
 			if (row_idx >= row_end || row_idx >= batch->row_count)
 				elog(ERROR, "pg_yaap: batch hash join global row out of bounds");
-			/* Sample one row per 1024, staggered by partition/slot to avoid
-			 * always measuring the first cache line of each reference page.
-			 * These counters contain sampled time, never extrapolated time. */
+			/* Sample one row per 1024, staggered by partition/slot. These
+			 * counters contain sampled time, never extrapolated time. */
 			const bool sample = profile_build && ((local_idx + partition_id * 31u + slot * 17u) & 1023u) == 0;
 			instr_time ref_start{}, hash_start{}, insert_start{}, insert_end{};
 			if (sample) INSTR_TIME_SET_CURRENT(ref_start);
-			key_refs[row_idx] = compact(buffer::YaapSegmentRowRefGet(ctx.dsa, keys, local_idx), key_cache);
-			if (row_refs != key_refs)
-				row_refs[row_idx] = compact(buffer::YaapSegmentRowRefGet(ctx.dsa, rows, local_idx), row_cache);
+			buffer::YaapSegmentRowRef key_ref, row_ref;
+			if (!next_ref(keys, &key_ref))
+				elog(ERROR, "pg_yaap: batch hash join key chain ended early");
+			key_refs[row_idx] = compact(&key_ref, key_cache);
+			if (row_refs != key_refs) {
+				if (!next_ref(rows, &row_ref))
+					elog(ERROR, "pg_yaap: batch hash join payload chain ended early");
+				row_refs[row_idx] = compact(&row_ref, row_cache);
+			}
 			TupleDataCollection *key_store = nullptr;
 			const uint8_t *key = ResolveBatchRow(ctx.dsa, batch, key_refs, row_idx, &key_store);
 			if (sample) INSTR_TIME_SET_CURRENT(hash_start);
@@ -3704,15 +3761,9 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 				PipelineProfileAddDiff(ctx, PipelineProfileStage::HASH_JOIN_BATCH_INSERT_SAMPLE, insert_end, insert_start, 1);
 			}
 		}
-		/* Only this partition's builder touches these slot-local reference
-		 * tables. The compact batch references now own all future lookups. */
-		const dsa_pointer key_dp = part.build_key_refs_dp;
-		const dsa_pointer row_dp = part.build_row_refs_dp;
-		PipelineProfileScope destroy_refs(ctx, PipelineProfileStage::HASH_JOIN_BATCH_REF_DESTROY);
-		buffer::YaapSegmentRowRefTableDestroy(ctx.dsa, key_dp);
-		if (row_dp != key_dp) buffer::YaapSegmentRowRefTableDestroy(ctx.dsa, row_dp);
-		part.build_key_refs_dp = InvalidDsaPointer;
-		part.build_row_refs_dp = InvalidDsaPointer;
+		buffer::YaapSegmentRowRef extra;
+		if (next_ref(keys, &extra) || (row_refs != key_refs && next_ref(rows, &extra)))
+			elog(ERROR, "pg_yaap: batch hash join chain has excess rows");
 	}
 	if (static_cast<uint64_t>(batch->partition_offsets[partition_id]) + expected_rows != row_idx || row_idx != row_end)
 		elog(ERROR, "pg_yaap: batch hash join partition row count mismatch");

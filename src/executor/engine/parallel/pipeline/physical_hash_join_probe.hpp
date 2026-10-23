@@ -5,6 +5,15 @@
 namespace pg_yaap {
 namespace pipeline {
 
+/* Tail quotas bound writable partition buffers independently of unrelated
+ * operators. Global pressure only forces a partial flush near the hard limit. */
+constexpr bool HashJoinProbeShouldSpillTail(uint32_t active, uint32_t limit,
+                                           uint64_t resident, uint64_t hard_limit,
+                                           uint64_t allocation_headroom) {
+	return active > 0 && (active >= limit || allocation_headroom >= hard_limit ||
+		resident > hard_limit - allocation_headroom);
+}
+
 /* Hybrid radix probe: resident partitions match while input streams through;
  * FinalExecute drains only deferred partition pairs after the shared EOF barrier. */
 class PhysicalHashJoinProbe final : public PhysicalOperator {

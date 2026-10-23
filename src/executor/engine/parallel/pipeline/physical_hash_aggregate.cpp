@@ -1,3 +1,4 @@
+#include "core/dsa_allocation.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 
@@ -789,7 +790,7 @@ AllocAhtForTdc(ExecCtx &ctx,
                AggregateHashTable **out_aht)
 {
 	const uint32_t capacity = AggregateHashTableChooseCapacity(max_groups);
-	*out_aht_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(capacity));
+	*out_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(capacity));
 	*out_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, *out_aht_dp));
 	AggregateHashTableInit(*out_aht, capacity, tdc_dp);
 }
@@ -806,7 +807,7 @@ GrowSegmentedLocalAht(ExecCtx &ctx, HashAggPartition &part,
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("pg_yaap: segmented aggregate exceeds maximum AHT capacity")));
 	const uint32_t new_capacity = std::min(kMaxAhtCapacity, old_aht->capacity * 2u);
-	const dsa_pointer new_dp = dsa_allocate0(ctx.dsa,
+	const dsa_pointer new_dp = YaapDsaAllocateZero(ctx.dsa,
 		AggregateHashTableAllocSize(new_capacity));
 	auto *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_dp));
 	AggregateHashTableInit(new_aht, new_capacity, InvalidDsaPointer);
@@ -833,7 +834,7 @@ ResizeAhtForTdc(ExecCtx &ctx,
 		return;
 
 	const uint32_t new_capacity = old_aht->capacity << 1;
-	dsa_pointer new_aht_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(new_capacity));
+	dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(new_capacity));
 	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
 	AggregateHashTableInit(new_aht, new_capacity, tdc_dp);
 	if (old_aht->row_refs_dp != InvalidDsaPointer)
@@ -894,7 +895,7 @@ GrowTdcForPartition(ExecCtx &ctx,
 	}
 
 	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
-	dsa_pointer new_aht_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(capacity));
+	dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(capacity));
 	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
 	AggregateHashTableInit(new_aht, capacity, new_tdc_dp);
 	AggregateHashTableRehash(new_aht, new_tdc, layout);
@@ -959,7 +960,7 @@ GrowLocalTdc(ExecCtx &ctx,
 	}
 
 	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
-	dsa_pointer new_aht_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(capacity));
+	dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(capacity));
 	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
 	AggregateHashTableInit(new_aht, capacity, new_tdc_dp);
 	AggregateHashTableRehash(new_aht, new_tdc, local.layout);
@@ -1023,7 +1024,7 @@ GrowLocalTdcForLayout(ExecCtx &ctx,
 		CopyTdcRow(layout, old_tdc, src, new_tdc, dst);
 	}
 	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
-	dsa_pointer new_aht_dp = dsa_allocate0(ctx.dsa, AggregateHashTableAllocSize(capacity));
+	dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(capacity));
 	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
 	AggregateHashTableInit(new_aht, capacity, new_tdc_dp);
 	AggregateHashTableRehash(new_aht, new_tdc, layout);

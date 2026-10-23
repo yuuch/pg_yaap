@@ -5,9 +5,20 @@ extern "C" {
 }
 
 #include <cstring>
+#include "core/dsa_allocation.hpp"
 
 #include "buffer_manager/yaap_buffer_shared.hpp"
 #include "buffer_manager/yaap_segmented_tdc.hpp"
+#include "parallel/pipeline/physical_hash_join_probe.hpp"
+
+/* Regression: unrelated resident data above 75% must not empty all probe
+ * tails. Quota exhaustion and actual allocation pressure must still flush. */
+static_assert(!pg_yaap::pipeline::HashJoinProbeShouldSpillTail(3, 8, 800, 1000, 20));
+static_assert(!pg_yaap::pipeline::HashJoinProbeShouldSpillTail(3, 8, 980, 1000, 20));
+static_assert(pg_yaap::pipeline::HashJoinProbeShouldSpillTail(3, 8, 981, 1000, 20));
+static_assert(pg_yaap::pipeline::HashJoinProbeShouldSpillTail(8, 8, 100, 1000, 20));
+static_assert(!pg_yaap::pipeline::HashJoinProbeShouldSpillTail(0, 8, 1000, 1000, 2000));
+static_assert(pg_yaap::pipeline::HashJoinProbeShouldSpillTail(1, 8, 0, 1000, 2000));
 
 extern "C" {
 PGDLLEXPORT Datum pg_yaap_segment_selftest(PG_FUNCTION_ARGS);
@@ -25,6 +36,12 @@ pg_yaap_segment_selftest(PG_FUNCTION_ARGS)
 		64u * 1024u * 1024u, 48u * 1024u * 1024u);
 	dsa_area *dsa = dsa_create(0);
 	dsa_set_size_limit(dsa, 64u * 1024u * 1024u);
+	/* Exercise the >1GiB flag without reserving/touching a huge mapping:
+	 * the 64MiB area cap must reject it via NO_OOM, not size-check ERROR. */
+	const size_t huge_bytes = static_cast<size_t>(MaxAllocSize) + 1u;
+	if (DsaPointerIsValid(pg_yaap::YaapDsaAllocate(dsa, huge_bytes, DSA_ALLOC_NO_OOM)) ||
+		DsaPointerIsValid(pg_yaap::YaapDsaAllocate(dsa, huge_bytes, DSA_ALLOC_NO_OOM | DSA_ALLOC_ZERO)))
+		ereport(ERROR, (errmsg("pg_yaap: huge DSA allocation bypassed area capacity")));
 	dsa_pointer arena_dp = pg_yaap::buffer::YaapSharedSegmentArenaCreate(
 		dsa, buffer_state, 99, 256u * 1024u);
 	pg_yaap::buffer::YaapSegmentedTdc tdc;

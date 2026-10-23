@@ -106,6 +106,30 @@ def main():
                 print(json.dumps(row), flush=True)
                 if not ok:
                     raise AssertionError(f'{tag}: output mismatch or SQL error; see {OUT}')
+        # Explicit DSA ceilings are exact area capacities, not payload+headroom.
+        query = queries['aggregate']
+        expected = checked('SET pg_yaap.enabled=off; ' + query)
+        for tag, payload in (('dsa-explicit-20gb', '64MB'), ('dsa-equal-payload-20gb', '20GB')):
+            result = run(setup(4, payload) +
+                         "SET pg_yaap.dsa_memory_limit='20GB'; "
+                         "SET client_min_messages=log; SET pg_yaap.trace_execution_path=on; " + query)
+            (OUT / (tag + '.out')).write_text(result.stdout)
+            (OUT / (tag + '.err')).write_text(result.stderr)
+            ok = result.returncode == 0 and result.stdout == expected and 'dsa_limit=21474836480' in result.stderr
+            results.append({'case': tag, 'pass': ok})
+            if not ok:
+                raise AssertionError(tag + ': explicit DSA ceiling/result mismatch')
+        result = run(setup(4, '64MB') +
+                     "SET pg_yaap.dsa_memory_limit='32MB'; " +
+                     '\n\\set ON_ERROR_STOP off\n' + query +
+                     " SET pg_yaap.dsa_memory_limit='128MB';\n\\set ON_ERROR_STOP on\n" + query)
+        (OUT / 'dsa-limit-reject-reuse.out').write_text(result.stdout)
+        (OUT / 'dsa-limit-reject-reuse.err').write_text(result.stderr)
+        ok = (result.returncode == 0 and result.stdout == expected and
+              'dsa_memory_limit must be addressable and at least memory_limit' in result.stderr)
+        results.append({'case': 'dsa-limit-reject-reuse', 'pass': ok})
+        if not ok:
+            raise AssertionError('invalid DSA ceiling must reject before allocation and allow reuse')
         # Force pairs larger than their soft admission budget. They must
         # serialize with bounded segment windows and preserve resumed strings.
         query = queries['join_resume']

@@ -69,6 +69,8 @@ bool pg_yaap_hash_join_partition_probe = true;
  * budgets above 2GB; runtime_dsm converts these to 64-bit byte counts. */
 int pg_yaap_memory_limit_mb = 256;
 int pg_yaap_memory_soft_limit_mb = -1;
+extern int pg_yaap_dsa_memory_limit_mb;
+int pg_yaap_dsa_memory_limit_mb = -1;
 char pg_yaap_bgworker_library_path[MAXPGPATH] = "pg_yaap";
 static int pg_yaap_utility_nesting = 0;
 
@@ -424,6 +426,11 @@ _PG_init(void)
 						 NULL,
 						 NULL,
 						 NULL);
+
+	DefineCustomIntVariable("pg_yaap.dsa_memory_limit",
+						 "Maximum total YAAP DSA segment capacity (-1 uses the automatic payload plus metadata limit).",
+						 NULL, &pg_yaap_dsa_memory_limit_mb, -1, -1, INT_MAX / 1024,
+						 PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
 
 	pg_yaap_init_state_table();
 	before_shmem_exit(pg_yaap_proc_exit_release_jit_contexts, (Datum) 0);

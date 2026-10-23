@@ -67,6 +67,10 @@ def main():
         # Keep those failures visible rather than normalize their output.
         'multikey': (
             f'SELECT a.id,b.s FROM {a} a JOIN {b} b ON a.k=b.k AND a.id=b.id ORDER BY a.id;'),
+        # String key heaps and wider payload rows roll over independently.
+        # Batch builders must follow two chains rather than zip their segments.
+        'string-key-payload-boundaries': (
+            f'SELECT a.id,b.id,b.s FROM {a} a JOIN {b} b ON a.s=b.s ORDER BY a.id;'),
         # Q22: a keyless scalar comparison must coexist with radix ANTI probe.
         'scalar-filter-anti': (
             f'SELECT a.id FROM {a} a WHERE a.id>(SELECT avg(b.id) FROM {b} b) '

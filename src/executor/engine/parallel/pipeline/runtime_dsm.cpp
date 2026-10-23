@@ -22,6 +22,7 @@ extern "C" {
 extern int pg_yaap_parallel_max_workers;
 extern int pg_yaap_memory_limit_mb;
 extern int pg_yaap_memory_soft_limit_mb;
+extern int pg_yaap_dsa_memory_limit_mb;
 extern bool pg_yaap_jit_deform;
 extern bool pg_yaap_trace_execution_path;
 extern int pg_yaap_runtime_dsa_tranche_id(void);
@@ -77,6 +78,22 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 	shm_toc_estimate_keys(&estimator, kRuntimeTocNumKeys);
 	const Size segsize = shm_toc_estimate(&estimator);
 
+	/* The payload budget and total DSA segment ceiling are separate. Keep
+	 * the historical bounded metadata allowance unless explicitly set. */
+	const size_t control_bytes = segsize - runtime_dsa_size;
+	const uint64_t dsa_headroom = std::min<uint64_t>(
+		runtime_dsa_limit / 2, UINT64CONST(4) * 1024u * 1024u * 1024u);
+	const uint64_t dsa_limit = pg_yaap_dsa_memory_limit_mb >= 0
+		? static_cast<uint64_t>(pg_yaap_dsa_memory_limit_mb) * 1024u * 1024u
+		: runtime_dsa_limit + dsa_headroom - control_bytes;
+	if (dsa_limit > static_cast<uint64_t>(SIZE_MAX) ||
+		(pg_yaap_dsa_memory_limit_mb >= 0 && dsa_limit < runtime_dsa_limit))
+	{
+		if (error_out != nullptr)
+			*error_out = "pg_yaap: dsa_memory_limit must be addressable and at least memory_limit";
+		return false;
+	}
+
 	dsm_segment *seg = dsm_create(segsize, DSM_CREATE_NULL_IF_MAXSEGMENTS);
 	if (seg == nullptr)
 	{
@@ -130,13 +147,7 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 										 tranche_id,
 										 seg);
 	dsa_pin_mapping(area);
-	/* Keep the breaker payload hard budget separate from DSA's unavoidable
-	 * descriptor/index/allocator space. DSA still has a strict ceiling, with
-	 * bounded headroom for those non-payload allocations and fragmentation. */
-	const size_t control_bytes = segsize - runtime_dsa_size;
-	const uint64_t dsa_headroom = std::min<uint64_t>(
-		runtime_dsa_limit / 2, UINT64CONST(4) * 1024u * 1024u * 1024u);
-	const uint64_t dsa_limit = runtime_dsa_limit + dsa_headroom - control_bytes;
+	control->dsa_limit_bytes = dsa_limit;
 	dsa_set_size_limit(area, static_cast<size_t>(dsa_limit));
 	shm_toc_insert(toc, PIPELINE_DSM_KEY_DSA, dsa_place);
 
@@ -181,7 +192,7 @@ DestroyRuntimeDsm(PgYaapQueryState *state)
 					dsa_get_address(state->runtime_dsa, control->buffer_state_root))
 				: nullptr;
 			if (buffer_state != nullptr && pg_yaap_trace_execution_path)
-				ereport(LOG, (errmsg("pg_yaap memory resident=%llu peak=%llu committed=%llu spill=%llu allocations=%llu pressure_epoch=%llu dsa_total=%zu payload_limit=%llu",
+				ereport(LOG, (errmsg("pg_yaap memory resident=%llu peak=%llu committed=%llu spill=%llu allocations=%llu pressure_epoch=%llu dsa_total=%zu payload_limit=%llu dsa_limit=%llu",
 					(unsigned long long) buffer::YaapBufferResidentBytes(buffer_state),
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->peak_resident_bytes),
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->committed_bytes),
@@ -189,7 +200,8 @@ DestroyRuntimeDsm(PgYaapQueryState *state)
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->allocation_count),
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->pressure_epoch),
 					dsa_get_total_size(state->runtime_dsa),
-					(unsigned long long) buffer_state->hard_limit)));
+					(unsigned long long) buffer_state->hard_limit,
+					(unsigned long long) control->dsa_limit_bytes)));
 			if (buffer_state != nullptr)
 			{
 				if (DsaPointerIsValid(control->shared_segment_arena_root))

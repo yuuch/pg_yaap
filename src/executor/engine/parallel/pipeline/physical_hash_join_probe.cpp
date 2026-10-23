@@ -1,3 +1,4 @@
+#include "core/dsa_allocation.hpp"
 #include "parallel/pipeline/physical_hash_join_probe.hpp"
 
 extern "C" {
@@ -365,14 +366,14 @@ dsa_pointer CreateBatch(ExecCtx &ctx, PhysicalHashJoin &join, HashJoinSharedPayl
 	pg_atomic_init_u32(&batch->released_workers, 0);
 	pg_atomic_init_u32(&batch->cleanup_state, 0);
 	const size_t entries = std::max<uint32_t>(1, batch->row_count);
-	batch->hash_table_dp = dsa_allocate(ctx.dsa, static_cast<size_t>(plan.capacity) * sizeof(pg_atomic_uint32));
-	batch->hash_links_dp = dsa_allocate(ctx.dsa, entries * sizeof(uint32_t));
-	batch->hash_salts_dp = dsa_allocate(ctx.dsa, entries * sizeof(uint16_t));
-	batch->key_refs_dp = dsa_allocate(ctx.dsa, entries * sizeof(HashJoinBatchRowRef));
+	batch->hash_table_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.capacity) * sizeof(pg_atomic_uint32));
+	batch->hash_links_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(uint32_t));
+	batch->hash_salts_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(uint16_t));
+	batch->key_refs_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(HashJoinBatchRowRef));
 	batch->row_refs_dp = build->build_rows_use_keys ? batch->key_refs_dp
-		: dsa_allocate(ctx.dsa, entries * sizeof(HashJoinBatchRowRef));
-	if (plan.segments) batch->segments_dp = dsa_allocate(ctx.dsa, static_cast<size_t>(plan.segments) * sizeof(HashJoinBatchSegment));
-	if (plan.map_count) batch->segment_map_dp = dsa_allocate(ctx.dsa, static_cast<size_t>(plan.map_count) * sizeof(uint32_t));
+		: YaapDsaAllocate(ctx.dsa, entries * sizeof(HashJoinBatchRowRef));
+	if (plan.segments) batch->segments_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.segments) * sizeof(HashJoinBatchSegment));
+	if (plan.map_count) batch->segment_map_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.map_count) * sizeof(uint32_t));
 	auto *heads = static_cast<pg_atomic_uint32 *>(dsa_get_address(ctx.dsa, batch->hash_table_dp));
 	for (uint32_t i = 0; i < plan.capacity; ++i) pg_atomic_init_u32(&heads[i], UINT32_MAX);
 	auto *segments = plan.segments ? static_cast<HashJoinBatchSegment *>(dsa_get_address(ctx.dsa, batch->segments_dp)) : nullptr;
@@ -795,7 +796,7 @@ std::unique_ptr<GlobalSinkState> PhysicalHashJoinProbe::GetGlobalSinkState(ExecC
 		p->chains_dp = dsa_allocate0(ctx.dsa, sizeof(ProbeChain) * p->slots * p->partitions);
 		p->pairs_dp = dsa_allocate0(ctx.dsa, sizeof(ProbePair) * p->partitions);
 		const auto *input_layout = static_cast<const TupleDataLayout *>(dsa_get_address(ctx.dsa, join_->left_payload_layout_dp()));
-		p->layout_dp = dsa_allocate(ctx.dsa, sizeof(TupleDataLayout));
+		p->layout_dp = YaapDsaAllocate(ctx.dsa, sizeof(TupleDataLayout));
 		auto *layout = static_cast<TupleDataLayout *>(dsa_get_address(ctx.dsa, p->layout_dp));
 		*layout = *input_layout;
 		p->null_offset = layout->row_width;
@@ -828,6 +829,12 @@ SinkResultType PhysicalHashJoinProbe::SinkChunk(ExecCtx &ctx, PipelineChunk &in,
 	spill.AttachSharedFileSet(&ctx.control->spill_fileset, nullptr);
 	const uint32_t tail_limit = std::max<uint32_t>(1, std::min<uint64_t>(global.payload->partitions,
 		Budget(ctx)->hard_limit / (static_cast<uint64_t>(global.payload->slots) * arena->segment_size * 8u)));
+	/* Allow one concurrent segment allocation per participant. The existing
+	 * per-worker quota bounds writable tails (at least one per worker); do not flush
+	 * those tails merely because other operators cross the 75% soft threshold.
+	 * The allocator still atomically enforces the hard limit. */
+	const uint64_t allocation_headroom = static_cast<uint64_t>(global.payload->slots) *
+		(arena->segment_size + sizeof(buffer::YaapSharedSegmentDesc));
 	for (uint16_t item = 0; item < (local.selected ? local.selection_count : in.count); ++item) {
 		const uint16_t row_idx = local.selected ? local.selection[item] : item;
 		if ((item & 1023u) == 0) CHECK_FOR_INTERRUPTS();
@@ -859,8 +866,8 @@ SinkResultType PhysicalHashJoinProbe::SinkChunk(ExecCtx &ctx, PipelineChunk &in,
 		const bool needs_segment = !writer.active.IsValid() ||
 			pg_atomic_read_u32(&buffer::YaapSharedSegmentResolve(ctx.dsa, writer.arena_dp, writer.active)->state) !=
 				static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL);
-		while (needs_segment && local.active_tails > 0 &&
-			(local.active_tails >= tail_limit || buffer::YaapBufferResidentBytes(Budget(ctx)) > Budget(ctx)->hard_limit * 3u / 4u)) {
+		while (needs_segment && HashJoinProbeShouldSpillTail(local.active_tails, tail_limit,
+			buffer::YaapBufferResidentBytes(Budget(ctx)), Budget(ctx)->hard_limit, allocation_headroom)) {
 			uint32_t oldest = UINT32_MAX;
 			for (uint32_t i = 0; i < local.writers.size(); ++i) {
 				const auto &candidate = local.writers[i];

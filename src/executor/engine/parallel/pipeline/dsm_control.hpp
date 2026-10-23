@@ -125,6 +125,7 @@ struct PipelineSharedControl
 	dsa_pointer      timeline_root;
 
 	/* Query-scoped accounting for DSA-backed breaker storage. */
+	uint64_t dsa_limit_bytes = 0;
 	dsa_pointer      buffer_state_root;
 	/* Stable root for lazy shared breaker segments. */
 	dsa_pointer      shared_segment_arena_root;

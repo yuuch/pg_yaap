@@ -202,6 +202,7 @@ All defined in `pg_yaap.c::_PG_init`. All are `PGC_USERSET`.
 | `pg_yaap.profile` | bool | `off` | Emit per-stage pipeline timing after each query. |
 | `pg_yaap.memory_limit` | int | `256MB` | Hard budget for shared breaker payloads; DSA has bounded headroom (up to 50%, capped at 4GB) for directories and allocator metadata. |
 | `pg_yaap.memory_soft_limit` | int | `-1` | Spill threshold; `-1` uses 75% of `memory_limit`. |
+| `pg_yaap.dsa_memory_limit` | int, MB | `-1` | Exact query DSA segment-capacity ceiling; `-1` preserves automatic metadata headroom. Not a whole-query RSS limit. |
 
 ---
 
