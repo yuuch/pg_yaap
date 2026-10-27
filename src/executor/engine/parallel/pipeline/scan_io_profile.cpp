@@ -204,7 +204,7 @@ void Print(const char *scope, uint32 pipeline, int worker, const ScanIORecord &r
 		elog(NOTICE,
 			 "pg_yaap[scan-io] %s pipeline=%u worker=%d read_stream=pg complete=%s "
 			 "custom_stream_observations=UNAVAILABLE source_elapsed_ms=%.3f pg_accounted_hits=%llu "
-			 "pg_accounted_reads=%llu",
+			 "pg_accounted_reads=%llu actual_io_stall=UNAVAILABLE",
 			 scope, pipeline, worker, complete ? "yes" : "no", r.source_ns / 1e6,
 			 (unsigned long long)r.shared_hits, (unsigned long long)r.shared_reads);
 		if (worker == -2)
@@ -554,13 +554,8 @@ void ScanIOProfilePublish(const ExecCtx &ctx, const ScanProfileRecord &cost, con
 	r->source_ns += cost.source_ns;
 	r->setup_ns += cost.setup_ns;
 	++r->source_calls;
-	r->submit_api_ns += cost.read_submit_ns;
-	r->wait_api_ns += cost.read_wait_ns;
-	r->refill_exclusive_ns += cost.read_refill_ns;
 	r->shared_hits += cost.shared_blks_hit;
 	r->shared_reads += cost.shared_blks_read;
-	r->submit_sample_cpu_ns += cost.read_submit_sample_cpu_ns;
-	r->submit_sample_wall_ns += cost.read_submit_sample_wall_ns;
 	if (now)
 		AddStats(r->stats, *now, previous);
 	pg_write_barrier();

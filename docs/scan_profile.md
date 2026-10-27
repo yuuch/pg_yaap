@@ -39,13 +39,15 @@ Worker records include the OS PID. Unknown operator indices use UINT32_MAX.
 | `samples`, `qual_samples`, `proj_samples` | Observed sample counts; zero means unknown cost, not free work |
 
 `load_ms`, `prepare_ms`, `tuple_ms`, `qual_ms`, and `proj_ms` expose the
-corresponding lower-level components. `pg_access_ms` is not purely disk I/O:
-ReadStream may wait, hit shared buffers or use other I/O workers. Their
-background execution is not all charged to this scanner.
+corresponding lower-level components. `pg_access_ms` is not purely disk I/O.
+`load_ms` includes PostgreSQL's public `read_stream_next_buffer` call, which
+may return a shared-buffer hit or wait inside the native ReadStream. Its
+internal phases are not visible to the extension, and I/O worker background
+execution is not all charged to this scanner.
 
 Primary scan times are **elapsed worker-time sums, not CPU time or query wall time**.
-The separate `read-stream-cpu` fields explicitly report sampled thread CPU time;
-see `docs/yaap_read_stream.md` for their denominator and limits.
+The native ReadStream path does not expose separate submit/wait CPU or elapsed
+timers to YAAP. See `docs/yaap_read_stream.md` for its integration boundary.
 Multiple workers and pipelines overlap. In particular, never calculate a
 hypothetical columnar query latency by subtracting aggregate PG-input time from
 query wall time. The source is a parent of its categories: do not add it to

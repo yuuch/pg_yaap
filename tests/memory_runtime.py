@@ -59,8 +59,7 @@ def setup(workers=12, memory='64MB'):
             f"SET pg_yaap.parallel_max_workers={workers}; "
             f"SET pg_yaap.memory_limit='{memory}'; "
             "SET pg_yaap.parallel_min_relation_blocks=0; "
-            "SET statement_timeout='60s'; "
-            f"SET pg_yaap.scan_read_stream={os.environ.get('YAAP_TEST_READ_STREAM', 'pg')}; ")
+            "SET statement_timeout='60s'; ")
 
 
 def main():

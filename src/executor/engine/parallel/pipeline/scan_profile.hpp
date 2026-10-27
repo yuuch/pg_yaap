@@ -19,27 +19,6 @@ struct ScanProfileRecord
 	uint32 operator_id = 0, relation_oid = 0, mode = 0, pid = 0;
 	uint32 pid_conflict = 0;
 	uint64 sample_clock_overhead_ns = 0;
-	uint64 read_submit_ns = 0, read_wait_ns = 0, read_refill_ns = 0;
-	uint64 read_requests = 0, read_need_wait = 0;
-	uint64 read_requested_pages = 0, read_accepted_pages = 0;
-	uint32 read_window_pages = 0, read_batch_pages = 0, read_stream_mode = 0;
-	uint32 read_request_limit = 0;
-	uint64 read_request_limit_stops = 0, read_new_io_burst_stops = 0;
-	uint64 read_submit_samples = 0;
-	uint64 read_submit_sample_wall_ns = 0;
-	uint64 read_submit_sample_cpu_ns = 0;
-	uint64 read_wait_calls = 0;
-	uint64 read_wait_samples = 0;
-	uint64 read_wait_sample_wall_ns = 0;
-	uint64 read_wait_sample_cpu_ns = 0;
-	uint64 read_cpu_clock_failures = 0;
-	uint64 read_refill_calls = 0;
-	uint64 read_pin_limit_stops = 0;
-	uint64 read_slot_limit_stops = 0;
-	uint64 read_split_requests = 0;
-	uint64 read_accepted_single = 0;
-	uint64 read_accepted_multi = 0;
-	uint64 read_peak_inflight = 0, read_ready_pages = 0;
 	uint64 shared_blks_hit = 0, shared_blks_read = 0;
 };
 bool

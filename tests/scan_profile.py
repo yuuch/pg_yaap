@@ -11,7 +11,6 @@ import pipeline_timeline as timeline
 
 OUT = timeline.OUT
 SCHEMA = f'yaap_scan_profile_{os.getpid()}'
-READ_STREAM = os.environ.get('YAAP_TEST_READ_STREAM', 'pg')
 COSTS = ('source_ns', 'pg_access_ns', 'row_to_column_ns', 'predicate_ns',
          'setup_ns', 'visible_rows', 'output_rows', 'samples')
 
@@ -87,7 +86,7 @@ def main():
             query = queries[query_name]
             expected = timeline.checked('SET pg_yaap.enabled=off;' + query)
             prefix = OUT / f'{name}-{time.time_ns()}'
-            config = timeline.setup(prefix, workers, 'trace', capacity, legacy, read_stream=READ_STREAM)
+            config = timeline.setup(prefix, workers, 'trace', capacity, legacy)
             config += f'SET pg_yaap.profile_scan={mode}; SET pg_yaap.jit_deform={"on" if jit else "off"}; '
             result = timeline.run(config + query)
             (OUT / f'{name}.expected').write_text(expected)
@@ -134,12 +133,12 @@ def main():
             (OUT / 'summary.json').write_text(json.dumps(results, indent=2))
             print(json.dumps(results[-1]), flush=True)
         # Independent scan reporting must work without timeline or legacy modes.
-        result = timeline.run(timeline.setup(OUT/'standalone', mode='off', read_stream=READ_STREAM) +
+        result = timeline.run(timeline.setup(OUT/'standalone', mode='off') +
                               'SET pg_yaap.profile_scan=sample;' + queries['scan'])
         (OUT/'standalone.err').write_text(result.stderr)
         assert result.returncode == 0 and 'pg_yaap[scan]' in result.stderr
         results.append({'case': 'standalone', 'pass': True})
-        timeline.abnormal_checks(results, queries['two-scans'], scan_mode='sample', read_stream=READ_STREAM)
+        timeline.abnormal_checks(results, queries['two-scans'], scan_mode='sample')
     finally:
         timeline.ddl(f'DROP SCHEMA {SCHEMA} CASCADE;')
         (OUT/'summary.json').write_text(json.dumps(results, indent=2))

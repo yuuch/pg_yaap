@@ -43,15 +43,13 @@ def ddl(sql):
     checked('SET pg_yaap.enabled=off; BEGIN;' + ''.join(disable) + sql + ''.join(restore) + 'COMMIT;')
 
 
-def setup(prefix, workers=4, mode='trace', capacity=8192, legacy=False, application='', scan_mode='off', read_stream=None, io_mode='off'):
-    if read_stream is None:
-        read_stream = os.environ.get('YAAP_TEST_READ_STREAM', 'pg')
+def setup(prefix, workers=4, mode='trace', capacity=8192, legacy=False, application='', scan_mode='off', io_mode='off'):
     return (f'LOAD {quote(LIBRARY)}; SET application_name={quote(application)}; '
             f'SET pg_yaap.parallel_max_workers={workers}; SET pg_yaap.parallel_min_relation_blocks=0; '
             "SET pg_yaap.memory_limit='512MB'; SET statement_timeout='90s'; "
             f'SET pg_yaap.profile={"on" if legacy else "off"}; '
             f'SET pg_yaap.profile_timeline={mode}; SET pg_yaap.profile_trace_capacity={capacity}; '
-            f'SET pg_yaap.profile_trace_file={quote(prefix)}; SET pg_yaap.profile_scan={scan_mode}; SET pg_yaap.scan_read_stream={read_stream}; SET pg_yaap.profile_scan_io={io_mode}; ')
+            f'SET pg_yaap.profile_trace_file={quote(prefix)}; SET pg_yaap.profile_scan={scan_mode}; SET pg_yaap.profile_scan_io={io_mode}; ')
 
 
 def validate(data, dropped_ok=False):
@@ -229,14 +227,14 @@ def export_checks(results, scan):
     results.append({'case': 'export-permissions-and-failure', 'pass': True})
 
 
-def abnormal_checks(results, query, scan_mode='off', read_stream=None, io_mode='off'):
+def abnormal_checks(results, query, scan_mode='off', io_mode='off'):
     # Repeat the real join until a worker is visible; do not depend on SQL sleeps.
     heavy = f'SELECT sum(a.id+b.id) FROM {SCHEMA}.a a JOIN {SCHEMA}.b b ON a.k=b.k;'
     for kind in ('cancel', 'worker_error'):
         app = f'yaap_timeline_{kind}_{os.getpid()}'
         prefix = OUT / f'{kind}-{time.time_ns()}'
         process = subprocess.Popen(BASE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        process.stdin.write(setup(prefix, application=app, scan_mode=scan_mode, read_stream=read_stream, io_mode=io_mode) + heavy)
+        process.stdin.write(setup(prefix, application=app, scan_mode=scan_mode, io_mode=io_mode) + heavy)
         process.stdin.close()
         process.stdin = None
         target = None

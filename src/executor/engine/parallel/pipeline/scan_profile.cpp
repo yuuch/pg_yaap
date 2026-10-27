@@ -1,6 +1,5 @@
 #include "parallel/pipeline/scan_profile.hpp"
 #include "core/dsa_allocation.hpp"
-#include <algorithm>
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
 extern "C"
@@ -52,25 +51,8 @@ Add(ScanProfileRecord& a, const ScanProfileRecord& b)
 	ADD(proj_rows);
 	ADD(qual_samples);
 	ADD(proj_samples);
-	ADD(read_submit_ns); ADD(read_wait_ns); ADD(read_refill_ns);
-	ADD(read_requests); ADD(read_need_wait); ADD(read_requested_pages); ADD(read_accepted_pages);
-	ADD(read_submit_samples);
-	ADD(read_submit_sample_wall_ns);
-	ADD(read_submit_sample_cpu_ns);
-	ADD(read_wait_calls);
-	ADD(read_wait_samples);
-	ADD(read_wait_sample_wall_ns);
-	ADD(read_wait_sample_cpu_ns);
-	ADD(read_cpu_clock_failures);
-	ADD(read_refill_calls);
-	ADD(read_pin_limit_stops);
-	ADD(read_slot_limit_stops);
-	ADD(read_split_requests);
-	ADD(read_accepted_single);
-	ADD(read_accepted_multi);
-	ADD(read_request_limit_stops); ADD(read_new_io_burst_stops);
-	ADD(read_ready_pages); ADD(shared_blks_hit); ADD(shared_blks_read);
-	a.read_peak_inflight = std::max(a.read_peak_inflight, b.read_peak_inflight);
+	ADD(shared_blks_hit);
+	ADD(shared_blks_read);
 #undef ADD
 }
 void
@@ -116,26 +98,6 @@ Print(const char* level, uint32 pipeline, int worker, const ScanProfileRecord& r
 	  r.tuple_ns * ms,
 	  r.qual_ns * ms,
 	  r.proj_ns * ms);
-	if (r.read_stream_mode)
-		elog(NOTICE, "pg_yaap[read-stream] %s pipeline=%u worker=%d mode=yaap window=%u batch=%u submit_ms=%.3f wait_api_ms=%.3f refill_exclusive_ms=%.3f requests=%llu need_wait=%llu requested_pages=%llu accepted_pages=%llu",
-			level, pipeline, worker, r.read_window_pages, r.read_batch_pages,
-			r.read_submit_ns * ms, r.read_wait_ns * ms, r.read_refill_ns * ms,
-			(unsigned long long) r.read_requests, (unsigned long long) r.read_need_wait,
-			(unsigned long long) r.read_requested_pages, (unsigned long long) r.read_accepted_pages);
-    if (r.read_stream_mode) {
-        elog(NOTICE, "pg_yaap[read-stream-cpu] %s pipeline=%u worker=%d submit_samples=%llu submit_sample_wall_ms=%.3f submit_sample_cpu_ms=%.3f wait_calls=%llu wait_samples=%llu wait_sample_wall_ms=%.3f wait_sample_cpu_ms=%.3f cpu_clock_failures=%llu",
-            level, pipeline, worker,
-            (unsigned long long)r.read_submit_samples, r.read_submit_sample_wall_ns*ms, r.read_submit_sample_cpu_ns*ms,
-            (unsigned long long)r.read_wait_calls, (unsigned long long)r.read_wait_samples,
-            r.read_wait_sample_wall_ns*ms, r.read_wait_sample_cpu_ns*ms, (unsigned long long)r.read_cpu_clock_failures);
-        elog(NOTICE, "pg_yaap[read-stream-queue] %s pipeline=%u worker=%d refills=%llu pin_limit_stops=%llu slot_limit_stops=%llu split_requests=%llu accepted_single=%llu accepted_multi=%llu max_queue_inflight=%llu ready_pages=%llu request_limit=%u request_limit_stops=%llu burst_stops=%llu",
-            level,pipeline,worker,(unsigned long long)r.read_refill_calls,
-            (unsigned long long)r.read_pin_limit_stops,(unsigned long long)r.read_slot_limit_stops,
-            (unsigned long long)r.read_split_requests,(unsigned long long)r.read_accepted_single,
-            (unsigned long long)r.read_accepted_multi,(unsigned long long)r.read_peak_inflight,
-            (unsigned long long)r.read_ready_pages, r.read_request_limit,
-            (unsigned long long)r.read_request_limit_stops,(unsigned long long)r.read_new_io_burst_stops);
-    }
     const uint64 buffer_refs = r.shared_blks_hit + r.shared_blks_read;
     elog(NOTICE, "pg_yaap[scan-buffer] %s pipeline=%u worker=%d shared_hits=%llu shared_reads=%llu hit_percent=%.3f",
         level,pipeline,worker,(unsigned long long)r.shared_blks_hit,(unsigned long long)r.shared_blks_read,
@@ -200,10 +162,6 @@ ScanProfilePublish(const ExecCtx& c, const ScanProfileRecord& v)
 	r->mode = v.mode;
 	r->pid = MyProcPid;
 	r->sample_clock_overhead_ns = v.sample_clock_overhead_ns;
-	r->read_window_pages = v.read_window_pages;
-	r->read_request_limit = v.read_request_limit;
-	r->read_batch_pages = v.read_batch_pages;
-	r->read_stream_mode = v.read_stream_mode;
 }
 static void
 ReportInternal(PipelineSharedControl* c, dsa_area* d, bool success)
@@ -231,7 +189,6 @@ ReportInternal(PipelineSharedControl* c, dsa_area* d, bool success)
 			total.pid_conflict |= r.pid_conflict;
 			total.operator_id = r.operator_id;
 			total.relation_oid = r.relation_oid;
-			total.read_stream_mode = r.read_stream_mode;
 		}
 		if (total.calls) {
 			char *label = PipelineProfileEventLabel(c, d, e);
@@ -240,7 +197,6 @@ ReportInternal(PipelineSharedControl* c, dsa_area* d, bool success)
 			Print("pipeline", e / 3, -2, total, success);
 			Add(query, total);
 			query.pid_conflict |= total.pid_conflict;
-			query.read_stream_mode = total.read_stream_mode;
 		}
 	}
 	if (query.calls)

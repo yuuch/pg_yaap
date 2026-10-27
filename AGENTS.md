@@ -202,9 +202,6 @@ All defined in `pg_yaap.c::_PG_init`. All are `PGC_USERSET`.
 | `pg_yaap.profile` | bool | `off` | Emit per-stage pipeline timing after each query. |
 | `pg_yaap.profile_scan` | enum | `off` | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |
 | `pg_yaap.profile_scan_io` | enum | `off` | `off`/`summary`/`detail`: extension-only IO observations and evidence-based diagnoses; see docs/scan_io_profiler.md. |
-| `pg_yaap.scan_read_stream` | enum | `pg` | `pg`/`yaap`: select PG ReadStream or the bounded plugin queue; see docs/yaap_read_stream.md. |
-| `pg_yaap.scan_prefetch_buffers` | int, pages | `1024` | Requested YAAP prefetch window (16–8192); runtime pin budgets can reduce it. |
-| `pg_yaap.scan_prefetch_requests` | int | `1` | Maximum unconsumed YAAP read operations per source (0–64); 0 retains window-only submission. |
 | `pg_yaap.memory_limit` | int | `256MB` | Hard budget for shared breaker payloads; DSA has bounded headroom (up to 50%, capped at 4GB) for directories and allocator metadata. |
 | `pg_yaap.memory_soft_limit` | int | `-1` | Spill threshold; `-1` uses 75% of `memory_limit`. |
 | `pg_yaap.dsa_memory_limit` | int, MB | `-1` | Exact query DSA segment-capacity ceiling; `-1` preserves automatic metadata headroom. Not a whole-query RSS limit. |

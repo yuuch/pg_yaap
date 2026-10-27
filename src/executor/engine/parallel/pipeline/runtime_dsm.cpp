@@ -24,11 +24,6 @@ extern int pg_yaap_memory_limit_mb;
 extern int pg_yaap_memory_soft_limit_mb;
 extern int pg_yaap_dsa_memory_limit_mb;
 extern bool pg_yaap_jit_deform;
-extern int pg_yaap_scan_read_stream;
-extern int pg_yaap_scan_prefetch_buffers;
-extern int pg_yaap_scan_prefetch_requests;
-extern int pg_yaap_scan_prefetch_batch_pages;
-extern int pg_yaap_profile_scan_blocks;
 extern bool pg_yaap_trace_execution_path;
 extern int pg_yaap_runtime_dsa_tranche_id(void);
 }
@@ -125,11 +120,6 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 	control->db_oid = MyDatabaseId;
 	control->num_workers = num_workers;
 	control->jit_deform = pg_yaap_jit_deform ? 1 : 0;
-	control->scan_read_stream = pg_yaap_scan_read_stream;
-	control->scan_prefetch_buffers = pg_yaap_scan_prefetch_buffers;
-	control->scan_prefetch_requests = pg_yaap_scan_prefetch_requests;
-	control->scan_prefetch_batch_pages = pg_yaap_scan_prefetch_batch_pages;
-	control->profile_scan_blocks = pg_yaap_profile_scan_blocks;
 	pg_atomic_init_u32(&control->profile_enabled, 0);
 	pg_atomic_init_u32(&control->trace_execution_path, 0);
 	control->profile_records_root = InvalidDsaPointer;

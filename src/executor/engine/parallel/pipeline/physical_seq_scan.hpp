@@ -48,9 +48,6 @@ public:
 	Relation        rel = nullptr;
 	HeapScanDesc    scan_desc = nullptr;
 	ReadStream     *read_stream = nullptr;
-	YaapReadStream *yaap_read_stream = nullptr;
-	YaapReadStreamStats read_stream_published{};
-    ScanIOStats *scan_io_published = nullptr;
 	TupleDesc       scan_tupdesc = nullptr;
 	uint32          page_visible_index = 0;
 	bool            check_serializable = false;
@@ -115,11 +112,6 @@ public:
 #endif
 		if (scan_desc != nullptr)
 		{
-			if (yaap_read_stream != nullptr)
-			{
-				YaapReadStreamEnd(yaap_read_stream);
-				yaap_read_stream = nullptr;
-			}
 			if (read_stream != nullptr)
 			{
 				read_stream_end(read_stream);

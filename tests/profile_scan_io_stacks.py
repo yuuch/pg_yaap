@@ -38,8 +38,7 @@ def parse_sample(text):
             stack.pop()
         stack.append((depth, symbol))
         names = [s for _, s in stack]
-        yaap = any('YaapReadStream' in s or 'QueueRefill' in s or
-                   'PhysicalSeqScan::' in s for s in names)
+        yaap_scan = any('PhysicalSeqScan::' in s for s in names)
         def ordered(parts):
             cursor = 0
             for name in names:
@@ -49,14 +48,14 @@ def parse_sample(text):
                         return True
             return False
         category = None
-        if yaap and ordered(('pgaio_worker_submit', 'pgaio_io_perform_synchronously', 'pread')):
+        if yaap_scan and ordered(('pgaio_worker_submit', 'pgaio_io_perform_synchronously', 'pread')):
             category = 'submitter_sync_read'
         elif ordered(('IoWorkerMain', 'pgaio_io_perform_synchronously', 'pread')):
             category = 'io_worker_read'
-        elif yaap and ordered(('WaitReadBuffers', 'pgaio_io_wait')) and any(
+        elif yaap_scan and ordered(('read_stream_next_buffer', 'pgaio_io_wait')) and any(
                 s in symbol for s in ('ConditionVariable', 'WaitLatch', 'kevent', 'WaitEventSetWait')):
             category = 'buffer_io_wait'
-        elif yaap and 'GetVictimBuffer' in symbol:
+        elif yaap_scan and 'GetVictimBuffer' in symbol:
             category = 'buffer_replacement'
         if category and len(found[category]) < 3:
             found[category].append(names[-32:])
@@ -86,7 +85,7 @@ def parse_file(path):
 def self_test():
     def graph(lines):
         return 'Call graph:\n' + '\n'.join(lines) + '\nBinary Images:\n'
-    sync = ['  4 pg_yaap::pipeline::YaapReadStreamNext(x)  (in pg_yaap)',
+    sync = ['  4 pg_yaap::pipeline::PhysicalSeqScan::GetData(x)  (in pg_yaap)',
             '    4 pgaio_worker_submit  (in postgres)',
             '      4 pgaio_io_perform_synchronously  (in postgres)',
             '        4 preadv  (in kernel)']
@@ -96,7 +95,7 @@ def self_test():
     assert not parse_sample('\n'.join(sync))['observed']['submitter_sync_read']
     no_yaap = sync[1:]
     assert not parse_sample(graph(no_yaap))['observed']['submitter_sync_read']
-    wait = sync[:1] + ['    3 WaitReadBuffers  (in postgres)',
+    wait = sync[:1] + ['    3 read_stream_next_buffer  (in postgres)',
                       '      3 pgaio_io_wait  (in postgres)',
                       '        3 WaitLatch  (in postgres)']
     assert parse_sample(graph(wait))['observed']['buffer_io_wait']

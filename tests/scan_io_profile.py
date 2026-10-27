@@ -184,22 +184,22 @@ def main():
       'limit':f'SELECT 1 FROM {a} LIMIT 7;'}
     try:
         pages=int(t.checked(f"SELECT pg_relation_size('{a}')/current_setting('block_size')::bigint;"))
-        cases=[('off','checksum',4,'off','yaap',False,8192),
-               ('summary','checksum',4,'summary','yaap',False,8192),
-               *[(f'workers-{w}','checksum',w,'detail','yaap',False,8192) for w in (1,4,8,12)],
-               ('filter','filter',4,'detail','yaap',False,8192),
-               ('strings','strings',4,'detail','yaap',False,8192),
-               ('empty','empty',4,'detail','yaap',False,8192),
-               ('reject','reject',4,'detail','yaap',False,8192),
-               ('join','join',4,'detail','yaap',False,8192),
-               ('limit','limit',4,'detail','yaap',False,8192),
+        cases=[('off','checksum',4,'off','pg',False,8192),
+               ('summary','checksum',4,'summary','pg',False,8192),
+               *[(f'workers-{w}','checksum',w,'detail','pg',False,8192) for w in (1,4,8,12)],
+               ('filter','filter',4,'detail','pg',False,8192),
+               ('strings','strings',4,'detail','pg',False,8192),
+               ('empty','empty',4,'detail','pg',False,8192),
+               ('reject','reject',4,'detail','pg',False,8192),
+               ('join','join',4,'detail','pg',False,8192),
+               ('limit','limit',4,'detail','pg',False,8192),
                ('native','checksum',4,'detail','pg',False,8192),
-               ('legacy','checksum',4,'detail','yaap',True,8192),
-               ('overflow','checksum',4,'detail','yaap',False,1)]
+               ('legacy','checksum',4,'detail','pg',True,8192),
+               ('overflow','checksum',4,'detail','pg',False,1)]
         for name,q,workers,mode,stream,legacy,cap in cases:
             expected=t.checked('SET pg_yaap.enabled=off;'+sql[q])
             prefix=OUT/f'{name}-{time.time_ns()}'
-            config=t.setup(prefix,workers,'trace',cap,legacy,read_stream=stream,io_mode=mode)
+            config=t.setup(prefix,workers,'trace',cap,legacy,io_mode=mode)
             r=t.run(config+sql[q]);(OUT/f'{name}.out').write_text(r.stdout);(OUT/f'{name}.err').write_text(r.stderr)
             assert r.returncode==0,(name,r.stderr)
             assert sorted(r.stdout.splitlines())==sorted(expected.splitlines()),name
@@ -236,12 +236,12 @@ def main():
                         assert h['validated_ready_upper_ns']['count']==o['validation_observations']
             results.append({'case':name,'pass':True,'trace':str(files[0])})
             (OUT/'summary.json').write_text(json.dumps(results,indent=2));print(json.dumps(results[-1]),flush=True)
-        r=t.run(t.setup(OUT/'standalone',mode='off',read_stream='yaap',io_mode='summary')+sql['checksum'])
+        r=t.run(t.setup(OUT/'standalone',mode='off',io_mode='summary')+sql['checksum'])
         (OUT/'standalone.err').write_text(r.stderr)
         assert r.returncode==0 and 'pg_yaap[scan-io] query ' in r.stderr
         assert 'pg_yaap[timing]' not in r.stderr and 'pg_yaap[scan] query' not in r.stderr
         results.append({'case':'independent-summary','pass':True})
-        t.abnormal_checks(results,sql['join'],read_stream='yaap',io_mode='detail')
+        t.abnormal_checks(results,sql['join'],io_mode='detail')
     finally:
         t.ddl(f'DROP SCHEMA {SCHEMA} CASCADE;')
         (OUT/'summary.json').write_text(json.dumps(results,indent=2))

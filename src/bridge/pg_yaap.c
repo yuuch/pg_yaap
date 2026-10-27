@@ -51,21 +51,6 @@ bool pg_yaap_parallel_leader_participation = true;
 bool pg_yaap_parallel_experimental_hash_pipeline = false;
 bool pg_yaap_disable_jit_for_parallel_worker = false;
 bool pg_yaap_profile = false;
-extern int pg_yaap_scan_read_stream;
-extern int pg_yaap_scan_prefetch_buffers;
-extern int pg_yaap_scan_prefetch_requests;
-extern int pg_yaap_scan_prefetch_batch_pages;
-extern int pg_yaap_profile_scan_blocks;
-int pg_yaap_scan_read_stream = 1;
-int pg_yaap_scan_prefetch_buffers = 1024;
-int pg_yaap_scan_prefetch_requests = 1;
-int pg_yaap_scan_prefetch_batch_pages = 0;
-int pg_yaap_profile_scan_blocks = 0;
-static const struct config_enum_entry pg_yaap_scan_read_stream_options[] = {
-	{"pg", 0, false},
-	{"yaap", 1, false},
-	{NULL, 0, false}
-};
 extern int pg_yaap_profile_scan_io;
 extern int pg_yaap_profile_scan_io_wait_pct;
 extern int pg_yaap_profile_scan_io_min_pages;
@@ -432,29 +417,6 @@ _PG_init(void)
 							 NULL, &pg_yaap_profile_scan, 0,
 							 pg_yaap_profile_scan_options, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
-	DefineCustomEnumVariable("pg_yaap.scan_read_stream",
-							 "Select YAAP's ringless shared-buffer queue or native PG ReadStream.",
-							 NULL, &pg_yaap_scan_read_stream, 1,
-							 pg_yaap_scan_read_stream_options, PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomIntVariable("pg_yaap.scan_prefetch_buffers",
-							 "Requested YAAP scan queue window in buffer pages; runtime pin budgets may reduce it.",
-							 NULL, &pg_yaap_scan_prefetch_buffers, 1024, 16, 8192,
-							 PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomIntVariable("pg_yaap.scan_prefetch_requests",
-							 "Maximum unconsumed asynchronous requests per YAAP source (0 retains window-only submission).",
-							 NULL, &pg_yaap_scan_prefetch_requests, 1, 0, 64,
-							 PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomIntVariable("pg_yaap.scan_prefetch_batch_pages",
-                             "Maximum pages per YAAP read request (0 uses io_combine_limit).",
-                             NULL, &pg_yaap_scan_prefetch_batch_pages, 0, 0, 128,
-                             PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomIntVariable("pg_yaap.profile_scan_blocks",
-                             "Bounded block diagnostic events per YAAP scan source (0 disables).",
-                             NULL, &pg_yaap_profile_scan_blocks, 0, 0, 65536,
-                             PGC_USERSET, 0, NULL, NULL, NULL);
-
 	DefineCustomEnumVariable("pg_yaap.profile_timeline",
 							 "Record pipeline and worker task execution intervals.",
 							 NULL, &pg_yaap_profile_timeline, 0,

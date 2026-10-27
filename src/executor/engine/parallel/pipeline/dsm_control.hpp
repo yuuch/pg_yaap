@@ -107,11 +107,6 @@ struct PipelineSharedControl
 	int32            num_workers;
 	/* Backend-local execution settings captured before bgworker launch. */
 	uint8            jit_deform;
-	uint32           scan_read_stream;
-	uint32           scan_prefetch_buffers;
-	uint32           scan_prefetch_requests;
-	uint32           scan_prefetch_batch_pages;
-	uint32           profile_scan_blocks;
 
 	/*
 	 * Optional per-query profiling storage. The leader allocates the records

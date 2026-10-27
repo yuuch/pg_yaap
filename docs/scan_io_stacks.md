@@ -1,14 +1,14 @@
 # Scan I/O stack evidence on macOS
 
-The extension can time `StartReadBuffers` and `WaitReadBuffers`, but their elapsed
-cost alone cannot establish whether a YAAP compute worker executed a synchronous
-read. Use the optional external helper to collect bounded stack evidence while a
-representative query runs. No PostgreSQL kernel changes, symbol interception, or
-executor changes are required.
+YAAP uses PostgreSQL's native ReadStream, so the extension cannot time its
+internal `StartReadBuffers` and `WaitReadBuffers` calls. Use the optional
+external helper to collect bounded stack evidence while a representative query
+runs. No PostgreSQL kernel changes, symbol interception, or executor changes
+are required.
 
 ## Collect
 
-Start the query with the normal Scan I/O profiler. In another terminal, select
+Start the query. In another terminal, select
 explicit YAAP worker PIDs belonging to that query. In a dedicated instance,
 `SELECT pid, backend_type FROM pg_stat_activity WHERE backend_type='pg_yaap worker'`
 is useful; in a shared instance, that predicate alone does **not** establish query
@@ -38,13 +38,13 @@ attribution:
 - `submitter_sync_read`: the same YAAP scan stack contains
   `pgaio_worker_submit → pgaio_io_perform_synchronously → pread/preadv`.
 - `buffer_io_wait`: the same YAAP scan stack contains
-  `WaitReadBuffers → pgaio_io_wait →` a wait primitive.
+  `read_stream_next_buffer → pgaio_io_wait →` a wait primitive.
 - `io_worker_read`: `IoWorkerMain → pgaio_io_perform_synchronously → pread/preadv`
   occurs within one stack. This is expected execution inside an I/O worker and
   is kept separate from compute-worker synchronous execution.
 - `buffer_replacement`: `GetVictimBuffer` appears below a YAAP scan frame.
-  Replacement is normal during a large sequential scan; its presence does not
-  establish Shared Buffer pressure or an undersized ring.
+  Replacement is normal under the shared-buffer policy; its presence does not
+  establish Shared Buffer pressure.
 
 The parser follows indentation in the `sample` call graph. Unrelated branches,
 threads, flat symbol summaries, and binary image names cannot jointly establish
