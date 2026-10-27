@@ -1,5 +1,12 @@
 #include "parallel/pipeline/yaap_pipeline_init_internal.hpp"
 
+extern "C" {
+#include "storage/dsm.h"
+#include "storage/shm_toc.h"
+}
+
+#include "parallel/pipeline/dsm_control.hpp"
+
 #include <cerrno>
 #include <cstdlib>
 
@@ -1309,6 +1316,23 @@ CollectJoinKeys(const Expression *expr,
 	return true;
 }
 
+static bool
+HasOuterHashJoin(const PipelineOperator *op)
+{
+	if (op == nullptr)
+		return false;
+	if (op->type() == pg_yaap::pipeline::PhysicalOperatorType::HASH_JOIN) {
+		const auto *join = static_cast<const PipelineHashJoin *>(op);
+		if (join->join_mode() == pg_yaap::pipeline::HashJoinMatchMode::LEFT ||
+			join->join_mode() == pg_yaap::pipeline::HashJoinMatchMode::RIGHT)
+			return true;
+	}
+	for (const auto &child : op->children())
+		if (HasOuterHashJoin(child.get()))
+			return true;
+	return false;
+}
+
 std::unique_ptr<PipelineOperator>
 BuildOutputContract(OptimizerNodeTranslation &node,
 					QueryDesc *queryDesc,
@@ -1319,6 +1343,8 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	TupleDataLayout output_layout;
 	if (!BuildColumnOnlyLayout(node.schema, output_layout))
 		return nullptr;
+	if (HasOuterHashJoin(node.op.get()))
+		TupleDataLayoutEnableValidity(&output_layout);
 	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(node.schema, state->runtime_dsa);
 	dsa_pointer output_layout_dp = SerializeTupleDataLayout(output_layout, state->runtime_dsa);
 	if (!DsaPointerIsValid(output_schema_dp) || !DsaPointerIsValid(output_layout_dp))
@@ -1329,7 +1355,32 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	uint32_t row_capacity = EstimateInitialResultRows(queryDesc, node.estimated_groups);
 	if (topn_output)
 		row_capacity = static_cast<uint32_t>(std::max<uint64_t>(1, std::min<uint64_t>(row_capacity, node.limit_count)));
-	const dsa_pointer output_payload_dp = BuildOutputTdc(state->runtime_dsa, output_layout_dp, output_layout, row_capacity);
+	dsa_pointer segment_arena_dp = InvalidDsaPointer;
+	dsa_pointer buffer_state_dp = InvalidDsaPointer;
+	if (state->runtime_dsm != nullptr)
+	{
+		shm_toc *toc = shm_toc_attach(pipeline::PIPELINE_DSM_MAGIC,
+			dsm_segment_address(state->runtime_dsm));
+		if (toc != nullptr)
+		{
+			auto *control = static_cast<pipeline::PipelineSharedControl *>(
+				shm_toc_lookup(toc, pipeline::PIPELINE_DSM_KEY_CONTROL, true));
+			if (control != nullptr)
+			{
+				segment_arena_dp = control->shared_segment_arena_root;
+				buffer_state_dp = control->buffer_state_root;
+			}
+		}
+	}
+	/* Small Top-N retains a bounded replacement table; larger ordered output
+	 * streams segments into PostgreSQL external sort on the leader. */
+	if (topn_output && node.limit_count <= 4096)
+	{
+		segment_arena_dp = InvalidDsaPointer;
+		buffer_state_dp = InvalidDsaPointer;
+	}
+	const dsa_pointer output_payload_dp = BuildOutputTdc(state->runtime_dsa,
+		output_layout_dp, output_layout, row_capacity, segment_arena_dp, buffer_state_dp);
 	if (!DsaPointerIsValid(output_payload_dp))
 		return nullptr;
 	const dsa_pointer final_sort_keys_dp = BuildFilterArray(state->runtime_dsa,

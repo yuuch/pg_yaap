@@ -23,6 +23,7 @@
  */
 
 #include "aggregate_hash_table.hpp"
+#include "buffer_manager/yaap_segment_row_refs.hpp"
 
 extern "C" {
 #include "postgres.h"
@@ -409,12 +410,215 @@ AggregateHashTableInit(AggregateHashTable *aht, uint32_t capacity, dsa_pointer t
 	aht->capacity      = capacity;
 	aht->capacity_mask = capacity - 1u;
 	aht->tdc_dp        = tdc_dp;
+	aht->row_refs_dp   = InvalidDsaPointer;
+	aht->row_ref_capacity = 0;
 	SpinLockInit(&aht->mutex);
 	aht->_pad = 0;
 
 	/* dsa_allocate0 gives value=0, a valid packed [salt=0,row=0] entry. */
 	for (uint32_t i = 0; i < capacity; ++i)
 		aht->entries[i].value = AHT_EMPTY_ENTRY_VALUE;
+}
+
+void
+AggregateHashTableEnableSegmentRefs(dsa_area *dsa, AggregateHashTable *aht,
+										uint32_t row_capacity)
+{
+	if (dsa == nullptr || aht == nullptr || row_capacity == 0)
+		ereport(ERROR, (errmsg("pg_yaap: invalid AHT segment reference parameters")));
+	if (DsaPointerIsValid(aht->row_refs_dp))
+		return;
+	aht->row_refs_dp = buffer::YaapSegmentRowRefTableCreate(dsa, row_capacity);
+	aht->row_ref_capacity = row_capacity;
+}
+
+bool
+AggregateHashTableRecordSegmentRow(dsa_area *dsa, AggregateHashTable *aht,
+										uint32_t row_index,
+										dsa_pointer arena_dp,
+										dsa_pointer segment_desc_dp,
+										const buffer::YaapSegmentHandle &segment,
+										uint32_t segment_row_index)
+{
+	if (aht == nullptr || !DsaPointerIsValid(aht->row_refs_dp))
+		return true;
+	auto *table = static_cast<buffer::YaapSegmentRowRefTable *>(
+		dsa_get_address(dsa, aht->row_refs_dp));
+	if (table == nullptr)
+		return false;
+	const uint32_t count = pg_atomic_read_u32(&table->count);
+	if (row_index < count)
+	{
+		const auto *existing = buffer::YaapSegmentRowRefGet(dsa, table, row_index);
+		return existing != nullptr && existing->segment.arena_id == segment.arena_id &&
+			existing->segment.segment_id == segment.segment_id &&
+			existing->segment.generation == segment.generation &&
+			existing->row_index == (segment_row_index == UINT32_MAX ? row_index : segment_row_index);
+	}
+	if (row_index != count)
+		return false;
+	(void) arena_dp;
+	auto *segment_desc = segment_desc_dp != InvalidDsaPointer
+		? static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(dsa, segment_desc_dp))
+		: nullptr;
+	if (segment_desc == nullptr)
+		return false;
+	const auto ref_id = buffer::YaapSegmentRowRefAppend(dsa, table,
+		buffer::YaapSegmentRowRef{segment,
+			segment_row_index == UINT32_MAX ? row_index : segment_row_index});
+	if (ref_id != buffer::YAAP_INVALID_SEGMENT_ROW_REF)
+		aht->row_ref_capacity = table->capacity;
+	return ref_id == row_index;
+}
+
+void
+AggregateHashTableCombineRowSegmented(AggregateHashTable *aht,
+									dsa_area *dsa,
+									dsa_pointer arena_dp,
+									buffer::YaapBufferSharedState *buffer_state,
+									buffer::YaapSegmentedTdc *segmented_tdc,
+									uint32_t *row_count,
+									const TupleDataLayout *layout,
+									const TupleDataCollection *src_tdc,
+									const uint8_t *src_row,
+									uint64_t hash)
+{
+	if (aht == nullptr || dsa == nullptr || buffer_state == nullptr ||
+		segmented_tdc == nullptr || row_count == nullptr || layout == nullptr ||
+		src_tdc == nullptr || src_row == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: invalid segmented hash aggregate combine state")));
+
+	const uint16_t salt = HashSalt(hash);
+	const uint32_t step = ProbeStep(hash);
+	uint32_t slot = static_cast<uint32_t>(hash) & aht->capacity_mask;
+	uint8_t *canonical_row = nullptr;
+
+	/* Partition owner serializes combine; appending may allocate or ERROR. */
+	for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+	{
+		AggHtEntry &entry = aht->entries[slot];
+		if (EntryIsEmpty(entry))
+		{
+			const uint32_t global_row_index = *row_count;
+			buffer::YaapSegmentedRowHandle handle;
+			TupleDataCollection *store = nullptr;
+			if (!buffer::YaapSegmentedTdcAppendWithHeap(dsa, buffer_state, segmented_tdc,
+				TupleDataCollectionRequiredHeapBytesForRow(layout, src_tdc, src_row),
+				&handle, &store, &canonical_row) || store == nullptr)
+			{
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("pg_yaap: segmented hash aggregate row append failed")));
+			}
+			/* A retired DSA segment can be reused with old payload bytes. Every
+			 * newly claimed canonical row must start with zero aggregate state. */
+			std::memset(canonical_row, 0, layout->row_width);
+			CopyGroupColumns(layout, src_tdc, src_row, store, canonical_row);
+			for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+			{
+				const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+				if (agg.kind == TdcAggKind::MIN_INT64 || agg.kind == TdcAggKind::MIN_NUMERIC)
+				{
+					const int64_t init_min = INT64_MAX;
+					std::memcpy(canonical_row + agg.offset, &init_min, sizeof(init_min));
+				}
+				else if (agg.kind == TdcAggKind::MAX_INT64 || agg.kind == TdcAggKind::MAX_NUMERIC)
+				{
+					const int64_t init_max = INT64_MIN;
+					std::memcpy(canonical_row + agg.offset, &init_max, sizeof(init_max));
+				}
+			}
+			auto *segment = buffer::YaapSharedSegmentResolve(dsa, arena_dp, handle.segment);
+			if (segment == nullptr || !AggregateHashTableRecordSegmentRow(dsa, aht,
+				global_row_index, arena_dp, segment->self_dp, handle.segment, handle.row_index))
+			{
+				ereport(ERROR, (errmsg("pg_yaap: segmented hash aggregate row reference append failed")));
+			}
+			entry.value = PackEntry(salt, global_row_index);
+			++*row_count;
+			CombineAggregates(layout, canonical_row, src_row);
+			return;
+		}
+
+		if (EntrySalt(entry) == salt)
+		{
+			const uint32_t existing_index = EntryRowIndex(entry);
+			const uint8_t *existing_row = AggregateHashTableResolveRow(dsa, aht,
+				nullptr, existing_index, arena_dp);
+			const auto *ref = DsaPointerIsValid(aht->row_refs_dp)
+				? buffer::YaapSegmentRowRefGet(dsa,
+					static_cast<const buffer::YaapSegmentRowRefTable *>(
+						dsa_get_address(dsa, aht->row_refs_dp)), existing_index) : nullptr;
+				const auto *segment = ref != nullptr
+					? buffer::YaapSharedSegmentResolve(dsa, arena_dp, ref->segment) : nullptr;
+			const auto *store = segment != nullptr && DsaPointerIsValid(segment->payload_dp)
+				? static_cast<const TupleDataCollection *>(
+					dsa_get_address(dsa, segment->payload_dp)) : nullptr;
+			if (existing_row != nullptr && store != nullptr &&
+				MatchGroupRow(layout, store, existing_row, src_tdc, src_row))
+			{
+				CombineAggregates(layout, const_cast<uint8_t *>(existing_row), src_row);
+				return;
+			}
+		}
+		slot = (slot + step) & aht->capacity_mask;
+	}
+	ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_yaap: segmented hash aggregate AHT full (capacity=%u)",
+						aht->capacity)));
+}
+
+void
+AggregateHashTableCopySegmentRefs(dsa_area *dsa, const AggregateHashTable *src,
+									  AggregateHashTable *dst)
+{
+	if (src == nullptr || dst == nullptr || !DsaPointerIsValid(src->row_refs_dp))
+		return;
+	const auto *src_table = static_cast<const buffer::YaapSegmentRowRefTable *>(
+		dsa_get_address(dsa, src->row_refs_dp));
+	const uint32_t count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&src_table->count));
+	AggregateHashTableEnableSegmentRefs(dsa, dst, dst->row_ref_capacity > 0 ?
+		dst->row_ref_capacity : src->row_ref_capacity);
+	auto *dst_table = static_cast<buffer::YaapSegmentRowRefTable *>(
+		dsa_get_address(dsa, dst->row_refs_dp));
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		const auto *ref = buffer::YaapSegmentRowRefGet(dsa, src_table, i);
+		if (ref == nullptr || buffer::YaapSegmentRowRefAppend(dsa, dst_table, *ref) != i)
+			ereport(ERROR, (errmsg("pg_yaap: AHT segmented reference copy failed at row %u", i)));
+	}
+}
+
+const uint8_t *
+AggregateHashTableResolveRow(dsa_area *dsa, const AggregateHashTable *aht,
+							 const TupleDataCollection *flat_tdc,
+							 uint32_t row_index, dsa_pointer arena_dp)
+{
+	if (aht != nullptr && DsaPointerIsValid(aht->row_refs_dp))
+	{
+		auto *table = static_cast<const buffer::YaapSegmentRowRefTable *>(
+			dsa_get_address(dsa, aht->row_refs_dp));
+		const auto *ref = buffer::YaapSegmentRowRefGet(dsa, table, row_index);
+		if (ref == nullptr)
+			return nullptr;
+		auto *arena = buffer::YaapSharedSegmentArenaResolve(dsa, arena_dp);
+			auto *segment = buffer::YaapSharedSegmentResolve(dsa, arena_dp, ref->segment);
+		if (arena == nullptr || segment == nullptr || segment->arena_id != ref->segment.arena_id ||
+			segment->segment_id != ref->segment.segment_id ||
+			segment->generation != ref->segment.generation ||
+			segment->arena_id != arena->arena_id)
+			return nullptr;
+		auto *store = static_cast<const TupleDataCollection *>(
+			dsa_get_address(dsa, segment->payload_dp));
+		if (store == nullptr || ref->row_index >= pg_atomic_read_u32(
+			const_cast<pg_atomic_uint32 *>(&store->row_count)))
+			return nullptr;
+		return TupleDataCollectionGetRowConst(store, ref->row_index);
+	}
+	if (flat_tdc == nullptr || row_index >= pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&flat_tdc->row_count)))
+		return nullptr;
+	return TupleDataCollectionGetRowConst(flat_tdc, row_index);
 }
 
 void
@@ -451,6 +655,45 @@ AggregateHashTableRehash(AggregateHashTable *aht,
 				        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				         errmsg("pg_yaap: AggregateHashTable rehash failed (capacity=%u)",
 				                aht->capacity)));
+		}
+	}
+}
+
+void
+AggregateHashTableRehashSegmented(AggregateHashTable *aht, dsa_area *dsa,
+                                  dsa_pointer arena_dp, TupleDataCollection *flat_tdc,
+                                  const TupleDataLayout *layout)
+{
+	Assert(aht != nullptr && dsa != nullptr && flat_tdc != nullptr && layout != nullptr);
+	for (uint32_t i = 0; i < aht->capacity; ++i)
+		aht->entries[i].value = AHT_EMPTY_ENTRY_VALUE;
+	const auto *table = static_cast<const buffer::YaapSegmentRowRefTable *>(
+		dsa_get_address(dsa, aht->row_refs_dp));
+	const uint32_t row_count = pg_atomic_read_u32(&flat_tdc->row_count);
+	for (uint32_t row_idx = 0; row_idx < row_count; ++row_idx)
+	{
+		const auto *ref = buffer::YaapSegmentRowRefGet(dsa, table, row_idx);
+		if (ref == nullptr)
+			ereport(ERROR, (errmsg("pg_yaap: segmented AHT row reference missing during rehash")));
+		const auto segmented = buffer::YaapSegmentedRowHandle{ref->segment, ref->row_index};
+		auto *store = buffer::YaapSegmentedTdcResolveStore(dsa, segmented, arena_dp);
+		const uint8_t *row = buffer::YaapSegmentedTdcResolveRow(dsa, segmented, arena_dp);
+		if (store == nullptr || row == nullptr)
+			ereport(ERROR, (errmsg("pg_yaap: segmented AHT row unavailable during rehash")));
+		const uint64_t hash = HashGroupRow(layout, store, row);
+		const uint16_t salt = HashSalt(hash);
+		uint32_t slot = static_cast<uint32_t>(hash) & aht->capacity_mask;
+		const uint32_t step = ProbeStep(hash);
+		for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+		{
+			if (EntryIsEmpty(aht->entries[slot]))
+			{
+				aht->entries[slot].value = PackEntry(salt, row_idx);
+				break;
+			}
+			slot = (slot + step) & aht->capacity_mask;
+			if (tries + 1 == aht->capacity)
+				ereport(ERROR, (errmsg("pg_yaap: segmented AHT rehash failed")));
 		}
 	}
 }
@@ -500,7 +743,9 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
                                     PipelineChunk &chunk,
                                     const AggregateHashTableBatchProbeInput *inputs,
                                     uint16_t count,
-                                    AggregateHashTableBatchProbeResult *results)
+                                    AggregateHashTableBatchProbeResult *results,
+                                    dsa_area *segment_dsa,
+                                    dsa_pointer segment_arena_dp)
 {
 	Assert(aht != nullptr && tdc != nullptr && layout != nullptr);
 	Assert(inputs != nullptr && results != nullptr);
@@ -605,13 +850,32 @@ AggregateHashTableFindOrInsertBatch(AggregateHashTable *aht,
 
 				if (match_count > 0)
 				{
-					MatchGroupBatch(layout,
-						tdc,
-						match_rows,
-						chunk,
-						match_row_indices,
-						match_count,
-						match_results);
+					if (segment_dsa != nullptr && DsaPointerIsValid(aht->row_refs_dp))
+					{
+						const auto *refs = static_cast<const buffer::YaapSegmentRowRefTable *>(
+							dsa_get_address(segment_dsa, aht->row_refs_dp));
+						for (uint16_t m = 0; m < match_count; ++m)
+						{
+							const auto *ref = buffer::YaapSegmentRowRefGet(segment_dsa, refs,
+								match_existing_indices[m]);
+							if (ref == nullptr)
+								ereport(ERROR, (errmsg("pg_yaap: segmented AHT match reference missing")));
+								auto *segment = buffer::YaapSharedSegmentResolve(
+									segment_dsa, segment_arena_dp, ref->segment);
+							auto *row_store = segment != nullptr
+								? static_cast<TupleDataCollection *>(dsa_get_address(segment_dsa,
+									segment->payload_dp)) : nullptr;
+							const uint8_t *row = AggregateHashTableResolveRow(segment_dsa, aht,
+								tdc, match_existing_indices[m], segment_arena_dp);
+							if (row_store == nullptr || row == nullptr)
+								ereport(ERROR, (errmsg("pg_yaap: segmented AHT match row unavailable")));
+							match_results[m] = MatchGroup(layout, row_store, row, chunk,
+								match_row_indices[m]);
+						}
+					}
+					else
+						MatchGroupBatch(layout, tdc, match_rows, chunk,
+							match_row_indices, match_count, match_results);
 					for (uint16_t m = 0; m < match_count; ++m)
 					{
 						const uint16_t input_idx = match_input_indices[m];
@@ -730,6 +994,101 @@ AggregateHashTableCombineRow(AggregateHashTable *aht,
 		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 		         errmsg("pg_yaap: AggregateHashTableCombineRow AHT full (capacity=%u)",
 		                aht->capacity)));
+}
+
+bool
+AggregateHashTableFindOrInsertSegmented(AggregateHashTable *aht,
+									dsa_area *dsa,
+									dsa_pointer arena_dp,
+									buffer::YaapBufferSharedState *buffer_state,
+									buffer::YaapSegmentedTdc *segmented_tdc,
+									uint32_t *row_count,
+									const TupleDataLayout *layout,
+									PipelineChunk &chunk,
+									uint16_t input_row_idx,
+									uint64_t hash,
+									TupleDataCollection **row_store,
+									uint8_t **row)
+{
+	if (aht == nullptr || dsa == nullptr || buffer_state == nullptr ||
+		segmented_tdc == nullptr || row_count == nullptr || layout == nullptr ||
+		row_store == nullptr || row == nullptr || input_row_idx >= chunk.count)
+		ereport(ERROR, (errmsg("pg_yaap: invalid segmented aggregate probe state")));
+	const uint16_t salt = HashSalt(hash);
+	const uint32_t step = ProbeStep(hash);
+	uint32_t slot = static_cast<uint32_t>(hash) & aht->capacity_mask;
+	SpinLockAcquire(&aht->mutex);
+	for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+	{
+		AggHtEntry &entry = aht->entries[slot];
+		if (EntryIsEmpty(entry))
+		{
+			const uint32_t stable_row_idx = *row_count;
+			buffer::YaapSegmentedRowHandle handle;
+			if (!buffer::YaapSegmentedTdcAppendWithHeap(dsa, buffer_state, segmented_tdc,
+				TupleDataCollectionRequiredHeapBytesForChunkRow(layout, chunk, input_row_idx),
+				&handle, row_store, row))
+			{
+				SpinLockRelease(&aht->mutex);
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("pg_yaap: segmented aggregate row append failed")));
+			}
+			/* A retired DSA segment may be reused with stale payload bytes. */
+			std::memset(*row, 0, layout->row_width);
+			ScatterGroupOnly(layout, *row_store, *row, chunk, input_row_idx);
+			for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+			{
+				const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+				if (agg.kind == TdcAggKind::MIN_INT64 || agg.kind == TdcAggKind::MIN_NUMERIC)
+				{
+					const int64_t init_min = INT64_MAX;
+					std::memcpy(*row + agg.offset, &init_min, sizeof(init_min));
+				}
+				else if (agg.kind == TdcAggKind::MAX_INT64 || agg.kind == TdcAggKind::MAX_NUMERIC)
+				{
+					const int64_t init_max = INT64_MIN;
+					std::memcpy(*row + agg.offset, &init_max, sizeof(init_max));
+				}
+			}
+			auto *segment = buffer::YaapSharedSegmentResolve(dsa, arena_dp, handle.segment);
+			if (segment == nullptr || !AggregateHashTableRecordSegmentRow(dsa, aht,
+				stable_row_idx, arena_dp, segment->self_dp, handle.segment, handle.row_index))
+			{
+				SpinLockRelease(&aht->mutex);
+				ereport(ERROR, (errmsg("pg_yaap: segmented aggregate row reference append failed")));
+			}
+			entry.value = PackEntry(salt, stable_row_idx);
+			++*row_count;
+			SpinLockRelease(&aht->mutex);
+			return true;
+		}
+		if (EntrySalt(entry) == salt)
+		{
+			const uint32_t existing_idx = EntryRowIndex(entry);
+			const uint8_t *existing = AggregateHashTableResolveRow(dsa, aht, nullptr,
+				existing_idx, arena_dp);
+			const auto *refs = static_cast<const buffer::YaapSegmentRowRefTable *>(
+				dsa_get_address(dsa, aht->row_refs_dp));
+			const auto *ref = buffer::YaapSegmentRowRefGet(dsa, refs, existing_idx);
+				auto *segment = ref != nullptr
+					? buffer::YaapSharedSegmentResolve(dsa, arena_dp, ref->segment) : nullptr;
+			auto *store = segment != nullptr && DsaPointerIsValid(segment->payload_dp)
+				? static_cast<TupleDataCollection *>(dsa_get_address(dsa, segment->payload_dp))
+				: nullptr;
+			if (existing != nullptr && store != nullptr &&
+				MatchGroup(layout, store, existing, chunk, input_row_idx))
+			{
+				*row_store = store;
+				*row = const_cast<uint8_t *>(existing);
+				SpinLockRelease(&aht->mutex);
+				return false;
+			}
+		}
+		slot = (slot + step) & aht->capacity_mask;
+	}
+	SpinLockRelease(&aht->mutex);
+	ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_yaap: segmented aggregate AHT full (capacity=%u)", aht->capacity)));
 }
 
 }  /* namespace pipeline */

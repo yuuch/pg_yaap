@@ -1,4 +1,7 @@
 #include "parallel/pipeline/pipeline_profile.hpp"
+#include "parallel/pipeline/pipeline_timeline.hpp"
+#include "parallel/pipeline/scan_profile.hpp"
+#include "parallel/pipeline/scan_io_profile.hpp"
 
 extern "C" {
 #include "utils/dsa.h"
@@ -47,6 +50,37 @@ StageName(PipelineProfileStage stage)
 	switch (stage)
 	{
 		case PipelineProfileStage::TOTAL: return "total";
+		case PipelineProfileStage::HASH_JOIN_BATCH_TABLES: return "hash_join_batch_tables";
+		case PipelineProfileStage::HASH_JOIN_BATCH_PARTITIONS: return "hash_join_batch_partitions";
+		case PipelineProfileStage::HASH_JOIN_BATCH_DIRECT_REFS: return "hash_join_batch_direct_refs";
+		case PipelineProfileStage::HASH_JOIN_WAIT_PIN: return "hash_join_wait_pin";
+		case PipelineProfileStage::HASH_JOIN_WAIT_DIRECTORY: return "hash_join_wait_directory";
+		case PipelineProfileStage::HASH_JOIN_WAIT_BUILD: return "hash_join_wait_build";
+		case PipelineProfileStage::HASH_JOIN_WAIT_PREPARED: return "hash_join_wait_prepared";
+		case PipelineProfileStage::HASH_JOIN_WAIT_SCAN: return "hash_join_wait_scan";
+		case PipelineProfileStage::HASH_JOIN_WAIT_RELEASE: return "hash_join_wait_release";
+		case PipelineProfileStage::HASH_JOIN_WAIT_CLEANUP: return "hash_join_wait_cleanup";
+		case PipelineProfileStage::HASH_JOIN_WAIT_DRAIN: return "hash_join_wait_drain";
+		case PipelineProfileStage::HASH_JOIN_BATCH_PIN: return "hash_join_batch_pin";
+		case PipelineProfileStage::HASH_JOIN_PROBE_CHAINS: return "hash_join_probe_chains";
+		case PipelineProfileStage::HASH_JOIN_PROBE_PREFETCH: return "hash_join_probe_prefetch";
+		case PipelineProfileStage::HASH_JOIN_UNMATCHED_BUILD_SCAN: return "hash_join_unmatched_build_scan";
+		case PipelineProfileStage::HASH_JOIN_MATCHED_BUILD_ROWS: return "hash_join_matched_build_rows";
+		case PipelineProfileStage::HASH_JOIN_PROBE_SPILL: return "hash_join_probe_spill";
+		case PipelineProfileStage::HASH_JOIN_BATCH_CLEANUP: return "hash_join_batch_cleanup";
+		case PipelineProfileStage::HASH_JOIN_BATCH_REF_SAMPLE: return "hash_join_batch_ref_sample";
+		case PipelineProfileStage::HASH_JOIN_BATCH_HASH_SAMPLE: return "hash_join_batch_hash_sample";
+		case PipelineProfileStage::HASH_JOIN_BATCH_INSERT_SAMPLE: return "hash_join_batch_insert_sample";
+		case PipelineProfileStage::HASH_JOIN_BATCH_REF_DESTROY: return "hash_join_batch_ref_destroy";
+		case PipelineProfileStage::HASH_JOIN_BATCH_COLLISIONS: return "hash_join_batch_collisions";
+		case PipelineProfileStage::HASH_JOIN_HYBRID_INITIAL_PARTITIONS: return "hash_join_hybrid_initial_partitions";
+		case PipelineProfileStage::HASH_JOIN_HYBRID_DIRECT_ROWS: return "hash_join_hybrid_direct_rows";
+		case PipelineProfileStage::HASH_JOIN_HYBRID_DEFERRED_ROWS: return "hash_join_hybrid_deferred_rows";
+		case PipelineProfileStage::HASH_JOIN_HYBRID_WAIT: return "hash_join_hybrid_wait";
+		case PipelineProfileStage::HASH_JOIN_HYBRID_EXECUTE: return "hash_join_hybrid_execute";
+		case PipelineProfileStage::SINK_HASH_JOIN_BUILD: return "hash_join_build_append";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_SPILL: return "hash_join_partition_spill";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_WORKING_SET: return "hash_join_partition_working_set";
 		case PipelineProfileStage::TASK_RUN_TOTAL: return "task_run_total";
 		case PipelineProfileStage::TASK_COMBINE_TOTAL: return "task_combine_total";
 		case PipelineProfileStage::TASK_FINALIZE_TOTAL: return "task_finalize_total";
@@ -57,6 +91,34 @@ StageName(PipelineProfileStage stage)
 		case PipelineProfileStage::OP_FILTER: return "filter_expr";
 		case PipelineProfileStage::OP_PROJECTION: return "project_expr";
 		case PipelineProfileStage::OP_HASH_JOIN: return "hash_join_probe";
+		case PipelineProfileStage::SOURCE_HASH_JOIN_PARTITION: return "hash_join_partition_source";
+		case PipelineProfileStage::SINK_HASH_JOIN_PARTITION: return "hash_join_probe_partition_append";
+		case PipelineProfileStage::FINALIZE_HASH_JOIN_PARTITION: return "hash_join_probe_partition_finalize";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_PAIR: return "hash_join_partition_pairs";
+		case PipelineProfileStage::HASH_JOIN_OVERSIZED_PARTITION_PAIR: return "hash_join_oversized_partition_pairs";
+		case PipelineProfileStage::HASH_JOIN_PAIR_PREPARE: return "hash_join_pair_prepare";
+		case PipelineProfileStage::HASH_JOIN_PAIR_WAIT: return "hash_join_pair_wait";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_INPUT_READ: return "hash_join_partition_input_read";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_RELOAD: return "hash_join_partition_reload";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_EVICT: return "hash_join_partition_evict";
+		case PipelineProfileStage::HASH_JOIN_LOOKUP: return "hash_join_hash_lookup";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_READ: return "hash_join_segment_read";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_REF_LOOKUP: return "hash_join_segment_ref_lookup";
+		case PipelineProfileStage::HASH_JOIN_PARTITION_ROW_MAP: return "hash_join_partition_row_map";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_RESOLVE: return "hash_join_segment_resolve";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD: return "hash_join_segment_reload";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_HIT: return "hash_join_segment_lease_hit";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_MISS: return "hash_join_segment_lease_miss";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_ACQUIRE: return "hash_join_segment_lease_acquire";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_WAIT: return "hash_join_segment_wait";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_SPILL_ATTACH: return "hash_join_segment_spill_attach";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD_OK: return "hash_join_segment_reload_ok";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD_RETRY: return "hash_join_segment_reload_retry";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD_RACE: return "hash_join_segment_reload_race";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_EVICT: return "hash_join_segment_evict";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_EVICT_OK: return "hash_join_segment_evict_ok";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_EVICT_NO_VICTIM: return "hash_join_segment_evict_no_victim";
+		case PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_ACQUIRE_RETRY: return "hash_join_segment_lease_acquire_retry";
 		case PipelineProfileStage::SINK_HASH_AGG_UPDATE: return "agg_update_local";
 		case PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE: return "perfect_agg_update_local";
 		case PipelineProfileStage::SINK_ORDER_APPEND: return "order_sink_append";
@@ -154,6 +216,7 @@ OpKindName(OpKind kind)
 		case OpKind::HASH_AGGREGATE: return "HASH_AGGREGATE";
 		case OpKind::PERFECT_HASH_AGGREGATE: return "PERFECT_HASH_AGGREGATE";
 		case OpKind::HASH_JOIN: return "HASH_JOIN";
+		case OpKind::HASH_JOIN_PROBE: return "HASH_JOIN_PROBE";
 		case OpKind::CROSS_PRODUCT: return "CROSS_PRODUCT";
 		case OpKind::ORDER: return "ORDER";
 		case OpKind::TOP_N: return "TOP_N";
@@ -173,6 +236,11 @@ HashJoinModeName(HashJoinMatchMode mode)
 		case HashJoinMatchMode::SEMI: return "SEMI";
 		case HashJoinMatchMode::ANTI: return "ANTI";
 		case HashJoinMatchMode::LEFT: return "LEFT";
+		case HashJoinMatchMode::RIGHT: return "RIGHT";
+		case HashJoinMatchMode::BUILD_SEMI: return "BUILD_SEMI";
+		case HashJoinMatchMode::BUILD_ANTI: return "BUILD_ANTI";
+			case HashJoinMatchMode::MARK: return "MARK";
+			case HashJoinMatchMode::MARK_FILTER_NOT: return "MARK_FILTER_NOT";
 	}
 	return "UNKNOWN";
 }
@@ -208,8 +276,10 @@ DescribeOp(const OpDescriptor &op)
 			return desc;
 		}
 		case OpKind::HASH_JOIN:
+		case OpKind::HASH_JOIN_PROBE:
 		{
-			std::string desc = "HASH_JOIN(";
+			std::string desc = OpKindName(op.kind);
+			desc += "(";
 			desc += HashJoinModeName(op.body.hash_join.join_mode);
 			desc += ")";
 			return desc;
@@ -269,6 +339,9 @@ PipelineProfileAllocate(PipelineSharedControl *control,
 	control->profile_event_count = event_count;
 	control->profile_worker_slots = num_workers + 1u;
 	pg_atomic_write_u32(&control->profile_enabled, 0u);
+	PipelineTimelineAllocate(control, dsa, event_count, num_workers);
+	ScanProfileAllocate(control, dsa, event_count, num_workers);
+    ScanIOProfileAllocate(control, dsa, event_count, num_workers);
 
 	if (!pg_yaap_profile || event_count == 0)
 		return true;
@@ -307,6 +380,7 @@ PipelineProfileRegisterProcess(PipelineSharedControl *control,
 						 int worker_index,
 						 int pid)
 {
+	PipelineTimelineRegisterProcess(control, dsa, worker_index, pid);
 	if (control == nullptr || dsa == nullptr ||
 		pg_atomic_read_u32(&control->profile_enabled) == 0)
 		return;
@@ -321,6 +395,12 @@ PipelineProfileRegisterProcess(PipelineSharedControl *control,
 
 	slot_infos[slot].pid = pid;
 	slot_infos[slot].worker_index = worker_index;
+}
+
+char *
+PipelineProfileEventLabel(PipelineSharedControl *control, dsa_area *dsa, uint32 event_id)
+{
+	return pstrdup(DescribeEvent(control, dsa, event_id).c_str());
 }
 
 void
@@ -365,6 +445,8 @@ PipelineProfileAddDiff(const ExecCtx &ctx,
 void
 PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 {
+	ScanProfileReport(control, dsa);
+    ScanIOProfileReport(control, dsa, true);
 	if (control == nullptr || dsa == nullptr ||
 		pg_atomic_read_u32(&control->profile_enabled) == 0)
 		return;
@@ -529,6 +611,7 @@ PipelineProfileSourceStage(PhysicalOperatorType type)
 		switch (type)
 		{
 			case PhysicalOperatorType::SEQ_SCAN: return PipelineProfileStage::SOURCE_SEQ_SCAN;
+			case PhysicalOperatorType::HASH_JOIN_PROBE: return PipelineProfileStage::SOURCE_HASH_JOIN_PARTITION;
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SOURCE_HASH_AGG;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::SOURCE_PERFECT_HASH_AGG;
 			case PhysicalOperatorType::ORDER: return PipelineProfileStage::SOURCE_ORDER;
@@ -546,6 +629,8 @@ PipelineProfileOperatorStage(PhysicalOperatorType type)
 			return PipelineProfileStage::OP_PROJECTION;
 		case PhysicalOperatorType::FILTER:
 			return PipelineProfileStage::OP_FILTER;
+		case PhysicalOperatorType::HASH_JOIN_PROBE:
+			return PipelineProfileStage::HASH_JOIN_HYBRID_EXECUTE;
 		case PhysicalOperatorType::HASH_JOIN:
 			return PipelineProfileStage::OP_HASH_JOIN;
 		case PhysicalOperatorType::CROSS_PRODUCT:
@@ -560,7 +645,9 @@ PipelineProfileSinkStage(PhysicalOperatorType type)
 	{
 		switch (type)
 		{
+			case PhysicalOperatorType::HASH_JOIN: return PipelineProfileStage::SINK_HASH_JOIN_BUILD;
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::SINK_HASH_AGG_UPDATE;
+			case PhysicalOperatorType::HASH_JOIN_PROBE: return PipelineProfileStage::SINK_HASH_JOIN_PARTITION;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::SINK_PERFECT_HASH_AGG_UPDATE;
 			case PhysicalOperatorType::ORDER: return PipelineProfileStage::SINK_ORDER_APPEND;
 			case PhysicalOperatorType::TOP_N: return PipelineProfileStage::SINK_ORDER_APPEND;
@@ -585,6 +672,7 @@ PipelineProfileFinalizeStage(PhysicalOperatorType type)
 		switch (type)
 		{
 			case PhysicalOperatorType::HASH_JOIN: return PipelineProfileStage::FINALIZE_HASH_JOIN;
+			case PhysicalOperatorType::HASH_JOIN_PROBE: return PipelineProfileStage::FINALIZE_HASH_JOIN_PARTITION;
 			case PhysicalOperatorType::CROSS_PRODUCT: return PipelineProfileStage::FINALIZE_HASH_JOIN;
 			case PhysicalOperatorType::HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_HASH_AGG;
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE: return PipelineProfileStage::FINALIZE_PERFECT_HASH_AGG;

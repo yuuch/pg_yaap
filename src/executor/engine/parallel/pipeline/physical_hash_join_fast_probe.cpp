@@ -67,7 +67,7 @@ FindRightColumnBySlotAndKind(const TupleDataLayout *right_layout,
 }
 
 static inline void
-CopyResolvedJoinRow(const PipelineChunk &left_chunk,
+CopyResolvedJoinRow(const PipelineChunk *left_chunk,
 		    uint16_t left_row_idx,
 		    const TupleDataCollection *right_tdc,
 		    const uint8_t *right_row,
@@ -84,12 +84,25 @@ CopyResolvedJoinRow(const PipelineChunk &left_chunk,
 			case ColumnDecodeKind::INT32_CHAR:
 			case ColumnDecodeKind::INT32_DATE:
 			case ColumnDecodeKind::INT32_INT4:
-				if (desc.side == HashJoinOutputSide::LEFT)
+				if (desc.side == HashJoinOutputSide::MARK)
 				{
-					out.int32_columns[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.get_int32(desc.input_chunk_slot, left_row_idx);
-					out.nulls[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.nulls[desc.input_chunk_slot][left_row_idx];
+					out.int32_columns[desc.output_chunk_slot][out_row_idx] = 0;
+					out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+				}
+				else if (desc.side == HashJoinOutputSide::LEFT)
+				{
+					if (left_chunk != nullptr)
+					{
+						out.int32_columns[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->get_int32(desc.input_chunk_slot, left_row_idx);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->nulls[desc.input_chunk_slot][left_row_idx];
+					}
+					else
+					{
+						out.int32_columns[desc.output_chunk_slot][out_row_idx] = 0;
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+					}
 				}
 				else if (right_row == nullptr)
 				{
@@ -108,10 +121,18 @@ CopyResolvedJoinRow(const PipelineChunk &left_chunk,
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
 				if (desc.side == HashJoinOutputSide::LEFT)
 				{
-					out.int64_columns[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.get_int64(desc.input_chunk_slot, left_row_idx);
-					out.nulls[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.nulls[desc.input_chunk_slot][left_row_idx];
+					if (left_chunk != nullptr)
+					{
+						out.int64_columns[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->get_int64(desc.input_chunk_slot, left_row_idx);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->nulls[desc.input_chunk_slot][left_row_idx];
+					}
+					else
+					{
+						out.int64_columns[desc.output_chunk_slot][out_row_idx] = 0;
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+					}
 				}
 				else if (right_row == nullptr)
 				{
@@ -129,10 +150,18 @@ CopyResolvedJoinRow(const PipelineChunk &left_chunk,
 			case ColumnDecodeKind::DOUBLE_FLOAT8:
 				if (desc.side == HashJoinOutputSide::LEFT)
 				{
-					out.double_columns[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.get_double(desc.input_chunk_slot, left_row_idx);
-					out.nulls[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.nulls[desc.input_chunk_slot][left_row_idx];
+					if (left_chunk != nullptr)
+					{
+						out.double_columns[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->get_double(desc.input_chunk_slot, left_row_idx);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->nulls[desc.input_chunk_slot][left_row_idx];
+					}
+					else
+					{
+						out.double_columns[desc.output_chunk_slot][out_row_idx] = 0;
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+					}
 				}
 				else if (right_row == nullptr)
 				{
@@ -150,12 +179,20 @@ CopyResolvedJoinRow(const PipelineChunk &left_chunk,
 			case ColumnDecodeKind::STRING_REF:
 				if (desc.side == HashJoinOutputSide::LEFT)
 				{
-					const VecStringRef src = left_chunk.get_string_ref(desc.input_chunk_slot, left_row_idx);
-					const char *ptr = left_chunk.get_string_ptr(desc.input_chunk_slot, left_row_idx);
+					if (left_chunk != nullptr)
+					{
+						const VecStringRef src = left_chunk->get_string_ref(desc.input_chunk_slot, left_row_idx);
+					const char *ptr = left_chunk->get_string_ptr(desc.input_chunk_slot, left_row_idx);
 					out.string_columns[desc.output_chunk_slot][out_row_idx] =
-						out.store_string_bytes(ptr, src.len);
-					out.nulls[desc.output_chunk_slot][out_row_idx] =
-						left_chunk.nulls[desc.input_chunk_slot][left_row_idx];
+							out.store_string_bytes(ptr, src.len);
+						out.nulls[desc.output_chunk_slot][out_row_idx] =
+							left_chunk->nulls[desc.input_chunk_slot][left_row_idx];
+					}
+					else
+					{
+						out.string_columns[desc.output_chunk_slot][out_row_idx] = VecStringRef{0, 0, 0};
+						out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+					}
 				}
 				else if (right_row == nullptr)
 				{
@@ -209,6 +246,8 @@ InitializeHashJoinFastProbeState(HashJoinFastProbeState &state,
 		state.resolved_output_columns[i].input_chunk_slot = output_columns[i].input_chunk_slot;
 		state.resolved_output_columns[i].decode_kind = output_columns[i].decode_kind;
 		state.resolved_output_columns[i].output_chunk_slot = output_columns[i].output_chunk_slot;
+		if (output_columns[i].side == HashJoinOutputSide::MARK)
+			continue;
 		if (output_columns[i].decode_kind == ColumnDecodeKind::NONE)
 		{
 			has_none_output = true;
@@ -260,7 +299,7 @@ CopyRowsByResolvedMappingBatch(const PipelineChunk &left_chunk,
 {
 	for (uint16_t batch_idx = 0; batch_idx < batch_count; ++batch_idx)
 	{
-		CopyResolvedJoinRow(left_chunk,
+		CopyResolvedJoinRow(&left_chunk,
 			left_row_indices[batch_idx],
 			right_tdcs != nullptr ? right_tdcs[batch_idx] : nullptr,
 			right_rows[batch_idx],
@@ -269,6 +308,18 @@ CopyRowsByResolvedMappingBatch(const PipelineChunk &left_chunk,
 			out,
 			static_cast<uint16_t>(out_row_base + batch_idx));
 	}
+}
+
+void
+CopyUnmatchedBuildRow(const TupleDataCollection *right_tdc,
+		      const uint8_t *right_row,
+		      const HashJoinResolvedOutputColumn *resolved_columns,
+		      uint16_t output_column_count,
+		      PipelineChunk &out,
+		      uint16_t out_row_idx)
+{
+	CopyResolvedJoinRow(nullptr, 0, right_tdc, right_row, resolved_columns,
+			     output_column_count, out, out_row_idx);
 }
 
 bool
@@ -347,7 +398,7 @@ TryFastInnerJoinProbe(ExecCtx &ctx,
 				continue;
 
 			const uint8_t *build_row = TupleDataCollectionGetRowConst(build_rows, build_row_idx);
-			CopyResolvedJoinRow(in,
+			CopyResolvedJoinRow(&in,
 				cursor.probe_row_idx,
 				build_rows,
 				build_row,

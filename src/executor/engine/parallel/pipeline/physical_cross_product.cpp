@@ -17,11 +17,16 @@ extern bool pg_yaap_trace_execution_path;
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
+#include "buffer_manager/yaap_shared_segment_arena.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
+#include "buffer_manager/yaap_spill_store.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
 
 namespace {
+
+static constexpr uint32_t kInitialCrossProductRows = 16384;
 
 static uint32_t
 EffectiveWorkerCount(const ExecCtx &ctx)
@@ -53,6 +58,107 @@ ResolveTdc(dsa_area *dsa, dsa_pointer tdc_dp)
 	if (!DsaPointerIsValid(tdc_dp))
 		return nullptr;
 	return static_cast<TupleDataCollection *>(dsa_get_address(dsa, tdc_dp));
+}
+
+static buffer::YaapBufferSharedState *
+ResolveBufferState(const ExecCtx &ctx)
+{
+	if (ctx.control == nullptr || !DsaPointerIsValid(ctx.control->buffer_state_root))
+		return nullptr;
+	return static_cast<buffer::YaapBufferSharedState *>(
+		dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
+}
+
+static bool
+CrossProductSegmentFits(const ExecCtx &ctx, const TupleDataLayout *layout,
+							uint32_t row_capacity, dsa_pointer *arena_dp)
+{
+	if (ctx.control == nullptr || layout == nullptr || arena_dp == nullptr ||
+		!DsaPointerIsValid(ctx.control->shared_segment_arena_root))
+		return false;
+	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, row_capacity);
+	const uint64_t required = offsetof(TupleDataCollection, rows) +
+		static_cast<uint64_t>(row_capacity) * layout->row_width + heap_capacity;
+	dsa_pointer candidate = ctx.control->shared_segment_arena_root;
+	auto *arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, candidate);
+	if (arena == nullptr || required > arena->segment_size)
+	{
+		candidate = ctx.control->large_shared_segment_arena_root;
+		arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, candidate);
+	}
+	if (arena == nullptr || required > arena->segment_size)
+		return false;
+	*arena_dp = candidate;
+	return true;
+}
+
+static void
+InitCrossProductGlobalSegment(ExecCtx &ctx, CrossProductSharedPayload *payload,
+								  dsa_pointer layout_dp, const TupleDataLayout *layout,
+								  uint32_t row_capacity)
+{
+	auto *state = ResolveBufferState(ctx);
+	dsa_pointer arena_dp = InvalidDsaPointer;
+	if (state == nullptr || !CrossProductSegmentFits(ctx, layout, row_capacity, &arena_dp))
+		return;
+	const auto handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa, state, arena_dp,
+		static_cast<uint32_t>(std::max(ctx.worker_index, 0)));
+	auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, handle);
+	if (segment == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: cross product segment allocation failed")));
+	auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, segment->payload_dp));
+	TupleDataCollectionInit(tdc, row_capacity, layout->row_width, layout_dp,
+		TupleDataCollectionDefaultHeapCapacity(layout, row_capacity));
+	payload->segment_arena_dp = arena_dp;
+	payload->segment_first_desc_dp = segment->self_dp;
+	payload->segment_desc_dp = segment->self_dp;
+	payload->segment_id = handle.segment_id;
+	payload->segment_generation = handle.generation;
+	payload->segment_row_count = 0;
+	payload->segment_backed = true;
+}
+
+static void
+EnsureCrossProductSegmentResident(ExecCtx &ctx, dsa_pointer arena_dp,
+								  buffer::YaapSharedSegmentDesc *segment)
+{
+	if (segment == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: cross product segment is missing")));
+	const buffer::YaapSegmentHandle handle{segment->arena_id, segment->segment_id,
+		segment->generation};
+	if (pg_atomic_read_u32(&segment->state) ==
+		static_cast<uint32_t>(buffer::YaapSharedSegmentState::SPILLED))
+	{
+		if (ctx.control == nullptr)
+			ereport(ERROR, (errmsg("pg_yaap: cross product spill control missing")));
+		buffer::YaapSpillStore spill(ctx.mcxt);
+		spill.AttachSharedFileSet(&ctx.control->spill_fileset,
+			segment->spill_extent.file_name);
+		if (!buffer::YaapSharedSegmentReload(ctx.dsa, ResolveBufferState(ctx), handle,
+			arena_dp, &spill, segment->spill_extent))
+		{
+			for (uint32_t retry = 0; retry < 1000; ++retry)
+			{
+				const uint32_t state = pg_atomic_read_u32(&segment->state);
+				if (state == static_cast<uint32_t>(buffer::YaapSharedSegmentState::PUBLISHED))
+					break;
+				if (state != static_cast<uint32_t>(buffer::YaapSharedSegmentState::RELOADING) &&
+					state != static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL))
+					ereport(ERROR, (errmsg("pg_yaap: cross product segment reload entered invalid state")));
+				pg_usleep(100L);
+			}
+		}
+		if (pg_atomic_read_u32(&segment->state) ==
+			static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL))
+		{
+			buffer::YaapSharedSegmentSeal(segment);
+			buffer::YaapSharedSegmentPublish(segment);
+		}
+	}
+	if (pg_atomic_read_u32(&segment->state) !=
+		static_cast<uint32_t>(buffer::YaapSharedSegmentState::PUBLISHED) ||
+		!DsaPointerIsValid(segment->payload_dp))
+		ereport(ERROR, (errmsg("pg_yaap: cross product segment is not readable")));
 }
 
 static CrossProductLocalBuildRegistryEntry *
@@ -176,6 +282,8 @@ public:
 	bool current_input_drained = false;
 	uint16_t probe_row_idx = 0;
 	uint32_t build_row_idx = 0;
+	dsa_pointer segment_desc_dp = InvalidDsaPointer;
+	uint32_t segment_row_idx = 0;
 	HashJoinFastProbeState output_state;
 };
 
@@ -233,26 +341,33 @@ PhysicalCrossProduct::GetGlobalSinkState(ExecCtx &ctx)
 		SpinLockInit(&state->payload->mutex);
 		state->payload->local_build_registry_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(state->payload->local_state_slot_count) * sizeof(CrossProductLocalBuildRegistryEntry));
-		const uint32_t global_row_capacity = std::max<uint32_t>(1024u, max_rows_);
-		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->right_layout,
-			global_row_capacity);
-		state->payload->build_rows_dp = TupleDataCollectionAllocate(ctx.dsa,
-			global_row_capacity,
-			state->right_layout->row_width,
-			heap_capacity);
-		TupleDataCollectionInit(ResolveTdc(ctx.dsa, state->payload->build_rows_dp),
-			global_row_capacity,
-			state->right_layout->row_width,
-			state->right_layout_dp,
-			heap_capacity);
+		const uint32_t global_row_capacity = std::min<uint32_t>(
+			std::max<uint32_t>(1024u, max_rows_), kInitialCrossProductRows);
+		InitCrossProductGlobalSegment(ctx, state->payload, state->right_layout_dp,
+			state->right_layout, global_row_capacity);
+		if (!state->payload->segment_backed)
+		{
+			const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->right_layout,
+				global_row_capacity);
+			state->payload->build_rows_dp = TupleDataCollectionAllocate(ctx.dsa,
+				global_row_capacity,
+				state->right_layout->row_width,
+				heap_capacity);
+			TupleDataCollectionInit(ResolveTdc(ctx.dsa, state->payload->build_rows_dp),
+				global_row_capacity,
+				state->right_layout->row_width,
+				state->right_layout_dp,
+				heap_capacity);
+		}
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
 
 	state->payload = ResolvePayload(ctx.dsa, state->shared_payload_dp);
 	if (state->payload == nullptr)
 		elog(ERROR, "pg_yaap: cross product shared payload missing");
-	state->build_rows = ResolveTdc(ctx.dsa, state->payload->build_rows_dp);
-	if (state->build_rows == nullptr)
+	state->build_rows = state->payload->segment_backed ? nullptr :
+		ResolveTdc(ctx.dsa, state->payload->build_rows_dp);
+	if (!state->payload->segment_backed && state->build_rows == nullptr)
 		elog(ERROR, "pg_yaap: cross product global build rows missing");
 	return state;
 }
@@ -324,10 +439,56 @@ PhysicalCrossProduct::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	if (input.local_state == nullptr)
 		elog(ERROR, "pg_yaap: cross product combine local state missing");
 	auto &local = static_cast<CrossProductLocalSinkState &>(*input.local_state);
-	if (local.build_rows == nullptr || global.build_rows == nullptr || global.payload == nullptr)
+	if (local.build_rows == nullptr || global.payload == nullptr)
 		elog(ERROR, "pg_yaap: cross product combine build rows missing");
 
 	const uint32_t local_row_count = pg_atomic_read_u32(&local.build_rows->row_count);
+	if (global.payload->segment_backed)
+	{
+		if (local_row_count == 0)
+			return SinkCombineResultType::FINISHED;
+		SpinLockAcquire(&global.payload->mutex);
+		auto *first = static_cast<buffer::YaapSharedSegmentDesc *>(
+			dsa_get_address(ctx.dsa, global.payload->segment_first_desc_dp));
+		auto *tail = static_cast<buffer::YaapSharedSegmentDesc *>(
+			dsa_get_address(ctx.dsa, global.payload->segment_desc_dp));
+		if (first == nullptr || tail == nullptr || !DsaPointerIsValid(tail->payload_dp))
+			elog(ERROR, "pg_yaap: cross product segment chain missing");
+		auto *tail_store = static_cast<TupleDataCollection *>(
+			dsa_get_address(ctx.dsa, tail->payload_dp));
+		buffer::YaapSegmentedTdc writer;
+		buffer::YaapSegmentedTdcInit(&writer, global.payload->segment_arena_dp,
+			global.right_layout_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+			tail_store->row_width, tail_store->row_capacity, tail_store->heap_capacity);
+		writer.first = {first->arena_id, first->segment_id, first->generation};
+		writer.active = {tail->arena_id, tail->segment_id, tail->generation};
+		writer.segment_count = 1;
+		writer.row_count = global.payload->segment_row_count;
+		for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
+		{
+			const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
+			buffer::YaapSegmentedRowHandle handle;
+			TupleDataCollection *dst_store = nullptr;
+			uint8_t *dst_row = nullptr;
+			if (!buffer::YaapSegmentedTdcAppendWithHeap(ctx.dsa, ResolveBufferState(ctx),
+				&writer, TupleDataCollectionRequiredHeapBytesForRow(global.right_layout,
+					local.build_rows, src_row), &handle, &dst_store, &dst_row))
+			{
+				SpinLockRelease(&global.payload->mutex);
+				ereport(ERROR, (errmsg("pg_yaap: cross product segmented build append failed")));
+			}
+			CopyBuildRow(global.right_layout, local.build_rows, src_row, dst_store, dst_row);
+			++global.payload->segment_row_count;
+		}
+		buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
+		auto *new_tail = buffer::YaapSharedSegmentResolve(ctx.dsa,
+			global.payload->segment_arena_dp, writer.active);
+		global.payload->segment_desc_dp = new_tail->self_dp;
+		global.payload->segment_id = new_tail->segment_id;
+		global.payload->segment_generation = new_tail->generation;
+		SpinLockRelease(&global.payload->mutex);
+		return SinkCombineResultType::FINISHED;
+	}
 	uint32_t row_idx = 0;
 	while (row_idx < local_row_count)
 	{
@@ -357,16 +518,75 @@ SinkFinalizeType
 PhysicalCrossProduct::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	auto &global = static_cast<CrossProductGlobalSinkState &>(gstate);
-	if (global.payload == nullptr || global.build_rows == nullptr)
+	if (global.payload == nullptr || (!global.payload->segment_backed && global.build_rows == nullptr))
 		elog(ERROR, "pg_yaap: cross product finalize missing global state");
-	global.payload->combined_row_count = pg_atomic_read_u32(&global.build_rows->row_count);
+	global.payload->combined_row_count = global.payload->segment_backed
+		? global.payload->segment_row_count
+		: pg_atomic_read_u32(&global.build_rows->row_count);
 	if (global.payload->combined_row_count > max_rows_)
 		elog(ERROR,
 		     "pg_yaap: cross product build side exceeded max rows (%u > %u)",
 		     global.payload->combined_row_count,
 		     max_rows_);
-	TupleDataCollectionResetScan(global.build_rows);
-	global.build_rows->finalized = true;
+	if (global.payload->segment_backed)
+	{
+		for (dsa_pointer desc_dp = global.payload->segment_first_desc_dp;
+			 DsaPointerIsValid(desc_dp);)
+		{
+			auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(
+				dsa_get_address(ctx.dsa, desc_dp));
+			if (segment == nullptr || !DsaPointerIsValid(segment->payload_dp))
+				elog(ERROR, "pg_yaap: cross product segment missing during finalize");
+			auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa,
+				segment->payload_dp));
+			if (pg_atomic_read_u32(&segment->state) ==
+				static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL))
+			{
+				const uint64_t used = offsetof(TupleDataCollection, rows) +
+					static_cast<uint64_t>(pg_atomic_read_u32(&tdc->row_count)) * tdc->row_width +
+					pg_atomic_read_u32(&tdc->heap_used);
+				buffer::YaapSharedSegmentSetUsed(segment, static_cast<uint32_t>(used));
+				buffer::YaapSharedSegmentSeal(segment);
+				buffer::YaapSharedSegmentPublish(segment);
+			}
+			tdc->finalized = true;
+			desc_dp = segment->chain_next_dp;
+		}
+	}
+	else
+	{
+		TupleDataCollectionResetScan(global.build_rows);
+		global.build_rows->finalized = true;
+	}
+	if (auto *buffer_state = ResolveBufferState(ctx);
+		buffer_state != nullptr && buffer::YaapBufferOverSoftLimit(buffer_state) &&
+		global.payload->segment_backed)
+	{
+		if (ctx.control == nullptr)
+			ereport(ERROR, (errmsg("pg_yaap: cross product spill control missing")));
+		buffer::YaapSpillStore spill(ctx.mcxt);
+		spill.AttachSharedFileSet(&ctx.control->spill_fileset, "pg_yaap_crossproduct_global");
+		for (dsa_pointer desc_dp = global.payload->segment_first_desc_dp;
+			 DsaPointerIsValid(desc_dp);)
+		{
+			auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(
+				dsa_get_address(ctx.dsa, desc_dp));
+			if (segment == nullptr)
+				ereport(ERROR, (errmsg("pg_yaap: cross product spill segment missing")));
+			const dsa_pointer next_dp = segment->chain_next_dp;
+			if (pg_atomic_read_u32(&segment->state) ==
+				static_cast<uint32_t>(buffer::YaapSharedSegmentState::PUBLISHED))
+			{
+				const buffer::YaapSegmentHandle handle{segment->arena_id,
+					segment->segment_id, segment->generation};
+				buffer::YaapSpillExtent extent{};
+				if (!buffer::YaapSharedSegmentSpill(ctx.dsa, buffer_state, handle,
+					global.payload->segment_arena_dp, &spill, &extent))
+					ereport(ERROR, (errmsg("pg_yaap: cross product segment spill failed")));
+			}
+			desc_dp = next_dp;
+		}
+	}
 	global.payload->finalized = true;
 	if (pg_yaap_trace_execution_path)
 		ereport(LOG,
@@ -405,7 +625,27 @@ PhysicalCrossProduct::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx)
 			FreeDsaPointerIfValid(ctx.dsa, &registry[i].build_rows_dp);
 	}
 	FreeDsaPointerIfValid(ctx.dsa, &payload->local_build_registry_dp);
-	FreeDsaPointerIfValid(ctx.dsa, &payload->build_rows_dp);
+	if (payload->segment_backed)
+	{
+		auto *buffer_state = ResolveBufferState(ctx);
+		for (dsa_pointer desc_dp = payload->segment_first_desc_dp;
+			 DsaPointerIsValid(desc_dp);)
+		{
+			auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(
+				dsa_get_address(ctx.dsa, desc_dp));
+			if (segment == nullptr)
+				break;
+			const dsa_pointer next_dp = segment->chain_next_dp;
+			const buffer::YaapSegmentHandle handle{segment->arena_id,
+				segment->segment_id, segment->generation};
+			if (buffer_state != nullptr && !buffer::YaapSharedSegmentRetire(ctx.dsa,
+				buffer_state, payload->segment_arena_dp, handle))
+				break;
+			desc_dp = next_dp;
+		}
+	}
+	else
+		FreeDsaPointerIfValid(ctx.dsa, &payload->build_rows_dp);
 	ClearSharedPayloadOnDescriptor(this);
 	pg_atomic_write_u32(&payload->release_state, 2);
 	dsa_free(ctx.dsa, payload_dp);
@@ -430,8 +670,9 @@ PhysicalCrossProduct::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &ou
 		elog(ERROR, "pg_yaap: cross product probe ran before build/finalize completed");
 	if (pg_atomic_read_u32(&payload->release_state) != 0)
 		elog(ERROR, "pg_yaap: cross product payload used after release");
-	TupleDataCollection *build_rows = ResolveTdc(ctx.dsa, payload->build_rows_dp);
-	if (build_rows == nullptr)
+	TupleDataCollection *build_rows = payload->segment_backed ? nullptr :
+		ResolveTdc(ctx.dsa, payload->build_rows_dp);
+	if (!payload->segment_backed && build_rows == nullptr)
 		elog(ERROR, "pg_yaap: cross product probe missing finalized build rows");
 	const TupleDataLayout *build_row_layout = ResolveLayout(ctx.dsa,
 		DsaPointerIsValid(right_payload_layout_dp_) ? right_payload_layout_dp_ :
@@ -458,6 +699,62 @@ PhysicalCrossProduct::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &ou
 		0,
 		0,
 		0);
+	if (payload->segment_backed)
+	{
+		out.reset();
+		while (op_state.probe_row_idx < in.count && out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
+		{
+			if (PipelineCancelRequestedEvery(ctx, op_state.probe_row_idx))
+				break;
+			if (!DsaPointerIsValid(op_state.segment_desc_dp))
+				op_state.segment_desc_dp = payload->segment_first_desc_dp;
+			while (DsaPointerIsValid(op_state.segment_desc_dp) &&
+				   out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
+			{
+				auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(
+					dsa_get_address(ctx.dsa, op_state.segment_desc_dp));
+				if (segment == nullptr)
+					elog(ERROR, "pg_yaap: cross product probe segment missing");
+				EnsureCrossProductSegmentResident(ctx, payload->segment_arena_dp, segment);
+				auto *segment_tdc = static_cast<TupleDataCollection *>(
+					dsa_get_address(ctx.dsa, segment->payload_dp));
+				const uint32_t row_count = pg_atomic_read_u32(&segment_tdc->row_count);
+				if (op_state.segment_row_idx >= row_count)
+				{
+					op_state.segment_desc_dp = segment->chain_next_dp;
+					op_state.segment_row_idx = 0;
+					continue;
+				}
+				const buffer::YaapSegmentHandle handle{segment->arena_id,
+					segment->segment_id, segment->generation};
+				buffer::YaapSharedSegmentReadLease lease;
+				if (!buffer::YaapSharedSegmentAcquireRead(ctx.dsa,
+					payload->segment_arena_dp, handle, &lease))
+					elog(ERROR, "pg_yaap: cross product segment read lease failed");
+				const uint8_t *build_row = TupleDataCollectionGetRowConst(segment_tdc,
+					op_state.segment_row_idx++);
+				const uint16_t probe_idx = op_state.probe_row_idx;
+				CopyRowsByResolvedMappingBatch(in, &probe_idx, &segment_tdc,
+					&build_row, op_state.output_state.resolved_output_columns.data(),
+					op_state.output_state.output_column_count, out, out.count, 1);
+				buffer::YaapSharedSegmentReleaseRead(ctx.dsa, payload->segment_arena_dp, &lease);
+				++out.count;
+			}
+			if (!DsaPointerIsValid(op_state.segment_desc_dp))
+			{
+				op_state.probe_row_idx++;
+				op_state.segment_row_idx = 0;
+			}
+		}
+		if (op_state.probe_row_idx >= in.count)
+		{
+			op_state.probe_row_idx = 0;
+			op_state.segment_desc_dp = InvalidDsaPointer;
+			op_state.segment_row_idx = 0;
+			op_state.current_input_drained = out.count > 0;
+		}
+		return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT : OperatorResultType::NEED_MORE_INPUT;
+	}
 
 	out.reset();
 	const uint32_t build_row_count = pg_atomic_read_u32(&build_rows->row_count);

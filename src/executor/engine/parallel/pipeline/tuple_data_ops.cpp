@@ -395,6 +395,14 @@ ScatterGroupColumns(const TupleDataLayout *layout,
 				}
 			}
 	}
+	if (layout->validity_width > 0)
+	{
+		auto *bitmap = row_ptr + TupleDataLayoutValidityOffset(layout);
+		std::memset(bitmap, 0, layout->validity_width);
+		for (uint16_t i = 0; i < layout->column_count; ++i)
+			if (chunk.nulls[layout->columns[i].src_col_idx][row_idx] != 0)
+				bitmap[i >> 3] |= static_cast<uint8_t>(1u << (i & 7u));
+	}
 }
 
 void
@@ -501,6 +509,9 @@ Gather(const TupleDataLayout *layout,
 					break;
 				}
 			}
+			if (layout->validity_width > 0)
+				chunk.nulls[col.src_col_idx][row_idx] =
+					TupleDataLayoutColumnIsNull(layout, row_ptr, i) ? 1 : 0;
 	}
 
 	/* Aggregate state columns: chunk col N+a = aggregate a (always int64). */

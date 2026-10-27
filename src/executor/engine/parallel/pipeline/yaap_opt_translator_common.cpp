@@ -1,4 +1,8 @@
 #include "parallel/pipeline/yaap_pipeline_init_internal.hpp"
+#include "parallel/pipeline/pipeline_descriptor.hpp"
+#include "buffer_manager/yaap_buffer_shared.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
+#include "buffer_manager/yaap_shared_segment_arena.hpp"
 
 #include <cerrno>
 #include <cctype>
@@ -207,17 +211,78 @@ dsa_pointer
 BuildOutputTdc(dsa_area *dsa,
 			   dsa_pointer layout_dp,
 			   const TupleDataLayout &layout,
-			   uint32_t row_capacity)
+			   uint32_t row_capacity,
+			   dsa_pointer segment_arena_dp,
+			   dsa_pointer buffer_state_dp)
 {
+	uint32_t segment_rows = std::min<uint32_t>(row_capacity, 16384u);
+	auto *buffer_state = DsaPointerIsValid(buffer_state_dp)
+		? static_cast<buffer::YaapBufferSharedState *>(dsa_get_address(dsa, buffer_state_dp))
+		: nullptr;
+	auto *arena = buffer_state != nullptr && DsaPointerIsValid(segment_arena_dp)
+		? buffer::YaapSharedSegmentArenaResolve(dsa, segment_arena_dp) : nullptr;
+	uint32_t segment_heap = TupleDataCollectionDefaultHeapCapacity(&layout, segment_rows);
+	uint64_t segment_required = offsetof(TupleDataCollection, rows) +
+		static_cast<uint64_t>(segment_rows) * layout.row_width + segment_heap;
+	/* Wide rows still use the shared spill path. Shrink the first window
+	 * instead of turning a row-count estimate into one large flat allocation. */
+	while (arena != nullptr && segment_rows > 1 && segment_required > arena->segment_size)
+	{
+		segment_rows = std::max<uint32_t>(1, segment_rows / 2);
+		segment_heap = TupleDataCollectionDefaultHeapCapacity(&layout, segment_rows);
+		segment_required = offsetof(TupleDataCollection, rows) +
+			static_cast<uint64_t>(segment_rows) * layout.row_width + segment_heap;
+	}
+	if (arena != nullptr && segment_rows > 0 && segment_required <= arena->segment_size)
+	{
+		const auto handle = buffer::YaapSharedSegmentArenaAllocate(dsa, buffer_state,
+			segment_arena_dp, 0);
+		auto *segment = buffer::YaapSharedSegmentResolve(dsa, segment_arena_dp, handle);
+		if (segment == nullptr)
+			return InvalidDsaPointer;
+		auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(dsa, segment->payload_dp));
+		TupleDataCollectionInit(tdc, segment_rows, layout.row_width, layout_dp, segment_heap);
+		const dsa_pointer payload_dp = dsa_allocate0(dsa, sizeof(pipeline::OutputSharedPayload));
+		if (!DsaPointerIsValid(payload_dp))
+			return InvalidDsaPointer;
+		auto *payload = static_cast<pipeline::OutputSharedPayload *>(dsa_get_address(dsa, payload_dp));
+		payload->tdc_dp = segment->payload_dp;
+		payload->segment_arena_dp = segment_arena_dp;
+		payload->segment_first_desc_dp = segment->self_dp;
+		payload->segment_desc_dp = segment->self_dp;
+		payload->segment_id = handle.segment_id;
+		payload->segment_generation = handle.generation;
+		payload->segment_row_count = 0;
+		payload->segment_backed = true;
+		payload->finalized = false;
+		return payload_dp;
+	}
 	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(&layout, row_capacity);
-	dsa_pointer payload_dp = pg_yaap::pipeline::TupleDataCollectionAllocate(
+	dsa_pointer tdc_dp = pg_yaap::pipeline::TupleDataCollectionAllocate(
 		dsa,
 		row_capacity,
 		layout.row_width,
 		heap_capacity);
-	if (!DsaPointerIsValid(payload_dp))
+	if (!DsaPointerIsValid(tdc_dp))
 		return InvalidDsaPointer;
-	auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(dsa, payload_dp));
+	dsa_pointer payload_dp = dsa_allocate0(dsa, sizeof(pg_yaap::pipeline::OutputSharedPayload));
+	if (!DsaPointerIsValid(payload_dp))
+	{
+		dsa_free(dsa, tdc_dp);
+		return InvalidDsaPointer;
+	}
+	auto *payload = static_cast<pg_yaap::pipeline::OutputSharedPayload *>(
+		dsa_get_address(dsa, payload_dp));
+	payload->tdc_dp = tdc_dp;
+	payload->segment_arena_dp = InvalidDsaPointer;
+	payload->segment_first_desc_dp = InvalidDsaPointer;
+	payload->segment_desc_dp = InvalidDsaPointer;
+	payload->segment_id = UINT32_MAX;
+	payload->segment_generation = 0;
+	payload->segment_row_count = 0;
+	payload->segment_backed = false;
+	payload->finalized = false;
+	auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(dsa, tdc_dp));
 	TupleDataCollectionInit(tdc, row_capacity, layout.row_width, layout_dp, heap_capacity);
 	return payload_dp;
 }

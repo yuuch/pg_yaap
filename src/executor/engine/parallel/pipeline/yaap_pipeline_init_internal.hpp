@@ -313,7 +313,9 @@ dsa_pointer
 BuildOutputTdc(dsa_area *dsa,
 			   dsa_pointer layout_dp,
 			   const TupleDataLayout &layout,
-			   uint32_t row_capacity);
+			   uint32_t row_capacity,
+			   dsa_pointer segment_arena_dp = InvalidDsaPointer,
+			   dsa_pointer buffer_state_dp = InvalidDsaPointer);
 
 uint32_t
 EstimateOutputRows(QueryDesc *qd);

@@ -12,11 +12,45 @@ extern "C" {
 #include "parallel/pipeline/source.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
 
 struct OpDescriptor;
+
+/* Backend-local PG external sort. Only TDC rows and descriptors cross backends. */
+class TdcExternalSorter {
+public:
+ TdcExternalSorter(ExecCtx &ctx, const TupleDataLayout *payload_layout,
+                   const TupleDataLayout *key_layout, const SortKeyDesc *keys,
+                   uint16_t nkeys, bool sequential_keys);
+ ~TdcExternalSorter();
+ void Put(const TupleDataCollection *tdc, const uint8_t *row);
+ void Perform();
+ const TupleDataCollection *Next();
+private:
+ struct State;
+ State *state_;
+};
+
+void SpillCompletedTdcSegments(ExecCtx &ctx, dsa_pointer arena_dp,
+                              dsa_pointer first_dp, const char *prefix);
+
+
+struct OrderSharedPayload
+{
+	dsa_pointer tdc_dp = InvalidDsaPointer;
+	dsa_pointer segment_arena_dp = InvalidDsaPointer;
+	dsa_pointer segment_first_desc_dp = InvalidDsaPointer;
+	dsa_pointer sorted_refs_dp = InvalidDsaPointer;
+	uint32_t segment_id = UINT32_MAX;
+	uint32_t segment_generation = 0;
+	uint32_t segment_row_count = 0;
+	bool segment_backed = false;
+	bool finalized = false;
+	uint8_t _pad[2] = {0, 0};
+};
 
 class OrderGlobalState final : public GlobalSinkState, public GlobalSourceState {
 public:
@@ -26,6 +60,7 @@ public:
 	dsa_pointer           key_layout_dp = InvalidDsaPointer;
 	dsa_pointer           payload_layout_dp = InvalidDsaPointer;
 	dsa_pointer           shared_payload_dp = InvalidDsaPointer;
+	OrderSharedPayload   *shared_payload = nullptr;
 	dsa_pointer           sort_indices_dp = InvalidDsaPointer;
 	const SortKeyDesc    *sort_keys = nullptr;
 	uint16_t              n_sort_keys = 0;
@@ -33,21 +68,30 @@ public:
 	const TupleDataLayout *payload_layout = nullptr;
 	TupleDataCollection  *payload = nullptr;
 	uint32_t              max_rows = 256;
+	bool                  segment_retired = false;
+	buffer::YaapSegmentedTdc segmented_writer;
+	bool                  segmented_writer_initialized = false;
 };
 
 class OrderLocalState final : public LocalSinkState, public LocalSourceState {
 public:
 	uint32_t source_cursor = 0;
+ std::unique_ptr<TdcExternalSorter> sorter;
 };
 
 /*
  * Sort indices array stored at the head of the OrderGlobalState's auxiliary
- * DSA allocation. Built in Finalize, consumed in GetData. Single-segment.
+ * DSA allocation. Built in Finalize, consumed in GetData.
  */
 struct OrderSortIndices {
 	uint32_t count;
 	uint32_t _pad;
 	uint32_t indices[];
+};
+
+struct OrderSortedRowRef {
+	dsa_pointer segment_desc_dp;
+	uint32_t row_index;
 };
 
 class PhysicalOrder final : public PhysicalOperator {

@@ -4,9 +4,12 @@ extern "C" {
 #include "postgres.h"
 #include "port/atomics.h"
 #include "utils/dsa.h"
+#include "storage/sharedfileset.h"
 }
 
 #include <sys/types.h>  /* pid_t */
+
+#include "buffer_manager/yaap_buffer_shared.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -17,7 +20,7 @@ namespace pipeline {
  * a CAS guard on worker_error before re-raising. Leader picks up the message
  * verbatim in its event loop (vs. a plain "worker died" placeholder).
  */
-static constexpr int PIPELINE_WORKER_ERROR_MSG_LEN = 256;
+static constexpr int PIPELINE_WORKER_ERROR_MSG_LEN = 512;
 
 /*
  * shm_toc keys for the MetaPipeline runtime DSM segment.
@@ -102,6 +105,8 @@ struct PipelineSharedControl
 	 */
 	Oid              db_oid;
 	int32            num_workers;
+	/* Backend-local execution settings captured before bgworker launch. */
+	uint8            jit_deform;
 
 	/*
 	 * Optional per-query profiling storage. The leader allocates the records
@@ -115,6 +120,29 @@ struct PipelineSharedControl
 	dsa_pointer      profile_slot_pids_root;
 	uint32           profile_event_count;
 	uint32           profile_worker_slots;
+	/* Immutable after publication; worker-exclusive Task timeline storage. */
+	uint32           scan_io_profile_mode;
+    dsa_pointer      scan_io_profile_root;
+    uint32           scan_io_reported;
+    uint32           scan_io_min_pages;
+    uint32           scan_io_wait_pct;
+    uint32           scan_profile_mode;
+	dsa_pointer      scan_profile_root;
+	uint32           scan_profile_reported;
+	uint32           timeline_mode;
+	dsa_pointer      timeline_root;
+
+	/* Query-scoped accounting for DSA-backed breaker storage. */
+	uint64_t dsa_limit_bytes = 0;
+	dsa_pointer      buffer_state_root;
+	/* Stable root for lazy shared breaker segments. */
+	dsa_pointer      shared_segment_arena_root;
+	dsa_pointer      large_shared_segment_arena_root;
+	pg_atomic_uint32 next_partition_probe_arena_id;
+	/* Logical reservations for simultaneously resident hybrid initial batches. */
+	pg_atomic_uint64 hybrid_resident_bytes;
+	/* Query-scoped spill namespace; initialized by the leader in DSM. */
+	SharedFileSet    spill_fileset;
 };
 
 /*

@@ -26,6 +26,7 @@
 extern "C" {
 #include "postgres.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
 #include "nodes/plannodes.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
@@ -44,6 +45,7 @@ extern "C" {
 extern bool pg_yaap_trace_hooks;
 extern bool pg_yaap_trace_execution_path;
 extern bool pg_yaap_parallel;
+extern int pg_yaap_parallel_max_workers;
 }
 
 /*
@@ -195,8 +197,7 @@ pg_yaap_execute_query(QueryDesc *queryDesc, PgYaapQueryState *state_ptr,
 
 	if (state->parallel_plan == nullptr)
 		ereport(ERROR,
-				(errmsg("pg_yaap: executor state is registered without a physical plan")));
-
+			(errmsg("pg_yaap: executor state is registered without a physical plan")));
 	bool ok = pg_yaap::pipeline::PgYaapPipelineRun(queryDesc, state, &failure_reason);
 
 	if (!ok)

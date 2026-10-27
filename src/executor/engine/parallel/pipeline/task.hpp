@@ -34,6 +34,7 @@ extern "C" {
 
 #include "core/memory.hpp"
 #include "core/data_chunk.hpp"
+#include "core/chunk_pool.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
 #include "parallel/pipeline/operator.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
@@ -56,10 +57,15 @@ struct ProcessPipelineExecState {
 	std::unique_ptr<LocalSourceState> local_source;
 	std::unique_ptr<LocalSinkState> local_sink;
 	PgVector<std::unique_ptr<OperatorState>> local_ops;
-	std::unique_ptr<PipelineChunk> run_src_chunk;
-	std::unique_ptr<PipelineChunk> run_scratch_a;
-	std::unique_ptr<PipelineChunk> run_scratch_b;
+	ChunkLease run_src_chunk;
+	ChunkLease run_scratch_a;
+	ChunkLease run_scratch_b;
+	/* Fused resumable joins must not overwrite a prefix operator input. */
+	PgVector<ChunkLease> run_op_outputs;
+	uint64_t run_op_output_bytes = 0;
 	bool run_initialized = false;
+	bool source_exhausted = false;
+	size_t final_op_index = 0;
 	bool combine_done = false;
 	bool leader_partial_pending = false;
 };
@@ -70,6 +76,7 @@ struct WorkerTaskRuntime {
 	EventShmState *event_shm;
 	PipelineDsmLookup<Pipeline> *pipelines;
 	PgVector<std::unique_ptr<ProcessPipelineExecState>> per_pipeline;
+	LocalChunkPool chunk_pool;
 	QueryDesc *leader_qd = nullptr;
 	OutputSink *final_output = nullptr;
 
@@ -148,7 +155,8 @@ public:
 class PipelineFinalizeTask final : public Task {
 public:
 	PipelineFinalizeTask(EventId event_id, Pipeline *pipeline,
-	                     WorkerTaskRuntime *runtime, int32_t worker_index);
+						 WorkerTaskRuntime *runtime, int32_t worker_index,
+						 uint32_t partition_id = UINT32_MAX);
 
 	TaskExecutionResult Execute() override;
 };

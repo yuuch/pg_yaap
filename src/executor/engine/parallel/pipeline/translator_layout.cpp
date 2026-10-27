@@ -363,12 +363,15 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 				 const std::vector<ColumnRef> &right_cols,
 				 const std::vector<ColumnSchema> &right_schema,
 				 std::vector<HashJoinOutputColumnDesc> &out_mappings,
-				 std::vector<ColumnSchema> &out_schema)
+				 std::vector<ColumnSchema> &out_schema,
+					 bool unique_output_slots,
+					 const ColumnRef *mark_output_ref)
 {
 	uint8_t next_int32_slot = 0;
 	uint8_t next_int64_slot = 0;
 	uint8_t next_double_slot = 0;
 	uint8_t next_string_slot = 0;
+	uint8_t next_output_slot = 0;
 	out_mappings.clear();
 	out_schema.clear();
 	out_mappings.reserve(output_cols.size());
@@ -376,6 +379,24 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 
 	for (const ColumnRef &ref : output_cols)
 	{
+		if (mark_output_ref != nullptr && ref == *mark_output_ref)
+		{
+			ColumnSchema mark_col{};
+			mark_col.type_oid = BOOLOID;
+			mark_col.typmod = -1;
+			mark_col.typlen = 1;
+			mark_col.typbyval = true;
+			mark_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int32_slot++;
+			mark_col.src_attno = 0;
+			mark_col.decode_kind = ColumnDecodeKind::INT32_INT4;
+			if (mark_col.chunk_slot >= 16)
+				return false;
+			out_schema.push_back(mark_col);
+			out_mappings.push_back(HashJoinOutputColumnDesc{
+				HashJoinOutputSide::MARK, 0, ColumnDecodeKind::INT32_INT4,
+				mark_col.chunk_slot});
+			continue;
+		}
 		const ColumnSchema *src = nullptr;
 		HashJoinOutputSide side;
 		if (LookupRawColumn(ref, left_cols, left_schema, src))
@@ -400,17 +421,17 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 			case ColumnDecodeKind::INT32_CHAR:
 			case ColumnDecodeKind::INT32_DATE:
 			case ColumnDecodeKind::INT32_INT4:
-				out_col.chunk_slot = next_int32_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int32_slot++;
 				break;
 			case ColumnDecodeKind::INT64_INT8:
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-				out_col.chunk_slot = next_int64_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int64_slot++;
 				break;
 			case ColumnDecodeKind::DOUBLE_FLOAT8:
-				out_col.chunk_slot = next_double_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_double_slot++;
 				break;
 			case ColumnDecodeKind::STRING_REF:
-				out_col.chunk_slot = next_string_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_string_slot++;
 				break;
 			case ColumnDecodeKind::NONE:
 				if (pg_yaap_trace_hooks)

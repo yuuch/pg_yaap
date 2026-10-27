@@ -34,11 +34,14 @@ extern "C" {
 #include "parallel/pipeline/physical_cross_product.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
+#include "parallel/pipeline/physical_hash_join_probe.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
 #include "parallel/pipeline/output_sink.hpp"
 #include "parallel/pipeline/pipeline_combine_event.hpp"
 #include "parallel/pipeline/pipeline_finalize_event.hpp"
 #include "parallel/pipeline/pipeline_run_event.hpp"
+#include "parallel/pipeline/pipeline_timeline.hpp"
+#include "buffer_manager/yaap_shared_segment_arena.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -104,6 +107,8 @@ TaskScheduler::TaskScheduler(MemoryContext              mcxt,
     , events_(mcxt)
     , events_owned_(PgMemoryContextAllocator<std::shared_ptr<Event>>(mcxt))
     , run_task_counts_(PgMemoryContextAllocator<uint32_t>(mcxt))
+    , pending_tasks_(PgMemoryContextAllocator<TaskDescriptor>(mcxt))
+    , pending_partition_probe_runs_(PgMemoryContextAllocator<Event *>(mcxt))
     , state_(mcxt, sizing.worker_count)
 {
 	Assert(mcxt_ != nullptr);
@@ -315,13 +320,41 @@ TaskScheduler::EnqueueTasks(Event &event)
 	EventId base_id = static_cast<EventId>(pid) * 3u;
 	EventId event_id;
 	uint32_t task_count;
+	bool parallel_hash_join_finalize = false;
+	uint32_t hash_join_finalize_workers = 1;
+	bool segmented_hash_join_worker_combine = false;
 	const TaskKind kind = event.kind();
+	const bool has_hybrid_probe = std::any_of(pipeline->ops.begin(), pipeline->ops.end(),
+		[](const PhysicalOperator *op) {
+			return op->type() == PhysicalOperatorType::HASH_JOIN_PROBE;
+		});
 	switch (kind)
 	{
 		case TaskKind::RUN:
 			event_id   = base_id + 0;
+			if (pipeline->source->type() == PhysicalOperatorType::HASH_JOIN_PROBE || has_hybrid_probe)
+			{
+				/* Paired sources and streaming hybrid operators reserve partition
+				 * working sets. Admit the RUN before initializing those reservations,
+				 * rather than parking workers behind another RUN's leases. */
+				if (active_partition_probe_run_ != INVALID_EVENT_ID)
+				{
+					Assert(active_partition_probe_run_ != event_id);
+					pg_atomic_write_u32(&event_shm_[event_id].tasks_remaining, 1);
+					pending_partition_probe_runs_.push_back(&event);
+					return;
+				}
+				active_partition_probe_run_ = event_id;
+			}
 			task_count = DeriveRunTaskCount(*pipeline);
 			RememberRunTaskCount(pid, task_count);
+			if (has_hybrid_probe)
+			{
+				ExecCtx leader_ctx{mcxt_, dsa_, LEADER_WORKER_INDEX, control_, event_id};
+				for (PhysicalOperator *op : pipeline->ops)
+					if (op->type() == PhysicalOperatorType::HASH_JOIN_PROBE)
+						static_cast<PhysicalHashJoinProbe *>(op)->InitializeHybrid(leader_ctx, task_count);
+			}
 			break;
 		case TaskKind::COMBINE:
 			event_id   = base_id + 1;
@@ -355,7 +388,13 @@ TaskScheduler::EnqueueTasks(Event &event)
 				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_join);
 				if (!DsaPointerIsValid(payload_dp))
 					elog(ERROR, "pg_yaap: hash join payload missing during COMBINE scheduling");
-				task_count = RememberedRunTaskCount(pid);
+				auto *payload = static_cast<HashJoinSharedPayload *>(dsa_get_address(dsa_, payload_dp));
+				segmented_hash_join_worker_combine = payload->direct_segmented_build &&
+					payload->build_partition_count > 1;
+				task_count = segmented_hash_join_worker_combine
+					? RememberedRunTaskCount(pid)
+					: (payload->build_partition_count > 1
+						? payload->build_partition_count : RememberedRunTaskCount(pid));
 			}
 			else if (pipeline->sink->type() == PhysicalOperatorType::CROSS_PRODUCT)
 			{
@@ -385,6 +424,7 @@ TaskScheduler::EnqueueTasks(Event &event)
 						ps.global_sink = sink->GetGlobalSinkState(leader_ctx);
 					if (ps.global_sink != nullptr)
 					{
+						PipelineTimelineTaskScope timeline_scope(leader_ctx, event_id);
 						SinkFinalizeType fres = sink->Finalize(leader_ctx, *ps.global_sink);
 						if (fres != SinkFinalizeType::READY)
 							elog(ERROR, "pg_yaap: trivial finalize did not finish");
@@ -393,7 +433,62 @@ TaskScheduler::EnqueueTasks(Event &event)
 				event.FinishEvent();
 				return;
 			}
-			/* Finalize is leader-only (Sink::Finalize is a leader op). The
+			if (pipeline->sink->type() == PhysicalOperatorType::HASH_JOIN)
+			{
+				auto *hash_join = static_cast<PhysicalHashJoin *>(pipeline->sink);
+				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_join);
+				if (!DsaPointerIsValid(payload_dp))
+					elog(ERROR, "pg_yaap: hash join payload missing during FINALIZE scheduling");
+				auto *payload = static_cast<HashJoinSharedPayload *>(dsa_get_address(dsa_, payload_dp));
+				parallel_hash_join_finalize = payload->direct_segmented_build &&
+					payload->build_partition_count > 1 && !payload->partition_probe_mode;
+				if (parallel_hash_join_finalize)
+				{
+					task_count = payload->build_partition_count;
+					/* Each task owns a partition directory and up to four key
+					 * segment leases. Use the largest partition to budget concurrent
+					 * builders from the hard/soft-limit headroom. */
+					uint64_t largest_rows = 0;
+					auto *registry = static_cast<const HashJoinLocalBuildRegistryEntry *>(
+						dsa_get_address(dsa_, payload->local_build_registry_dp));
+					if (registry == nullptr)
+						elog(ERROR, "pg_yaap: hash join finalize registry missing");
+					for (uint32_t part = 0; part < task_count; ++part)
+					{
+						uint64_t rows = 0;
+						for (uint32_t slot = 0; slot < payload->local_state_slot_count; ++slot)
+						{
+							if (!DsaPointerIsValid(registry[slot].partition_state_dp))
+								continue;
+							const auto *parts = static_cast<const HashJoinLocalPartitionState *>(
+								dsa_get_address(dsa_, registry[slot].partition_state_dp));
+							rows += parts[part].row_count;
+						}
+						largest_rows = std::max(largest_rows, rows);
+					}
+					uint64_t buckets = 1;
+					while (buckets < largest_rows * 2u)
+						buckets <<= 1;
+					auto *budget = static_cast<buffer::YaapBufferSharedState *>(
+						dsa_get_address(dsa_, control_->buffer_state_root));
+					auto *arena = buffer::YaapSharedSegmentArenaResolve(dsa_,
+						payload->segment_arena_dp);
+					if (budget == nullptr || arena == nullptr)
+						elog(ERROR, "pg_yaap: hash join finalize memory budget missing");
+					const uint64_t task_bytes = buckets * sizeof(uint32_t) +
+						largest_rows * (sizeof(uint32_t) * 3u + sizeof(int64_t)) +
+						4u * static_cast<uint64_t>(arena->segment_size);
+					const uint64_t headroom = budget->hard_limit > budget->soft_limit
+						? budget->hard_limit - budget->soft_limit : budget->hard_limit / 4u;
+					hash_join_finalize_workers = static_cast<uint32_t>(
+						std::max<uint64_t>(1u, std::min<uint64_t>(
+							DeriveRunTaskCount(*pipeline), headroom / task_bytes)));
+					break;
+				}
+			}
+			/* Finalize is leader-only for ordinary sinks (Sink::Finalize is a
+			 * leader op). Partitioned segmented hash joins dispatch one task per
+			 * radix partition so their hash directories can be built in parallel.
 			 * leader's worker_index is LEADER_WORKER_INDEX; C7's event loop
 			 * runs Finalize inline rather than dispatching to the DSM
 			 * queue. We still publish 1 to tasks_remaining so the C7 loop
@@ -415,7 +510,7 @@ TaskScheduler::EnqueueTasks(Event &event)
 	 * trigger the leader's FinishEvent. */
 	pg_atomic_write_u32(&shm.tasks_remaining, task_count);
 
-	if (kind == TaskKind::FINALIZE)
+	if (kind == TaskKind::FINALIZE && !parallel_hash_join_finalize)
 		return;
 
 	for (uint32_t i = 0; i < task_count; i++)
@@ -426,30 +521,81 @@ TaskScheduler::EnqueueTasks(Event &event)
 		desc.partition_id = UINT32_MAX;
 		desc.worker_index = static_cast<int32_t>(i);
 		desc.kind         = static_cast<uint8_t>(kind);
-		if (kind == TaskKind::COMBINE &&
-			pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
+			if (kind == TaskKind::COMBINE &&
+				pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
 		{
 			desc.partition_id = i;
 			desc.worker_index = static_cast<int32_t>(i % DeriveRunTaskCount(*pipeline));
-		}
+			}
+			else if (kind == TaskKind::COMBINE &&
+				pipeline->sink->type() == PhysicalOperatorType::HASH_JOIN)
+			{
+				if (segmented_hash_join_worker_combine)
+				{
+					desc.partition_id = UINT32_MAX;
+					desc.worker_index = static_cast<int32_t>(i);
+				}
+				else
+				{
+					auto *hash_join = static_cast<PhysicalHashJoin *>(pipeline->sink);
+					dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_join);
+					auto *payload = DsaPointerIsValid(payload_dp)
+						? static_cast<HashJoinSharedPayload *>(dsa_get_address(dsa_, payload_dp)) : nullptr;
+					if (payload != nullptr && payload->build_partition_count > 1)
+					{
+						desc.partition_id = i;
+						desc.worker_index = static_cast<int32_t>(i % DeriveRunTaskCount(*pipeline));
+					}
+				}
+			}
+			else if (kind == TaskKind::FINALIZE && parallel_hash_join_finalize)
+			{
+				desc.partition_id = i;
+				desc.worker_index = static_cast<int32_t>(i % hash_join_finalize_workers);
+			}
 
-		/* TryPush wakes every registered worker latch on success
-		 * (DsmTaskQueue C2). Capacity sized in EstimateDsmSize is
-		 * worst-case >= sum(task_count) across in-flight events, so the
-		 * loop never spuriously fails in M-FRAME-MIN. If it ever does
-		 * (capacity misconfigured), assert rather than spin: C7 will
-		 * surface this as a worker_error and Abort the query. */
-		const bool ok = task_queue_->TryPush(desc);
-		if (!ok)
-		{
-			pg_atomic_write_u32(&shm.tasks_remaining, 0);
-			elog(ERROR,
-			     "pg_yaap: task queue full while enqueuing event %u "
-			     "(pipeline %u, kind %u, capacity %u)",
-			     event_id, (unsigned) pid, (unsigned) kind,
-			     task_queue_->Capacity());
-		}
+		/* Do not block scheduling while the bounded DSM queue is full.
+		 * The leader drains this private backlog as workers free slots. */
+		pending_tasks_.push_back(desc);
 	}
+}
+
+void
+TaskScheduler::NotifyPartitionProbeRunFinished(EventId event_id)
+{
+	if (active_partition_probe_run_ != event_id)
+		return;
+
+	active_partition_probe_run_ = INVALID_EVENT_ID;
+	while (!pending_partition_probe_runs_.empty())
+	{
+		Event *next = pending_partition_probe_runs_.front();
+		pending_partition_probe_runs_.erase(pending_partition_probe_runs_.begin());
+		if (next->aborted())
+			continue;
+		Assert(next->state() == EventState::SCHEDULED);
+		EnqueueTasks(*next);
+		break;
+	}
+}
+
+bool
+TaskScheduler::DispatchPendingTasks()
+{
+	bool progress = false;
+	while (pending_cursor_ < pending_tasks_.size())
+	{
+		if (!task_queue_->TryPush(pending_tasks_[pending_cursor_]))
+			break;
+		++pending_cursor_;
+		progress = true;
+	}
+	if (pending_cursor_ == pending_tasks_.size())
+	{
+		pending_tasks_.clear();
+		pending_cursor_ = 0;
+	}
+	return progress;
 }
 
 }  /* namespace pipeline */

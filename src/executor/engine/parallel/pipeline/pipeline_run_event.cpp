@@ -4,6 +4,7 @@
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/task_scheduler.hpp"
+#include "parallel/pipeline/pipeline_timeline.hpp"
 #include "parallel/pipeline/types.hpp"
 
 namespace pg_yaap {
@@ -17,6 +18,8 @@ void
 PipelineRunEvent::Schedule()
 {
 	Assert(pipeline_ != nullptr);
+	PipelineTimelineReady(scheduler_->control(), scheduler_->dsa(),
+		static_cast<uint32_t>(pipeline_id_));
 
 	/*
 	 * Leader pre-init of source + sink GlobalState (DuckDB-faithful;
@@ -46,6 +49,8 @@ PipelineRunEvent::Schedule()
 	if (pipeline_->sink != nullptr)
 		(void) pipeline_->sink->GetGlobalSinkState(leader_ctx);
 
+	/* Hybrid mid-operator state is initialized by EnqueueTasks only after
+	 * admission and RUN task-count derivation, so deferred RUNs hold no leases. */
 	scheduler_->EnqueueTasks(*this);
 }
 

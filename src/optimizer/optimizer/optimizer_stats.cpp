@@ -782,6 +782,10 @@ RelationStats RelationStatisticsHelper::ExtractFilterStats(LogicalFilter& filter
     RelationStats input_stats = Extract(*filter.children[0]);
     RelationStats stats = input_stats;
     stats.cardinality = EstimateFilterCardinality(input_stats, filter.expressions);
+    if (input_stats.cardinality > 0) {
+        stats.filter_strength *= static_cast<double>(stats.cardinality) /
+            static_cast<double>(input_stats.cardinality);
+    }
     return stats;
 }
 
@@ -1109,9 +1113,17 @@ size_t RelationStatisticsHelper::EstimateSemiOrAntiJoinCardinality(
             continue;
         }
 
+        /* Column NDV comes from the base relation and is copied through
+         * filters. Scale it by the filtered relation's selectivity before
+         * estimating key coverage; otherwise a selective RHS (e.g. Q16's
+         * supplier comment predicate) can appear to contain every key. */
+        const double filtered_right_ndv = std::min(
+            static_cast<double>(right_stats.cardinality),
+            static_cast<double>(right_column.distinct.distinct_count) *
+                std::max(0.0, std::min(1.0, right_stats.filter_strength)));
         double coverage = std::min(
             1.0,
-            static_cast<double>(right_column.distinct.distinct_count) /
+            filtered_right_ndv /
                 static_cast<double>(std::max<size_t>(1, left_column.distinct.distinct_count)));
         matched_fraction = used_stats ? matched_fraction * coverage : coverage;
         used_stats = true;

@@ -123,6 +123,7 @@ public:
     ColumnBinding binding;
     std::string table_name;
     std::string column_name;
+    bool not_null = false;
     BoundColumnRefExpression(ColumnBinding binding, std::string table_name, std::string column_name)
         : Expression(ExpressionType::BOUND_COLUMN_REF), binding(binding),
           table_name(std::move(table_name)), column_name(std::move(column_name)) {}
@@ -230,6 +231,7 @@ public:
     bool has_mark_index = false;
     bool convert_mark_to_semi = true;
     bool invert_result = false;
+    bool null_aware_mark = false;
     std::vector<std::unique_ptr<Expression>> conditions;
     LogicalComparisonJoin(int type) : LogicalOperator(LogicalOperatorType::LOGICAL_COMPARISON_JOIN), join_type(type) {}
 };

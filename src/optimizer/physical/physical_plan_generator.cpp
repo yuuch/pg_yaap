@@ -33,6 +33,12 @@ void AppendOutputs(PhysicalOperator &target, const PhysicalOperator &source) {
     target.outputs.insert(target.outputs.end(), source.outputs.begin(), source.outputs.end());
 }
 
+bool ChooseHashJoinBuildLeft(const PhysicalOperator &left, const PhysicalOperator &right) {
+	if (left.estimated_cardinality > 0 && right.estimated_cardinality > 0)
+		return left.estimated_cardinality < right.estimated_cardinality;
+	return left.outputs.size() < right.outputs.size();
+}
+
 bool OutputBindingVisible(const ColumnBinding& binding,
 						  const std::vector<OutputColumn>& visible_outputs) {
 	for (const auto& output : visible_outputs) {
@@ -674,6 +680,7 @@ std::unique_ptr<PhysicalHashJoin> MakeInnerJoin(
 	join->children.push_back(std::move(right));
 	AppendOutputs(*join, *join->children[0]);
 	AppendOutputs(*join, *join->children[1]);
+	join->build_left = ChooseHashJoinBuildLeft(*join->children[0], *join->children[1]);
 	CanonicalizeAggregateRefs(*join, join->conditions, {join->children[0].get(), join->children[1].get()});
 	return join;
 }
@@ -908,10 +915,13 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalCompa
     hash_join->children.push_back(std::move(left));
     hash_join->children.push_back(std::move(right));
     const bool semi_or_anti = op.join_type == JOIN_SEMI || op.join_type == JOIN_ANTI;
+    const bool mark_join = op.join_type == JOIN_MARK;
     AppendOutputs(*hash_join, *hash_join->children[0]);
-    if (!semi_or_anti) {
+    if (!semi_or_anti && !mark_join) {
         AppendOutputs(*hash_join, *hash_join->children[1]);
     }
+	hash_join->build_left = mark_join ? false : ChooseHashJoinBuildLeft(*hash_join->children[0], *hash_join->children[1]);
+	hash_join->build_output = semi_or_anti && hash_join->build_left;
     if (op.has_mark_index) {
         hash_join->outputs.push_back(OutputColumn{
             ColumnBinding{op.mark_index, ProjectionIndex{0}},

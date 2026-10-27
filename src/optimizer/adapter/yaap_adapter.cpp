@@ -261,6 +261,7 @@ struct ProducedOutput {
 	std::string semantic_key;
 	std::string table_name;
 	bool has_source_binding = false;
+	bool not_null = false;
 	ColumnBinding source_binding{TableIndex{0}, ProjectionIndex{0}};
 };
 
@@ -384,8 +385,10 @@ ProducedOutput MakeProducedOutput(ColumnBinding binding,
 	output.semantic_key = source_expression != nullptr ? ExpressionSemanticKey(source_expression) : std::string();
 	output.table_name = std::move(table_name);
 	if (source_expression != nullptr && source_expression->type == ExpressionType::BOUND_COLUMN_REF) {
+		auto *column = static_cast<BoundColumnRefExpression*>(source_expression);
 		output.has_source_binding = true;
-		output.source_binding = static_cast<BoundColumnRefExpression*>(source_expression)->binding;
+		output.source_binding = column->binding;
+		output.not_null = column->not_null;
 	}
 	return output;
 }
@@ -1072,10 +1075,12 @@ std::unique_ptr<Expression> TryRewriteToProducedOutput(LogicalOperator* input,
 		return nullptr;
 	}
 
-	return std::make_unique<BoundColumnRefExpression>(
+	auto result = std::make_unique<BoundColumnRefExpression>(
 		matched_output->binding,
 		matched_output->table_name.empty() ? "output" : matched_output->table_name,
 		matched_output->name);
+	result->not_null = matched_output->not_null;
+	return result;
 }
 
 std::unique_ptr<LogicalOperator> BuildDependentJoin(YaapAdapter& adapter,
@@ -1102,6 +1107,9 @@ std::unique_ptr<LogicalOperator> BuildDependentJoin(YaapAdapter& adapter,
     auto join = std::make_unique<LogicalDependentJoin>(join_type);
     join->dependent = true;
     join->invert_result = negated;
+    /* NOT IN is a null-aware anti condition.  Unlike NOT EXISTS, it cannot
+     * generally be represented by a plain ANTI join. */
+    join->null_aware_mark = false;
     if (join_type == JOIN_MARK) {
         join->mark_index = adapter.GenerateTableIndex();
         join->has_mark_index = true;
@@ -1119,6 +1127,25 @@ std::unique_ptr<LogicalOperator> BuildDependentJoin(YaapAdapter& adapter,
             }
         }
     }
+
+	if (subquery->sublink_name == "ANY" && negated) {
+		bool has_equality = false;
+		bool keys_proven_not_null = true;
+		for (const auto &condition : join->conditions) {
+			if (!condition || condition->type != ExpressionType::BOUND_FUNCTION)
+				continue;
+			auto *function = static_cast<BoundFunctionExpression *>(condition.get());
+			if (function->function_name != "=" || function->children.size() != 2 ||
+				function->children[0]->type != ExpressionType::BOUND_COLUMN_REF ||
+				function->children[1]->type != ExpressionType::BOUND_COLUMN_REF)
+				continue;
+			has_equality = true;
+			keys_proven_not_null = keys_proven_not_null &&
+				static_cast<BoundColumnRefExpression *>(function->children[0].get())->not_null &&
+				static_cast<BoundColumnRefExpression *>(function->children[1].get())->not_null;
+		}
+		join->null_aware_mark = !has_equality || !keys_proven_not_null;
+	}
 
     if (!join->children.empty()) {
         join->estimated_cardinality = join->children[0]->estimated_cardinality;
@@ -1654,10 +1681,20 @@ std::unique_ptr<Expression> YaapAdapter::TranslateExpression(::Node* pg_expr) {
             return TranslateExpression((::Node*)list_nth(rte->groupexprs, var->varattno - 1));
         }
 
-        return std::make_unique<BoundColumnRefExpression>(
+        auto result = std::make_unique<BoundColumnRefExpression>(
             GetBaseColumnBinding(var),
             GetRteName(var),
             GetColumnName(var));
+        if (rte != nullptr && rte->rtekind == RTE_RELATION && var->varattno > 0) {
+            Relation relation = RelationIdGetRelation(rte->relid);
+            if (relation != nullptr) {
+                TupleDesc desc = RelationGetDescr(relation);
+                if (var->varattno <= desc->natts)
+                    result->not_null = TupleDescAttr(desc, var->varattno - 1)->attnotnull;
+                RelationClose(relation);
+            }
+        }
+        return result;
     }
 
     if (IsA(pg_expr, FuncExpr)) {

@@ -14,6 +14,7 @@ extern "C" {
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -31,10 +32,13 @@ public:
 	const TupleDataLayout  *layout = nullptr;
 	const SortKeyDesc      *sort_keys = nullptr;
 	TupleDataCollection    *global_tdc = nullptr;
+	OutputSharedPayload    *shared_payload = nullptr;
 	dsa_pointer             shared_payload_dp = InvalidDsaPointer;
 	bool                    finalized = false;
 	uint16_t                n_sort_keys = 0;
 	uint64                  max_emit_rows = 0;
+	buffer::YaapSegmentedTdc segmented_writer;
+	bool                    segmented_writer_initialized = false;
 };
 
 class OutputLocalState final : public LocalSinkState {
@@ -48,8 +52,9 @@ public:
 	 * DSA pointers are mirrored into OpDescriptor by EmitOutput so the worker
 	 * ctor below can rebuild on remote backends.
 	 *
-	 * shared_payload_dp MUST be a valid DSA pointer to a TupleDataCollection
-	 * already initialized via TupleDataCollectionInit at translation time.
+	 * shared_payload_dp MUST be a valid DSA pointer to an OutputSharedPayload
+	 * wrapper whose initial TDC is initialized via TupleDataCollectionInit at
+	 * translation time.
 	 * Reason: OutputSink runs as a non-blocking sink in the OUTPUT pipeline;
 	 * unlike PhysicalHashAggregate (whose Combine() is leader-only and thus
 	 * gives the leader first-touch on alloc), OutputSink::GetGlobalSinkState
