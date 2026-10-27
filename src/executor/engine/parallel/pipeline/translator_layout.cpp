@@ -364,7 +364,8 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 				 const std::vector<ColumnSchema> &right_schema,
 				 std::vector<HashJoinOutputColumnDesc> &out_mappings,
 				 std::vector<ColumnSchema> &out_schema,
-				 bool unique_output_slots)
+					 bool unique_output_slots,
+					 const ColumnRef *mark_output_ref)
 {
 	uint8_t next_int32_slot = 0;
 	uint8_t next_int64_slot = 0;
@@ -378,6 +379,24 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 
 	for (const ColumnRef &ref : output_cols)
 	{
+		if (mark_output_ref != nullptr && ref == *mark_output_ref)
+		{
+			ColumnSchema mark_col{};
+			mark_col.type_oid = BOOLOID;
+			mark_col.typmod = -1;
+			mark_col.typlen = 1;
+			mark_col.typbyval = true;
+			mark_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int32_slot++;
+			mark_col.src_attno = 0;
+			mark_col.decode_kind = ColumnDecodeKind::INT32_INT4;
+			if (mark_col.chunk_slot >= 16)
+				return false;
+			out_schema.push_back(mark_col);
+			out_mappings.push_back(HashJoinOutputColumnDesc{
+				HashJoinOutputSide::MARK, 0, ColumnDecodeKind::INT32_INT4,
+				mark_col.chunk_slot});
+			continue;
+		}
 		const ColumnSchema *src = nullptr;
 		HashJoinOutputSide side;
 		if (LookupRawColumn(ref, left_cols, left_schema, src))

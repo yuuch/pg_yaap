@@ -2162,7 +2162,7 @@ PhysicalHashJoin::BuildPipelines(Pipeline &current, MetaPipeline &meta)
 	/* Radix batches consume segmented equality-key rows. A keyless scalar
 	 * comparison (e.g. Q22's balance > AVG) uses flat rows plus residual
 	 * predicates; it must remain the ordinary YAAP join operator. */
-	const bool force_partition_probe = join_mode_ == HashJoinMatchMode::RIGHT;
+	const bool force_partition_probe = HashJoinScansBuildResults(join_mode_);
 	if (((pg_yaap_parallel_max_workers > 1 && pg_yaap_hash_join_partition_probe) ||
 		 force_partition_probe) &&
 		n_left_keys_ > 0 && n_right_keys_ > 0)
@@ -2223,7 +2223,7 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 			state->payload->local_state_slot_count);
 		const HashJoinMatchMode join_mode = desc_ != nullptr
 			? desc_->body.hash_join.join_mode : join_mode_;
-		if (join_mode == HashJoinMatchMode::RIGHT && state->payload->build_partition_count < 2)
+		if (HashJoinScansBuildResults(join_mode) && state->payload->build_partition_count < 2)
 			state->payload->build_partition_count = 2;
 		state->payload->hash_table_capacity = 0;
 		state->payload->radix_bits = 64u - HashJoinPartitionShift(
@@ -2267,6 +2267,7 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 			!payload_rows_unused && can_share_local_payload;
 		state->payload->finalized = false;
 		pg_atomic_init_u32(&state->payload->release_state, 0);
+		pg_atomic_init_u32(&state->payload->build_has_null_key, 0);
 		pg_atomic_init_u32(&state->payload->combine_prepare_state, 0);
 		state->payload->combined_row_count = 0;
 		state->payload->combined_key_heap_used = 0;
@@ -2578,6 +2579,23 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 		(local.build_keys == nullptr || local.build_rows == nullptr)) ||
 		local.build_key_layout == nullptr || local.build_layout == nullptr)
 		elog(ERROR, "pg_yaap: hash join local build rows not initialized");
+	bool chunk_has_null_key = false;
+	for (uint16_t key_idx = 0; key_idx < local.build_key_layout->column_count; ++key_idx)
+	{
+		const uint16_t slot = local.build_key_layout->columns[key_idx].src_col_idx;
+		if (slot >= 16)
+			elog(ERROR, "pg_yaap: hash join build key chunk slot out of range");
+		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+			if (in.nulls[slot][row_idx] != 0)
+			{
+				chunk_has_null_key = true;
+				break;
+			}
+		if (chunk_has_null_key)
+			break;
+	}
+	if (chunk_has_null_key)
+		(void) pg_atomic_fetch_or_u32(&global.payload->build_has_null_key, 1u);
 	if (global.payload->direct_segmented_build)
 	{
 		if (global.payload->build_partition_count > 1)
@@ -3809,19 +3827,19 @@ PhysicalHashJoin::IsBatchBuildRowMatched(ExecCtx &ctx, dsa_pointer batch_dp, uin
 {
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, batch_dp));
 	if (batch == nullptr || row_idx >= batch->row_count || !DsaPointerIsValid(batch->matched_bitmap_dp))
-		elog(ERROR, "pg_yaap: invalid right hash join matched-bit lookup");
+		elog(ERROR, "pg_yaap: invalid build-output hash join matched-bit lookup");
 	auto *words = static_cast<pg_atomic_uint32 *>(dsa_get_address(ctx.dsa, batch->matched_bitmap_dp));
 	const uint32_t word = pg_atomic_read_u32(&words[row_idx >> 5]);
 	return (word & (UINT32_C(1) << (row_idx & 31u))) != 0;
 }
 
 void
-PhysicalHashJoin::EmitUnmatchedBuildRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx,
-						OperatorState &state, PipelineChunk &out)
+PhysicalHashJoin::EmitBuildResultRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx,
+					     OperatorState &state, PipelineChunk &out)
 {
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, batch_dp));
 	if (batch == nullptr || row_idx >= batch->row_count || !DsaPointerIsValid(batch->row_refs_dp))
-		elog(ERROR, "pg_yaap: invalid right hash join unmatched-row reference");
+		elog(ERROR, "pg_yaap: invalid build-output hash join row reference");
 	auto *refs = static_cast<HashJoinBatchRowRef *>(dsa_get_address(ctx.dsa, batch->row_refs_dp));
 	TupleDataCollection *store = nullptr;
 	const uint8_t *row = ResolveBatchRow(ctx.dsa, batch, refs, row_idx, &store);
@@ -4198,8 +4216,8 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	const uint16_t n_filter_steps = n_filter_steps_ > 0 ? n_filter_steps_ :
 		(desc_ != nullptr ? desc_->body.hash_join.n_filter_steps : 0);
 	const HashJoinMatchMode join_mode = desc_ != nullptr ? desc_->body.hash_join.join_mode : join_mode_;
-	if (join_mode == HashJoinMatchMode::RIGHT && batch == nullptr)
-		elog(ERROR, "pg_yaap: RIGHT hash join requires the partitioned probe path");
+	if (HashJoinScansBuildResults(join_mode) && batch == nullptr)
+		elog(ERROR, "pg_yaap: build-output hash join requires the partitioned probe path");
 	if (output_columns == nullptr || output_column_count == 0)
 		elog(ERROR, "pg_yaap: hash join probe missing output column mapping");
 	if ((n_filter_inputs > 0 && filter_inputs == nullptr) ||
@@ -4280,6 +4298,10 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	uint16_t matched_probe_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	const uint8_t *matched_build_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	const TupleDataCollection *matched_build_row_tdcs[PIPELINE_DEFAULT_CHUNK_SIZE];
+	uint8_t marker_states[PIPELINE_DEFAULT_CHUNK_SIZE]; /* 0=false, 1=true, 2=NULL */
+	const bool mark_mode = join_mode == HashJoinMatchMode::MARK ||
+		join_mode == HashJoinMatchMode::MARK_FILTER_NOT;
+	const bool mark_filter_not = join_mode == HashJoinMatchMode::MARK_FILTER_NOT;
 	std::unique_ptr<DataChunk<PIPELINE_DEFAULT_CHUNK_SIZE>> filter_chunk_holder;
 	uint8_t filter_bool_values[FILTER_MAX_BOOL_REGS];
 	const bool has_join_filter = n_filter_inputs > 0 && n_filter_exprs > 0 && n_filter_steps > 0;
@@ -4305,6 +4327,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	uint32_t matched_rows = 0;
 
 	if (batch == nullptr && !partitioned_build && !shared_local_payload && !payload->segmented_build &&
+		!HashJoinScansBuildResults(join_mode) &&
 		TryFastInnerJoinProbe(ctx,
 			op_state.fast_probe,
 			payload->hash_table_capacity,
@@ -4330,6 +4353,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		op_state.cursor.have_build_cursor = false;
 		op_state.cursor.probe_salt = 0;
 		op_state.cursor.probe_matched = false;
+			op_state.cursor.probe_key_null = false;
 		op_state.cursor.partition_id = UINT32_MAX;
 		/* Count-sort this input chunk by radix partition without moving its
 		 * columns. The cursor remains an ordinal in this stable permutation,
@@ -4379,6 +4403,22 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 				break;
 			if (!op_state.cursor.have_build_cursor)
 			{
+				if (mark_mode)
+				{
+					if (probe_layout->column_count != 1)
+						elog(ERROR, "pg_yaap: MARK hash join currently requires one equality key");
+					const uint16_t key_slot = probe_layout->columns[0].src_col_idx;
+					if (key_slot >= 16)
+						elog(ERROR, "pg_yaap: MARK probe key slot out of range");
+					op_state.cursor.probe_key_null = in.nulls[key_slot][probe_row_idx] != 0;
+					if (op_state.cursor.probe_key_null)
+					{
+						op_state.cursor.build_row_idx = HASH_JOIN_INVALID_ROW;
+						op_state.cursor.have_build_cursor = true;
+						op_state.cursor.probe_matched = false;
+						continue;
+					}
+				}
 				PipelineProfileScope lookup_scope(ctx,
 					PipelineProfileStage::HASH_JOIN_LOOKUP);
 				uint64_t hash = 0;
@@ -4410,6 +4450,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 					? pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&batch_heads[bucket])) : bucket_heads[bucket];
 				op_state.cursor.have_build_cursor = true;
 				op_state.cursor.probe_matched = false;
+				op_state.cursor.probe_key_null = false;
 				if (!partitioned_build)
 					op_state.cursor.partition_id = UINT32_MAX;
 				while (op_state.cursor.build_row_idx != HASH_JOIN_INVALID_ROW &&
@@ -4427,7 +4468,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 						!candidate_matches(op_state.cursor.build_row_idx, probe_row_idx))
 						op_state.cursor.build_row_idx = links[op_state.cursor.build_row_idx];
 				}
-				bool key_match = scalar_key_values != nullptr;
+				bool key_match = scalar_key_values != nullptr && !mark_mode;
 				if (!key_match)
 				{
 					TupleDataCollection *key_store = build_keys;
@@ -4452,7 +4493,8 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 						build_key_row = TupleDataCollectionGetRowConst(build_keys, build_row_idx);
 					if (build_key_row == nullptr)
 						ereport(ERROR, (errmsg("pg_yaap: hash join segmented key row unavailable")));
-					key_match = MatchGroupLayouts(build_key_layout, key_store,
+					key_match = !(mark_mode && TupleDataLayoutColumnIsNull(build_key_layout,
+						build_key_row, 0)) && MatchGroupLayouts(build_key_layout, key_store,
 						build_key_row, probe_layout, in, probe_row_idx);
 				}
 				if (key_match)
@@ -4533,7 +4575,13 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 						op_state.cursor.build_row_idx = HASH_JOIN_INVALID_ROW;
 						break;
 					}
-					if (join_mode == HashJoinMatchMode::RIGHT)
+					if (mark_mode)
+					{
+						op_state.cursor.probe_matched = true;
+						op_state.cursor.build_row_idx = HASH_JOIN_INVALID_ROW;
+						break;
+					}
+					if (HashJoinTracksBuildMatches(join_mode))
 					{
 						auto *matched = static_cast<pg_atomic_uint32 *>(
 							dsa_get_address(ctx.dsa, batch->matched_bitmap_dp));
@@ -4544,6 +4592,9 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 					}
 					op_state.cursor.probe_matched = true;
 					++matched_rows;
+					if (join_mode == HashJoinMatchMode::BUILD_SEMI ||
+						join_mode == HashJoinMatchMode::BUILD_ANTI)
+						continue;
 					if (payload->segmented_build)
 					{
 						uint16_t probe_row = probe_row_idx;
@@ -4572,6 +4623,26 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 				}
 			}
 			const bool probe_complete = (op_state.cursor.build_row_idx == HASH_JOIN_INVALID_ROW);
+			if (mark_mode && probe_complete)
+			{
+				matched_probe_rows[0] = probe_row_idx;
+				matched_build_rows[0] = nullptr;
+				matched_build_row_tdcs[0] = nullptr;
+				const uint32_t build_rows_total = payload->segmented_build
+					? payload->segmented_row_count : payload->combined_row_count;
+				if (op_state.cursor.probe_matched)
+					marker_states[0] = 1;
+				else if (build_rows_total == 0)
+					marker_states[0] = 0;
+				else if (op_state.cursor.probe_key_null ||
+					pg_atomic_read_u32(&payload->build_has_null_key) != 0)
+					marker_states[0] = 2;
+				else
+					marker_states[0] = 0;
+				batch_count = 1;
+				if (mark_filter_not && marker_states[0] != 0)
+					batch_count = 0;
+			}
 			if ((join_mode == HashJoinMatchMode::ANTI || join_mode == HashJoinMatchMode::LEFT) &&
 				probe_complete && batch_count == 0 && !op_state.cursor.probe_matched)
 			{
@@ -4592,6 +4663,21 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 					out.count,
 					batch_count);
 				out.count += batch_count;
+				if (join_mode == HashJoinMatchMode::MARK)
+				{
+					for (uint16_t col_idx = 0; col_idx < output_column_count; ++col_idx)
+					{
+						if (output_columns[col_idx].side != HashJoinOutputSide::MARK)
+							continue;
+						const uint8_t slot = output_columns[col_idx].output_chunk_slot;
+						for (uint16_t row = 0; row < batch_count; ++row)
+						{
+							const uint16_t out_row = static_cast<uint16_t>(out.count - batch_count + row);
+							out.int32_columns[slot][out_row] = marker_states[row] == 1 ? 1 : 0;
+							out.nulls[slot][out_row] = marker_states[row] == 2 ? 1 : 0;
+						}
+					}
+				}
 			}
 			if (probe_complete)
 			{
@@ -4617,6 +4703,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		op_state.cursor.have_build_cursor = false;
 		op_state.cursor.probe_salt = 0;
 		op_state.cursor.probe_matched = false;
+		op_state.cursor.probe_key_null = false;
 	}
 	if (out.count > 0 && pg_yaap_trace_execution_path)
 		ereport(LOG,

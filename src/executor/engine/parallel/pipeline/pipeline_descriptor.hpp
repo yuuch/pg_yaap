@@ -311,6 +311,7 @@ struct ProjectOpBody {
 enum class HashJoinOutputSide : uint8_t {
 	LEFT = 0,
 	RIGHT = 1,
+	MARK = 2,
 };
 
 struct HashJoinFilterInputDesc {
@@ -334,7 +335,29 @@ enum class HashJoinMatchMode : uint8_t {
 	ANTI = 2,
 	LEFT = 3,
 	RIGHT = 4,
+	BUILD_SEMI = 5,
+	BUILD_ANTI = 6,
+	MARK = 7,
+	MARK_FILTER_NOT = 8,
 };
+
+inline bool HashJoinTracksBuildMatches(HashJoinMatchMode mode) {
+	return mode == HashJoinMatchMode::RIGHT ||
+		mode == HashJoinMatchMode::BUILD_SEMI ||
+		mode == HashJoinMatchMode::BUILD_ANTI;
+}
+
+inline bool HashJoinScansBuildResults(HashJoinMatchMode mode) {
+	return HashJoinTracksBuildMatches(mode);
+}
+
+inline bool HashJoinEmitsBuildMatch(HashJoinMatchMode mode, bool matched) {
+	return mode == HashJoinMatchMode::BUILD_SEMI ? matched : !matched;
+}
+
+inline bool HashJoinNeedsUnmatchedBuildRows(HashJoinMatchMode mode) {
+	return mode == HashJoinMatchMode::RIGHT || mode == HashJoinMatchMode::BUILD_ANTI;
+}
 
 struct HashJoinOpBody {
 	dsa_pointer left_input_schema;
@@ -497,6 +520,7 @@ struct HashJoinSharedPayload {
 	bool        partition_probe_mode;
 	uint8_t     _pad0[2];
 	pg_atomic_uint32 release_state;       /* 0=live, 1=releasing, 2=released */
+	pg_atomic_uint32 build_has_null_key;
 	pg_atomic_uint32 combine_prepare_state; /* 0=pending, 1=preparing, 2=ready */
 	uint32_t    combined_row_count;
 	uint32_t    combined_key_heap_used;

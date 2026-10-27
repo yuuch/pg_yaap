@@ -237,6 +237,10 @@ HashJoinModeName(HashJoinMatchMode mode)
 		case HashJoinMatchMode::ANTI: return "ANTI";
 		case HashJoinMatchMode::LEFT: return "LEFT";
 		case HashJoinMatchMode::RIGHT: return "RIGHT";
+		case HashJoinMatchMode::BUILD_SEMI: return "BUILD_SEMI";
+		case HashJoinMatchMode::BUILD_ANTI: return "BUILD_ANTI";
+			case HashJoinMatchMode::MARK: return "MARK";
+			case HashJoinMatchMode::MARK_FILTER_NOT: return "MARK_FILTER_NOT";
 	}
 	return "UNKNOWN";
 }

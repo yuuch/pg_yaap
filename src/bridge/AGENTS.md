@@ -63,7 +63,7 @@ The execution and memory settings listed below are `PGC_USERSET`; the timeline e
 | `pg_yaap.profile` | `false` | bool | Emit per-stage pipeline timing after each offloaded query. Fine-grained scan stages add visible overhead; use for diagnosis, not benchmark timing. |
 | `pg_yaap.profile_scan` | `off` | enum: off/sample/exact | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |
 | `pg_yaap.profile_scan_io` | `off` | enum: off/summary/detail | Extension-only IO observations; strict unavailable metrics remain null. |
-| `pg_yaap.scan_read_stream` | `pg` | enum: pg/yaap | Select native ReadStream or plugin queue; workers use DSM snapshot. |
+| `pg_yaap.scan_read_stream` | `yaap` | enum: pg/yaap | Select YAAP's shared-buffer queue (no BAS ring) or native PG ReadStream; workers use DSM snapshot. |
 | `pg_yaap.scan_prefetch_buffers` | `1024` | 16–8192 pages | Requested plugin window, limited by pin budgets. |
 | `pg_yaap.scan_prefetch_requests` | `1` | 0–64 | Per-source read-request cap; 0 retains the old window-only policy. |
 | `pg_yaap.hash_join_partition_probe` | `true` | bool | Stream rows for the resident Build batch directly; partition and spill deferred Probe rows for matching later batches. Only equality-key joins use this path. Off retains the non-hybrid YAAP path for controlled comparisons. |

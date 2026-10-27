@@ -106,7 +106,7 @@ TupleDataLayoutAppendAggregate(TupleDataLayout *layout,
 							   TdcAggKind kind,
 							   uint16_t src_col_idx,
 							   Oid pg_agg_oid,
-							   int16_t numeric_scale)
+								 int16_t numeric_scale)
 {
 	Assert(layout != nullptr);
 	if (layout->aggregate_count >= TUPLE_DATA_MAX_COLUMNS)

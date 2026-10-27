@@ -33,6 +33,9 @@ public:
 	dsa_pointer          shared_payload_dp = InvalidDsaPointer;
 	HashAggSharedPayload *payload = nullptr;
 	HashAggPartition    *partitions = nullptr;
+	HashAggPartition    *distinct_partitions = nullptr;
+	const TupleDataLayout *distinct_layout = nullptr;
+	dsa_pointer          distinct_layout_dp = InvalidDsaPointer;
 	uint32_t             partition_count = 0;
 	uint32_t             max_groups = 256;
 	bool                 finalized = false;

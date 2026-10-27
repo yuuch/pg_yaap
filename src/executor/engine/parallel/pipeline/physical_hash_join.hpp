@@ -180,8 +180,8 @@ public:
 	void SetProbeBatch(OperatorState &state, dsa_pointer batch_dp);
 	void BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t partition_id);
 	bool IsBatchBuildRowMatched(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx) const;
-	void EmitUnmatchedBuildRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx,
-					   OperatorState &state, PipelineChunk &out);
+	void EmitBuildResultRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx,
+						OperatorState &state, PipelineChunk &out);
 	OperatorResultType Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state) override;
 	void ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx);
 	void ReleaseBuildPayloadAtQueryEnd(ExecCtx &ctx);

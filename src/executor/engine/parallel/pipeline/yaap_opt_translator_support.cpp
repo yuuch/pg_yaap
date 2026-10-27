@@ -268,7 +268,7 @@ OptimizerJoinOpTypeName(const PhysicalHashJoin &join)
 	{
 		if (join.join_type == yaap::JOIN_SINGLE && join.correlated_columns.empty())
 			return "NESTED_LOOP_JOIN";
-		if (join.join_type == yaap::JOIN_ANTI)
+		if (join.join_type == yaap::JOIN_SEMI && join.build_output)
 			return "RIGHT_DELIM_JOIN";
 		return "LEFT_DELIM_JOIN";
 	}
@@ -334,6 +334,8 @@ AppendPlanDetailList(std::string &out, const std::vector<std::string> &details)
 const char *
 OptimizerJoinTypeName(const PhysicalHashJoin &join)
 {
+	if (join.join_type == yaap::JOIN_SEMI && join.build_output)
+		return "RIGHT_SEMI";
 	switch (join.join_type)
 	{
 		case yaap::JOIN_INNER: return "INNER";
@@ -598,6 +600,10 @@ OptimizerPlanNodeDetails(const PhysicalOperator &op)
 		{
 			const auto &join = static_cast<const PhysicalHashJoin &>(op);
 			details.push_back("type=" + std::string(OptimizerJoinTypeName(join)));
+			details.push_back(join.build_left ? "probe=right" : "probe=left");
+			details.push_back(join.build_left ? "build=left" : "build=right");
+			if (join.join_type == yaap::JOIN_SEMI || join.join_type == yaap::JOIN_ANTI)
+				details.push_back(join.build_output ? "output=build" : "output=probe");
 			if (!join.conditions.empty())
 				details.push_back("conds=" + std::to_string(join.conditions.size()));
 			if (join.dependent)

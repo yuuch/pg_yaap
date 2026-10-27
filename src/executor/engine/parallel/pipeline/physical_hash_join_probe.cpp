@@ -318,7 +318,7 @@ BatchPlan DescribeBatch(ExecCtx &ctx, PhysicalHashJoin &join, HashJoinSharedPayl
 	}
 	plan.capacity = std::max(1u, plan.capacity);
 	const uint64_t entries = std::max<uint64_t>(1, plan.rows);
-	if (join.join_mode() == HashJoinMatchMode::RIGHT)
+	if (HashJoinTracksBuildMatches(join.join_mode()))
 		plan.matched_word_count = static_cast<uint32_t>((entries + 31u) / 32u);
 	plan.directory_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32) +
 		entries * (sizeof(uint32_t) + sizeof(uint16_t) +
@@ -737,7 +737,7 @@ void AdvanceBatch(ExecCtx &ctx, PhysicalHashJoinProbe &op, HybridProbeState &sta
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, state.active_batch_dp));
 	/* GetData returned only after this worker consumed every resumable output
 	 * for its assigned probe chains. Other workers may still be probing. */
-	if (op.join().join_mode() != HashJoinMatchMode::RIGHT) {
+	if (!HashJoinScansBuildResults(op.join().join_mode())) {
 		pg_atomic_fetch_add_u32(&batch->probe_done, 1);
 		while (pg_atomic_read_u32(&batch->probe_done) < p->participants && HybridLive(ctx, p)) {
 			PipelineProfileScope wait(ctx, PipelineProfileStage::HASH_JOIN_PAIR_WAIT);
@@ -1020,7 +1020,7 @@ SourceResultType PhysicalHashJoinProbe::GetData(ExecCtx &ctx, PipelineChunk &out
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(ErrorRelease, PointerGetDatum(&local));
 	if (result != SourceResultType::FINISHED || !HybridLive(ctx, global.payload) ||
-		join_->join_mode() != HashJoinMatchMode::RIGHT || !DsaPointerIsValid(local.batch_dp))
+		!HashJoinScansBuildResults(join_->join_mode()) || !DsaPointerIsValid(local.batch_dp))
 		return result;
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, local.batch_dp));
 	if (!local.probe_barrier_published) {
@@ -1048,8 +1048,9 @@ SourceResultType PhysicalHashJoinProbe::GetData(ExecCtx &ctx, PipelineChunk &out
 		while (local.unmatched_cursor < local.unmatched_end &&
 			out.count < PIPELINE_DEFAULT_CHUNK_SIZE) {
 			const uint32_t row_idx = local.unmatched_cursor++;
-			if (!join_->IsBatchBuildRowMatched(ctx, local.batch_dp, row_idx))
-				join_->EmitUnmatchedBuildRow(ctx, local.batch_dp, row_idx,
+			const bool matched = join_->IsBatchBuildRowMatched(ctx, local.batch_dp, row_idx);
+			if (HashJoinEmitsBuildMatch(join_->join_mode(), matched))
+				join_->EmitBuildResultRow(ctx, local.batch_dp, row_idx,
 					*local.unmatched_join_state, out);
 		}
 		scan.AddRows(out.count);
@@ -1218,7 +1219,7 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 				HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_SCAN);
 			pg_read_barrier();
 			state.initial_scan_barrier_passed = true;
-			if (join_->join_mode() == HashJoinMatchMode::RIGHT) {
+			if (HashJoinScansBuildResults(join_->join_mode())) {
 				auto *batch = DsaPointerIsValid(p->initial_batch_dp)
 					? static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->initial_batch_dp)) : nullptr;
 				const uint32_t worker = ctx.worker_index < 0 ? p->participants - 1
@@ -1230,7 +1231,7 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 				state.initial_unmatched_join_state = join_->GetOperatorState(ctx);
 			}
 		}
-		if (HybridLive(ctx, p) && join_->join_mode() == HashJoinMatchMode::RIGHT) {
+		if (HybridLive(ctx, p) && HashJoinScansBuildResults(join_->join_mode())) {
 			auto *batch = DsaPointerIsValid(p->initial_batch_dp)
 				? static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->initial_batch_dp)) : nullptr;
 			if (batch != nullptr) {
@@ -1238,8 +1239,9 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 				while (state.initial_unmatched_cursor < state.initial_unmatched_end &&
 					out.count < PIPELINE_DEFAULT_CHUNK_SIZE) {
 					const uint32_t row_idx = state.initial_unmatched_cursor++;
-					if (!join_->IsBatchBuildRowMatched(ctx, p->initial_batch_dp, row_idx))
-						join_->EmitUnmatchedBuildRow(ctx, p->initial_batch_dp, row_idx,
+					const bool matched = join_->IsBatchBuildRowMatched(ctx, p->initial_batch_dp, row_idx);
+					if (HashJoinEmitsBuildMatch(join_->join_mode(), matched))
+						join_->EmitBuildResultRow(ctx, p->initial_batch_dp, row_idx,
 							*state.initial_unmatched_join_state, out);
 				}
 				scan.AddRows(out.count);
@@ -1287,7 +1289,7 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 				Finalize(ctx, *state.sink_global);
 				// Partitions without probe rows need neither a table nor a later batch.
 				auto *pairs = Pairs(ctx, p);
-				const bool right_outer = join_->join_mode() == HashJoinMatchMode::RIGHT;
+				const bool right_outer = HashJoinNeedsUnmatchedBuildRows(join_->join_mode());
 				for (uint32_t part = 0; part < p->partitions; ++part) {
 					if (!right_outer && ((p->completed_mask >> part) & 1u) == 0 &&
 						pairs[part].rows == 0) {

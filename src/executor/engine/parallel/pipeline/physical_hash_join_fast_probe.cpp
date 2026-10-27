@@ -84,7 +84,12 @@ CopyResolvedJoinRow(const PipelineChunk *left_chunk,
 			case ColumnDecodeKind::INT32_CHAR:
 			case ColumnDecodeKind::INT32_DATE:
 			case ColumnDecodeKind::INT32_INT4:
-				if (desc.side == HashJoinOutputSide::LEFT)
+				if (desc.side == HashJoinOutputSide::MARK)
+				{
+					out.int32_columns[desc.output_chunk_slot][out_row_idx] = 0;
+					out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+				}
+				else if (desc.side == HashJoinOutputSide::LEFT)
 				{
 					if (left_chunk != nullptr)
 					{
@@ -241,6 +246,8 @@ InitializeHashJoinFastProbeState(HashJoinFastProbeState &state,
 		state.resolved_output_columns[i].input_chunk_slot = output_columns[i].input_chunk_slot;
 		state.resolved_output_columns[i].decode_kind = output_columns[i].decode_kind;
 		state.resolved_output_columns[i].output_chunk_slot = output_columns[i].output_chunk_slot;
+		if (output_columns[i].side == HashJoinOutputSide::MARK)
+			continue;
 		if (output_columns[i].decode_kind == ColumnDecodeKind::NONE)
 		{
 			has_none_output = true;

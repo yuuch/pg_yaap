@@ -604,6 +604,14 @@ YaapReadStream *YaapReadStreamBegin(HeapScanDesc scan, SeqScanReadStreamState &s
 		read_stream_end(scan->rs_read_stream);
 		scan->rs_read_stream = nullptr;
 	}
+	/* YAAP's scan mode deliberately uses PostgreSQL's normal shared-buffer
+	 * replacement policy.  BAS_BULKREAD would rotate a small ring and keep a
+	 * large sequential scan from populating an otherwise sufficiently large
+	 * shared_buffers pool. */
+	if (scan->rs_strategy != nullptr) {
+		FreeAccessStrategy(scan->rs_strategy);
+		scan->rs_strategy = nullptr;
+	}
 	/* ResourceOwner owns in-flight requests. Keep their addresses valid through
 	 * ERROR unwinding even when the query MemoryContext is reset first. */
 	MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
@@ -629,10 +637,9 @@ YaapReadStream *YaapReadStreamBegin(HeapScanDesc scan, SeqScanReadStreamState &s
 					 std::max(1u, scan->rs_base.rs_rd->rd_rel->relpersistence == RELPERSISTENCE_TEMP
 									  ? GetLocalPinLimit()
 									  : GetPinLimit()));
-	s->strategy =
-		GetAccessStrategyWithSize(BAS_BULKREAD, std::max<uint32_t>(1, limit * (BLCKSZ / 1024)));
-	limit =
-		std::min(limit, static_cast<uint32_t>(std::max(1, GetAccessStrategyPinLimit(s->strategy))));
+	/* Keep the YAAP look-ahead/pin budget, but pass no BAS ring to ReadBuffers.
+	 * This lets scanned pages use the whole PG shared-buffer pool. */
+	s->strategy = nullptr;
 	s->stats.window_pages = limit;
 	state.yaap_queue = true;
 	state.actual_window_pages = limit;

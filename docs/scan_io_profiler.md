@@ -204,16 +204,15 @@ PG internal queue-full counts and exact fallback durations remain unavailable.
 ### Ring interpretation
 
 BAS_BULKREAD is a reuse strategy over shared_buffers, not separate page memory.
-`GetAccessStrategyWithSize` caps ring buffers to NBuffers/8. BAS_BULKREAD's
-strategy pin limit equals its ring size. YAAP chooses its window using a
-per-query/per-source shared-buffer share and backend pin share first, creates a
-ring of that size, then clamps the queue to the strategy's pin allowance.
-Consequently ring and window can have equal reported capacities because YAAP
-selected them together; equality alone does not identify an undersized ring.
-Already pinned buffers are protected against ordinary eviction. Normal ring
-reuse and `GetVictimBuffer` stacks do not prove harmful replacement pressure.
-Reliable internal buffer lookup/replacement exclusive times require kernel
-instrumentation and are intentionally UNAVAILABLE here.
+The native `scan_read_stream=pg` path can use it for large relations;
+`GetAccessStrategyWithSize` caps ring buffers to NBuffers/8. The YAAP stream
+passes no BufferAccessStrategy, so it does not cycle through a BAS ring and
+uses PostgreSQL's normal shared-buffer replacement policy. Its own page window
+still bounds outstanding pins and prefetch. Already pinned buffers are
+protected against ordinary eviction. Normal ring reuse and `GetVictimBuffer`
+stacks do not prove harmful replacement pressure. Reliable internal buffer
+lookup/replacement exclusive times require kernel instrumentation and are
+intentionally UNAVAILABLE here.
 
 
 ## Scoped PostgreSQL shared-read time

@@ -190,7 +190,7 @@ uint16_t TupleDataLayoutAppendAggregate(TupleDataLayout *layout,
                                          TdcAggKind kind,
                                          uint16_t src_col_idx,
                                          Oid pg_agg_oid,
-                                         int16_t numeric_scale);
+								 int16_t numeric_scale);
 uint16_t TupleDataLayoutAggregateWidth(TdcAggKind kind);
 void   TupleDataLayoutSeal(TupleDataLayout *layout);
 void   TupleDataLayoutEnableValidity(TupleDataLayout *layout);

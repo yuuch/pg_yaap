@@ -162,6 +162,8 @@ public:
     int join_type;
     bool dependent = false;
     bool delim_join = false;
+    bool build_left = false;
+    bool build_output = false;
     TableIndex mark_index{static_cast<size_t>(-1)};
     bool has_mark_index = false;
     bool invert_result = false;

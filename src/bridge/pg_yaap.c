@@ -56,7 +56,7 @@ extern int pg_yaap_scan_prefetch_buffers;
 extern int pg_yaap_scan_prefetch_requests;
 extern int pg_yaap_scan_prefetch_batch_pages;
 extern int pg_yaap_profile_scan_blocks;
-int pg_yaap_scan_read_stream = 0;
+int pg_yaap_scan_read_stream = 1;
 int pg_yaap_scan_prefetch_buffers = 1024;
 int pg_yaap_scan_prefetch_requests = 1;
 int pg_yaap_scan_prefetch_batch_pages = 0;
@@ -433,8 +433,8 @@ _PG_init(void)
 							 pg_yaap_profile_scan_options, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomEnumVariable("pg_yaap.scan_read_stream",
-							 "Select native PG or YAAP's bounded asynchronous scan queue.",
-							 NULL, &pg_yaap_scan_read_stream, 0,
+							 "Select YAAP's ringless shared-buffer queue or native PG ReadStream.",
+							 NULL, &pg_yaap_scan_read_stream, 1,
 							 pg_yaap_scan_read_stream_options, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("pg_yaap.scan_prefetch_buffers",
 							 "Requested YAAP scan queue window in buffer pages; runtime pin budgets may reduce it.",

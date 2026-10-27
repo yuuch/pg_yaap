@@ -113,6 +113,8 @@ struct HashAggSharedPayload
 	uint8_t     _pad[3];
 	pg_atomic_uint32 source_partition_next;
 	dsa_pointer partitions_dp;  /* HashAggPartition[partition_count] */
+	dsa_pointer distinct_layout_dp; /* TupleDataLayout for COUNT(DISTINCT), optional */
+	dsa_pointer distinct_partitions_dp; /* HashAggPartition[partition_count], optional */
 	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
 	dsa_pointer publication_dp; /* YaapSegmentPublicationDirectory, optional */
 	pg_atomic_uint32 combine_partitions_done;

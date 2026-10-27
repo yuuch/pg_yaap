@@ -72,6 +72,14 @@ JoinConditionPushPolicy GetJoinConditionPushPolicy(const LogicalOperator& join_p
     switch (join.join_type) {
         case JOIN_INNER:
             return {true, true, true};
+        case JOIN_LEFT:
+            /* Right-only ON predicates can be applied before the join without
+             * removing preserved left rows. Left-only predicates must stay in
+             * ON so those rows still receive null-extended output. */
+            return {false, true, false};
+        case JOIN_RIGHT:
+            /* Symmetric rule for RIGHT OUTER JOIN. */
+            return {true, false, false};
         case JOIN_SEMI:
             return {true, true, false};
         case JOIN_ANTI:

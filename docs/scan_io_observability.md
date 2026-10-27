@@ -135,7 +135,8 @@ not evidence that actual submitted lookahead was persistently pin-limited.
 IO limits can dominate well below the pin cap.
 
 Low cache hit rate alone cannot establish shared-buffer pressure, nor can
-normal BAS_BULKREAD reuse. GetAccessStrategyWithSize caps a ring at NBuffers/8
+normal BAS_BULKREAD reuse in the native PG stream mode. The YAAP stream mode
+uses no BAS ring. GetAccessStrategyWithSize caps a ring at NBuffers/8
 (`freelist.c:626–654`), while BAS_BULKREAD allows pins up to the full ring
 (`689–703`). Backend pin limits and current additional-pin limits are separate
 public APIs (`bufmgr.h:303–308`). Ring capacity, backend pins and total shared

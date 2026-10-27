@@ -114,7 +114,8 @@ bool BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 				 const std::vector<ColumnSchema> &right_schema,
 				 std::vector<HashJoinOutputColumnDesc> &out_mappings,
 				 std::vector<ColumnSchema> &out_schema,
-				 bool unique_output_slots = false);
+				 bool unique_output_slots = false,
+				 const ColumnRef *mark_output_ref = nullptr);
 bool BuildHashGroupLayout(const std::vector<ColumnRef> &group_cols,
 			  const std::vector<ColumnRef> &input_cols,
 			  const std::vector<ColumnSchema> &input_columns,

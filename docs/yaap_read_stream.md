@@ -10,7 +10,7 @@ read synchronously; queueing cannot turn a synchronous backend into AIO.
 ## Configuration
 
 ```sql
-SET pg_yaap.scan_read_stream = yaap;     -- pg (default) or yaap
+SET pg_yaap.scan_read_stream = yaap;     -- yaap (default) or pg
 SET pg_yaap.scan_prefetch_buffers = 1024; -- requested window in pages
 SET pg_yaap.scan_prefetch_requests = 1;   -- 0 retains the old window-only policy
 SET pg_yaap.profile_scan = sample;
@@ -18,9 +18,12 @@ SET pg_yaap.profile_timeline = basic;
 SELECT ...;
 ```
 
-`scan_read_stream=pg` retains the original PG ReadStream implementation. There
-is no automatic fallback when the YAAP path is selected and fails. Both GUCs
-are captured in the query DSM before background workers launch.
+`scan_read_stream=pg` selects the original PG ReadStream implementation,
+including PG's BAS_BULKREAD policy for sufficiently large relations. The
+default YAAP stream submits asynchronous reads directly to PG's Buffer Manager
+without a BAS ring. There is no automatic fallback when the YAAP path is
+selected and fails. Both GUCs are captured in the query DSM before background
+workers launch.
 
 The requested window is 16–8192 pages, default 1024. Actual windows can be as
 small as one page. At 8KiB/block, the requested default is 8MiB. See the actual
@@ -46,11 +49,16 @@ the requested value was granted.
 - Transfer exactly one pin to the heap scanner for each returned Buffer, clear
   its queue entry, and retain the existing page visibility/deform handling.
 - On normal completion or early LIMIT, wait for all pending requests before
-  releasing all unconsumed pins and the independent BULKREAD strategy.
+	  releasing all unconsumed pins.
 
-The queue uses a separate PG BAS_BULKREAD strategy. It does not replace or free
-heap scan's original strategy. Each active source window is limited by a quarter of shared_buffers across
-query participants and the backend GetPinLimit minus a small reserve. It is
+The YAAP queue passes a NULL BufferAccessStrategy to `ReadBuffers`; misses use
+the ordinary shared-buffer replacement path and can occupy any available
+buffer instead of cycling through a per-scan BAS ring. This is intended for
+large-memory TPC-H runs where retaining scanned pages in `shared_buffers` is
+useful. Pages are still unpinned after consumption and can be evicted under
+normal buffer pressure; YAAP does not create a second cache or pin the full
+relation. Each active source window is limited by a quarter of shared_buffers
+across query participants and the backend GetPinLimit minus a small reserve. It is
 not divided by every Scan descriptor in the query DAG: current workers run a
 RUN task to completion, including yielded fragments, and destroy its source
 before taking another task. If scheduling changes to interleave RUN tasks,
@@ -122,10 +130,11 @@ as processed pages. The queue reads only after obtaining ownership and keeps
 its saved block at a discontinuity. Page-number allocation is independent of
 which shared-buffer slot PG uses for that page.
 
-The ring is a PG access-strategy list of Buffer IDs referencing shared_buffers,
-not a separate page cache. Each source queue holds pins on pages in shared
-buffers; enlarging shared_buffers can increase granted pin/window budgets but
-does not guarantee higher hit rates for a large streaming heap scan.
+The PG native stream still uses its access-strategy ring when `scan_read_stream`
+is explicitly set to `pg`. The YAAP queue has no such ring; its bounded request
+queue and pin window control concurrent I/O, not total scan cache residency.
+The separate PostgreSQL AIO submission queue described below is unrelated to
+the BufferAccessStrategy ring.
 
 In the current PG branch, method_worker.c submits request IDs through a global
 64-slot ring (one slot reserved), then uses SetLatch to wake an idle I/O worker.
@@ -169,7 +178,7 @@ does not claim to fix that latency or eliminate synchronous execution.
 
 `pg_yaap.scan_prefetch_requests` is an integer GUC (0–64, default 1), captured
 in query DSM for workers. It applies only to the explicitly selected YAAP
-stream; the default `scan_read_stream=pg` remains unchanged. Zero preserves
+stream; `scan_read_stream=yaap` is now the default. Zero preserves
 the old full-page-window submission policy for A/B tests. Positive values
 strictly cap operations for which Start returned need_wait and consumption
 Wait has not completed. This is per source, includes already completed reads
