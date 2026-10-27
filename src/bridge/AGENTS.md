@@ -61,6 +61,11 @@ The execution and memory settings listed below are `PGC_USERSET`; the timeline e
 | `pg_yaap.parallel_leader_participation` | `true` | bool | Leader runs pipeline tasks alongside workers. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | `false` | bool | Reserved; **no effect in greenfield** (HashJoin removed). Kept registered to avoid breaking existing config files. |
 | `pg_yaap.profile` | `false` | bool | Emit per-stage pipeline timing after each offloaded query. Fine-grained scan stages add visible overhead; use for diagnosis, not benchmark timing. |
+| `pg_yaap.profile_scan` | `off` | enum: off/sample/exact | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |
+| `pg_yaap.profile_scan_io` | `off` | enum: off/summary/detail | Extension-only IO observations; strict unavailable metrics remain null. |
+| `pg_yaap.scan_read_stream` | `pg` | enum: pg/yaap | Select native ReadStream or plugin queue; workers use DSM snapshot. |
+| `pg_yaap.scan_prefetch_buffers` | `1024` | 16–8192 pages | Requested plugin window, limited by pin budgets. |
+| `pg_yaap.scan_prefetch_requests` | `1` | 0–64 | Per-source read-request cap; 0 retains the old window-only policy. |
 | `pg_yaap.hash_join_partition_probe` | `true` | bool | Stream rows for the resident Build batch directly; partition and spill deferred Probe rows for matching later batches. Only equality-key joins use this path. Off retains the non-hybrid YAAP path for controlled comparisons. |
 | `pg_yaap.memory_limit` | `256MB` | 64MB–`INT_MAX` bytes | Hard shared breaker-payload budget; DSA can reserve up to 50% (capped at 4GB) additional metadata/allocator space. |
 | `pg_yaap.memory_soft_limit` | `-1` | -1–`INT_MAX` bytes | Spill threshold; `-1` uses 75% of `memory_limit`. |

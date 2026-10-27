@@ -2108,6 +2108,34 @@ ResolveBatchRow(dsa_area *dsa, const HashJoinBatch *batch,
 	return reinterpret_cast<const uint8_t *>(*store) + refs[row].row_offset;
 }
 
+static void
+InitializeHashJoinOutputState(ExecCtx &ctx, PhysicalHashJoin &join,
+			      HashJoinOperatorState &state, HashJoinMatchMode join_mode)
+{
+	const auto *output_columns = DsaPointerIsValid(join.output_columns_dp())
+		? static_cast<const HashJoinOutputColumnDesc *>(dsa_get_address(ctx.dsa, join.output_columns_dp()))
+		: (join.desc() != nullptr && DsaPointerIsValid(join.desc()->body.hash_join.output_columns)
+			? static_cast<const HashJoinOutputColumnDesc *>(dsa_get_address(ctx.dsa,
+				join.desc()->body.hash_join.output_columns)) : nullptr);
+	const auto *build_row_layout = ResolveLayout(ctx.dsa, DsaPointerIsValid(join.right_payload_layout_dp())
+		? join.right_payload_layout_dp()
+		: (join.desc() != nullptr ? join.desc()->body.hash_join.right_payload_layout : InvalidDsaPointer));
+	const auto *probe_layout = ResolveLayout(ctx.dsa, DsaPointerIsValid(join.left_key_layout_dp())
+		? join.left_key_layout_dp()
+		: (join.desc() != nullptr ? join.desc()->body.hash_join.left_key_layout : InvalidDsaPointer));
+	const auto *build_key_layout = ResolveLayout(ctx.dsa, DsaPointerIsValid(join.right_key_layout_dp())
+		? join.right_key_layout_dp()
+		: (join.desc() != nullptr ? join.desc()->body.hash_join.right_key_layout : InvalidDsaPointer));
+	const uint16_t output_count = join.output_column_count() > 0 ? join.output_column_count()
+		: (join.desc() != nullptr ? join.desc()->body.hash_join.output_column_count : 0);
+	if (output_columns == nullptr || build_row_layout == nullptr || probe_layout == nullptr ||
+		build_key_layout == nullptr || output_count == 0)
+		elog(ERROR, "pg_yaap: hash join output state metadata is incomplete");
+	InitializeHashJoinFastProbeState(state.fast_probe, output_columns, output_count,
+		build_row_layout, probe_layout, build_key_layout, join_mode,
+		join.n_filter_inputs(), join.n_filter_exprs(), join.n_filter_steps());
+}
+
 } // namespace
 
 int
@@ -2134,7 +2162,9 @@ PhysicalHashJoin::BuildPipelines(Pipeline &current, MetaPipeline &meta)
 	/* Radix batches consume segmented equality-key rows. A keyless scalar
 	 * comparison (e.g. Q22's balance > AVG) uses flat rows plus residual
 	 * predicates; it must remain the ordinary YAAP join operator. */
-	if (pg_yaap_parallel_max_workers > 1 && pg_yaap_hash_join_partition_probe &&
+	const bool force_partition_probe = join_mode_ == HashJoinMatchMode::RIGHT;
+	if (((pg_yaap_parallel_max_workers > 1 && pg_yaap_hash_join_partition_probe) ||
+		 force_partition_probe) &&
 		n_left_keys_ > 0 && n_right_keys_ > 0)
 	{
 		probe_stage_ = std::make_unique<PhysicalHashJoinProbe>(*this);
@@ -2191,6 +2221,10 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 		state->payload->local_state_slot_count = EffectiveWorkerCount(ctx);
 		state->payload->build_partition_count = HashJoinChoosePartitionCount(
 			state->payload->local_state_slot_count);
+		const HashJoinMatchMode join_mode = desc_ != nullptr
+			? desc_->body.hash_join.join_mode : join_mode_;
+		if (join_mode == HashJoinMatchMode::RIGHT && state->payload->build_partition_count < 2)
+			state->payload->build_partition_count = 2;
 		state->payload->hash_table_capacity = 0;
 		state->payload->radix_bits = 64u - HashJoinPartitionShift(
 			state->payload->build_partition_count);
@@ -2201,7 +2235,6 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 		pg_atomic_init_u32(&state->payload->combine_partitions_done, 0);
 		pg_atomic_init_u32(&state->payload->finalize_partitions_done, 0);
 		state->payload->combined = false;
-		const HashJoinMatchMode join_mode = desc_ != nullptr ? desc_->body.hash_join.join_mode : join_mode_;
 		const auto *output_columns = DsaPointerIsValid(output_columns_dp_)
 			? static_cast<const HashJoinOutputColumnDesc *>(dsa_get_address(ctx.dsa, output_columns_dp_))
 			: (desc_ != nullptr && DsaPointerIsValid(desc_->body.hash_join.output_columns)
@@ -3771,6 +3804,35 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 	collision_scope.AddRows(collisions);
 }
 
+bool
+PhysicalHashJoin::IsBatchBuildRowMatched(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx) const
+{
+	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, batch_dp));
+	if (batch == nullptr || row_idx >= batch->row_count || !DsaPointerIsValid(batch->matched_bitmap_dp))
+		elog(ERROR, "pg_yaap: invalid right hash join matched-bit lookup");
+	auto *words = static_cast<pg_atomic_uint32 *>(dsa_get_address(ctx.dsa, batch->matched_bitmap_dp));
+	const uint32_t word = pg_atomic_read_u32(&words[row_idx >> 5]);
+	return (word & (UINT32_C(1) << (row_idx & 31u))) != 0;
+}
+
+void
+PhysicalHashJoin::EmitUnmatchedBuildRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx,
+						OperatorState &state, PipelineChunk &out)
+{
+	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, batch_dp));
+	if (batch == nullptr || row_idx >= batch->row_count || !DsaPointerIsValid(batch->row_refs_dp))
+		elog(ERROR, "pg_yaap: invalid right hash join unmatched-row reference");
+	auto *refs = static_cast<HashJoinBatchRowRef *>(dsa_get_address(ctx.dsa, batch->row_refs_dp));
+	TupleDataCollection *store = nullptr;
+	const uint8_t *row = ResolveBatchRow(ctx.dsa, batch, refs, row_idx, &store);
+	auto &join_state = static_cast<HashJoinOperatorState &>(state);
+	const HashJoinMatchMode mode = desc_ != nullptr ? desc_->body.hash_join.join_mode : join_mode_;
+	InitializeHashJoinOutputState(ctx, *this, join_state, mode);
+	CopyUnmatchedBuildRow(store, row, join_state.fast_probe.resolved_output_columns.data(),
+			      join_state.fast_probe.output_column_count, out, out.count);
+	++out.count;
+}
+
 void
 PhysicalHashJoin::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx)
 {
@@ -4060,8 +4122,8 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		elog(ERROR, "pg_yaap: hash join probe ran before build/finalize completed");
 	if (pg_atomic_read_u32(&payload->release_state) != 0)
 		elog(ERROR, "pg_yaap: hash join payload used after release");
-	const auto *batch = DsaPointerIsValid(op_state.batch_dp)
-		? static_cast<const HashJoinBatch *>(dsa_get_address(ctx.dsa, op_state.batch_dp)) : nullptr;
+	auto *batch = DsaPointerIsValid(op_state.batch_dp)
+		? static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, op_state.batch_dp)) : nullptr;
 	const bool partitioned_build = batch == nullptr && payload->build_partition_count > 1;
 	if (pg_yaap_trace_execution_path)
 		elog(LOG,
@@ -4136,6 +4198,8 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 	const uint16_t n_filter_steps = n_filter_steps_ > 0 ? n_filter_steps_ :
 		(desc_ != nullptr ? desc_->body.hash_join.n_filter_steps : 0);
 	const HashJoinMatchMode join_mode = desc_ != nullptr ? desc_->body.hash_join.join_mode : join_mode_;
+	if (join_mode == HashJoinMatchMode::RIGHT && batch == nullptr)
+		elog(ERROR, "pg_yaap: RIGHT hash join requires the partitioned probe path");
 	if (output_columns == nullptr || output_column_count == 0)
 		elog(ERROR, "pg_yaap: hash join probe missing output column mapping");
 	if ((n_filter_inputs > 0 && filter_inputs == nullptr) ||
@@ -4212,16 +4276,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		std::memcpy(&key, value, sizeof(key));
 		return key == in.get_int64(probe_col.src_col_idx, probe_row);
 	};
-	InitializeHashJoinFastProbeState(op_state.fast_probe,
-		output_columns,
-		output_column_count,
-		build_row_layout,
-		probe_layout,
-		build_key_layout,
-		join_mode,
-		n_filter_inputs,
-		n_filter_exprs,
-		n_filter_steps);
+	InitializeHashJoinOutputState(ctx, *this, op_state, join_mode);
 	uint16_t matched_probe_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	const uint8_t *matched_build_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	const TupleDataCollection *matched_build_row_tdcs[PIPELINE_DEFAULT_CHUNK_SIZE];
@@ -4477,6 +4532,15 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 						batch_count = 0;
 						op_state.cursor.build_row_idx = HASH_JOIN_INVALID_ROW;
 						break;
+					}
+					if (join_mode == HashJoinMatchMode::RIGHT)
+					{
+						auto *matched = static_cast<pg_atomic_uint32 *>(
+							dsa_get_address(ctx.dsa, batch->matched_bitmap_dp));
+						const uint32_t bit = UINT32_C(1) << (build_row_idx & 31u);
+						const uint32_t old = pg_atomic_fetch_or_u32(&matched[build_row_idx >> 5], bit);
+						if ((old & bit) == 0)
+							pg_atomic_fetch_add_u32(&batch->matched_build_rows, 1);
 					}
 					op_state.cursor.probe_matched = true;
 					++matched_rows;

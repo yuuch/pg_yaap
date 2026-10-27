@@ -1,5 +1,7 @@
 #include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/pipeline_timeline.hpp"
+#include "parallel/pipeline/scan_profile.hpp"
+#include "parallel/pipeline/scan_io_profile.hpp"
 
 extern "C" {
 #include "utils/dsa.h"
@@ -62,6 +64,8 @@ StageName(PipelineProfileStage stage)
 		case PipelineProfileStage::HASH_JOIN_BATCH_PIN: return "hash_join_batch_pin";
 		case PipelineProfileStage::HASH_JOIN_PROBE_CHAINS: return "hash_join_probe_chains";
 		case PipelineProfileStage::HASH_JOIN_PROBE_PREFETCH: return "hash_join_probe_prefetch";
+		case PipelineProfileStage::HASH_JOIN_UNMATCHED_BUILD_SCAN: return "hash_join_unmatched_build_scan";
+		case PipelineProfileStage::HASH_JOIN_MATCHED_BUILD_ROWS: return "hash_join_matched_build_rows";
 		case PipelineProfileStage::HASH_JOIN_PROBE_SPILL: return "hash_join_probe_spill";
 		case PipelineProfileStage::HASH_JOIN_BATCH_CLEANUP: return "hash_join_batch_cleanup";
 		case PipelineProfileStage::HASH_JOIN_BATCH_REF_SAMPLE: return "hash_join_batch_ref_sample";
@@ -232,6 +236,7 @@ HashJoinModeName(HashJoinMatchMode mode)
 		case HashJoinMatchMode::SEMI: return "SEMI";
 		case HashJoinMatchMode::ANTI: return "ANTI";
 		case HashJoinMatchMode::LEFT: return "LEFT";
+		case HashJoinMatchMode::RIGHT: return "RIGHT";
 	}
 	return "UNKNOWN";
 }
@@ -331,6 +336,8 @@ PipelineProfileAllocate(PipelineSharedControl *control,
 	control->profile_worker_slots = num_workers + 1u;
 	pg_atomic_write_u32(&control->profile_enabled, 0u);
 	PipelineTimelineAllocate(control, dsa, event_count, num_workers);
+	ScanProfileAllocate(control, dsa, event_count, num_workers);
+    ScanIOProfileAllocate(control, dsa, event_count, num_workers);
 
 	if (!pg_yaap_profile || event_count == 0)
 		return true;
@@ -434,6 +441,8 @@ PipelineProfileAddDiff(const ExecCtx &ctx,
 void
 PipelineProfileReport(PipelineSharedControl *control, dsa_area *dsa)
 {
+	ScanProfileReport(control, dsa);
+    ScanIOProfileReport(control, dsa, true);
 	if (control == nullptr || dsa == nullptr ||
 		pg_atomic_read_u32(&control->profile_enabled) == 0)
 		return;

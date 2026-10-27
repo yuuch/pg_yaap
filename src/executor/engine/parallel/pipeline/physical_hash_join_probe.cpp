@@ -41,6 +41,7 @@ struct ProbePayload {
 	pg_atomic_uint32 prepare_next;
 	pg_atomic_uint32 prepared_workers;
 	pg_atomic_uint32 scan_done;
+	pg_atomic_uint32 initial_unmatched_done;
 	pg_atomic_uint32 released_workers;
 	pg_atomic_uint32 drain_phase;
 	pg_atomic_uint32 abandoned;
@@ -77,6 +78,12 @@ struct ProbeSourceLocal final : LocalSourceState {
 	uint32_t partition = UINT32_MAX;
 	uint32_t slot = 0;
 	uint32_t slot_end = 0;
+	dsa_pointer batch_dp = InvalidDsaPointer;
+	uint32_t unmatched_cursor = 0;
+	uint32_t unmatched_end = 0;
+	bool probe_barrier_published = false;
+	bool unmatched_scan_initialized = false;
+	bool unmatched_barrier_published = false;
 	static constexpr uint32_t kPrefetchSegments = 4;
 	static constexpr uint64_t kPrefetchBytes = 4u * 1024u * 1024u;
 	dsa_pointer prefetch_cursor = InvalidDsaPointer;
@@ -89,6 +96,7 @@ struct ProbeSourceLocal final : LocalSourceState {
 	buffer::YaapSharedSegmentReadLease probe_lease;
 	std::unique_ptr<PipelineChunk> chunk;
 	std::unique_ptr<OperatorState> join_state;
+	std::unique_ptr<OperatorState> unmatched_join_state;
 	buffer::YaapSpillStore spill;
 	bool have_input = false;
 
@@ -265,6 +273,7 @@ struct BatchPlan {
 	uint32_t segments = 0;
 	uint32_t map_count = 0;
 	uint32_t capacity = 0;
+	uint32_t matched_word_count = 0;
 	uint32_t offsets[64]{};
 	uint32_t bucket_offsets[64]{};
 	uint32_t bucket_masks[64]{};
@@ -309,9 +318,12 @@ BatchPlan DescribeBatch(ExecCtx &ctx, PhysicalHashJoin &join, HashJoinSharedPayl
 	}
 	plan.capacity = std::max(1u, plan.capacity);
 	const uint64_t entries = std::max<uint64_t>(1, plan.rows);
+	if (join.join_mode() == HashJoinMatchMode::RIGHT)
+		plan.matched_word_count = static_cast<uint32_t>((entries + 31u) / 32u);
 	plan.directory_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32) +
 		entries * (sizeof(uint32_t) + sizeof(uint16_t) +
 			(build->build_rows_use_keys ? 1u : 2u) * sizeof(HashJoinBatchRowRef)) +
+		static_cast<uint64_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32) +
 		static_cast<uint64_t>(plan.segments) * sizeof(HashJoinBatchSegment) +
 		static_cast<uint64_t>(plan.map_count) * sizeof(uint32_t);
 	return plan;
@@ -354,6 +366,9 @@ dsa_pointer CreateBatch(ExecCtx &ctx, PhysicalHashJoin &join, HashJoinSharedPayl
 	batch->hash_capacity = plan.capacity;
 	batch->segment_count = plan.segments;
 	batch->segment_map_count = plan.map_count;
+	if (plan.matched_word_count > 0)
+		batch->matched_bitmap_dp = YaapDsaAllocate(ctx.dsa,
+			static_cast<size_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32));
 	std::memcpy(batch->partition_offsets, plan.offsets, sizeof(plan.offsets));
 	std::memcpy(batch->bucket_offsets, plan.bucket_offsets, sizeof(plan.bucket_offsets));
 	std::memcpy(batch->bucket_masks, plan.bucket_masks, sizeof(plan.bucket_masks));
@@ -365,6 +380,15 @@ dsa_pointer CreateBatch(ExecCtx &ctx, PhysicalHashJoin &join, HashJoinSharedPayl
 	pg_atomic_init_u32(&batch->probe_done, 0);
 	pg_atomic_init_u32(&batch->released_workers, 0);
 	pg_atomic_init_u32(&batch->cleanup_state, 0);
+	pg_atomic_init_u32(&batch->unmatched_done, 0);
+	pg_atomic_init_u32(&batch->matched_build_rows, 0);
+	pg_atomic_init_u32(&batch->profile_published, 0);
+	if (plan.matched_word_count > 0) {
+		auto *matched_words = static_cast<pg_atomic_uint32 *>(dsa_get_address(ctx.dsa,
+			batch->matched_bitmap_dp));
+		for (uint32_t i = 0; i < plan.matched_word_count; ++i)
+			pg_atomic_init_u32(&matched_words[i], 0);
+	}
 	const size_t entries = std::max<uint32_t>(1, batch->row_count);
 	batch->hash_table_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.capacity) * sizeof(pg_atomic_uint32));
 	batch->hash_links_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(uint32_t));
@@ -405,7 +429,7 @@ void DestroyBatch(ExecCtx &ctx, dsa_pointer dp) {
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, dp));
 	if (batch->charged_bytes == 0) return;
 	if (batch->row_refs_dp == batch->key_refs_dp) batch->row_refs_dp = InvalidDsaPointer;
-	dsa_pointer *arrays[] = {&batch->segments_dp, &batch->segment_map_dp, &batch->hash_table_dp,
+		dsa_pointer *arrays[] = {&batch->matched_bitmap_dp, &batch->segments_dp, &batch->segment_map_dp, &batch->hash_table_dp,
 		&batch->hash_links_dp, &batch->hash_salts_dp, &batch->key_refs_dp, &batch->row_refs_dp};
 	for (auto *array : arrays) {
 		if (DsaPointerIsValid(*array)) dsa_free(ctx.dsa, *array);
@@ -456,6 +480,7 @@ PairClaimResult ClaimPair(ExecCtx &ctx, PhysicalHashJoinProbe &op, ProbeSourceGl
 	auto *pairs = Pairs(ctx, p);
 	if (!DsaPointerIsValid(p->current_batch_dp)) return PairClaimResult::EXHAUSTED;
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->current_batch_dp));
+	local.batch_dp = p->current_batch_dp;
 	uint32_t chosen = UINT32_MAX;
 	uint32_t chosen_slot = 0;
 	bool first_chain = false;
@@ -588,6 +613,7 @@ struct HybridProbeState final : OperatorState, PgMemoryContextObject {
 	std::unique_ptr<GlobalSinkState> sink_global;
 	std::unique_ptr<LocalSinkState> sink_local;
 	std::unique_ptr<OperatorState> stream_join;
+	std::unique_ptr<OperatorState> initial_unmatched_join_state;
 	std::unique_ptr<PipelineChunk> stream_chunk;
 	PipelineChunk *stream_input = nullptr;
 	uint64_t chunk_charged_bytes = 0;
@@ -595,6 +621,11 @@ struct HybridProbeState final : OperatorState, PgMemoryContextObject {
 	std::unique_ptr<LocalSourceState> drain_local;
 	bool have_stream_input = false;
 	bool eof_published = false;
+	bool initial_scan_barrier_passed = false;
+	bool initial_unmatched_initialized = false;
+	bool initial_unmatched_worker_published = false;
+	uint32_t initial_unmatched_cursor = 0;
+	uint32_t initial_unmatched_end = 0;
 	bool leases_released = false;
 	bool done = false;
 
@@ -638,6 +669,15 @@ void HybridPause(ExecCtx &ctx, PipelineProfileStage stage) {
 	PipelineProfileScope phase(ctx, stage);
 	PipelineProfileScope wait(ctx, PipelineProfileStage::HASH_JOIN_HYBRID_WAIT);
 	pg_usleep(1000L);
+}
+
+void PublishMatchedBuildRows(ExecCtx &ctx, HashJoinBatch *batch) {
+	if (batch == nullptr) return;
+	uint32_t expected = 0;
+	if (pg_atomic_compare_exchange_u32(&batch->profile_published, &expected, 1)) {
+		PipelineProfileScope matched(ctx, PipelineProfileStage::HASH_JOIN_MATCHED_BUILD_ROWS);
+		matched.AddRows(pg_atomic_read_u32(&batch->matched_build_rows));
+	}
 }
 
 void PrepareBatch(ExecCtx &ctx, PhysicalHashJoinProbe &op, HybridProbeState &state, dsa_pointer dp) {
@@ -697,12 +737,14 @@ void AdvanceBatch(ExecCtx &ctx, PhysicalHashJoinProbe &op, HybridProbeState &sta
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, state.active_batch_dp));
 	/* GetData returned only after this worker consumed every resumable output
 	 * for its assigned probe chains. Other workers may still be probing. */
-	pg_atomic_fetch_add_u32(&batch->probe_done, 1);
-	while (pg_atomic_read_u32(&batch->probe_done) < p->participants && HybridLive(ctx, p)) {
-		PipelineProfileScope wait(ctx, PipelineProfileStage::HASH_JOIN_PAIR_WAIT);
-		HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_DRAIN);
+	if (op.join().join_mode() != HashJoinMatchMode::RIGHT) {
+		pg_atomic_fetch_add_u32(&batch->probe_done, 1);
+		while (pg_atomic_read_u32(&batch->probe_done) < p->participants && HybridLive(ctx, p)) {
+			PipelineProfileScope wait(ctx, PipelineProfileStage::HASH_JOIN_PAIR_WAIT);
+			HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_DRAIN);
+		}
+		pg_read_barrier();
 	}
-	pg_read_barrier();
 	if (!HybridLive(ctx, p)) return;
 	state.drain_local.reset();
 	state.ReleaseInitial();
@@ -977,7 +1019,53 @@ SourceResultType PhysicalHashJoinProbe::GetData(ExecCtx &ctx, PipelineChunk &out
 		}
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(ErrorRelease, PointerGetDatum(&local));
-	return result;
+	if (result != SourceResultType::FINISHED || !HybridLive(ctx, global.payload) ||
+		join_->join_mode() != HashJoinMatchMode::RIGHT || !DsaPointerIsValid(local.batch_dp))
+		return result;
+	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, local.batch_dp));
+	if (!local.probe_barrier_published) {
+		pg_atomic_fetch_add_u32(&batch->probe_done, 1);
+		local.probe_barrier_published = true;
+	}
+	while (pg_atomic_read_u32(&batch->probe_done) < global.payload->participants &&
+		HybridLive(ctx, global.payload))
+		HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_DRAIN);
+	pg_read_barrier();
+	if (!HybridLive(ctx, global.payload))
+		return SourceResultType::FINISHED;
+	if (!local.unmatched_scan_initialized) {
+		const uint32_t worker = ctx.worker_index < 0
+			? global.payload->participants - 1 : static_cast<uint32_t>(ctx.worker_index);
+		local.unmatched_cursor = static_cast<uint64_t>(batch->row_count) * worker /
+			global.payload->participants;
+		local.unmatched_end = static_cast<uint64_t>(batch->row_count) * (worker + 1) /
+			global.payload->participants;
+		local.unmatched_scan_initialized = true;
+		local.unmatched_join_state = join_->GetOperatorState(ctx);
+	}
+	{
+		PipelineProfileScope scan(ctx, PipelineProfileStage::HASH_JOIN_UNMATCHED_BUILD_SCAN);
+		while (local.unmatched_cursor < local.unmatched_end &&
+			out.count < PIPELINE_DEFAULT_CHUNK_SIZE) {
+			const uint32_t row_idx = local.unmatched_cursor++;
+			if (!join_->IsBatchBuildRowMatched(ctx, local.batch_dp, row_idx))
+				join_->EmitUnmatchedBuildRow(ctx, local.batch_dp, row_idx,
+					*local.unmatched_join_state, out);
+		}
+		scan.AddRows(out.count);
+	}
+	if (local.unmatched_cursor == local.unmatched_end && !local.unmatched_barrier_published) {
+		pg_atomic_fetch_add_u32(&batch->unmatched_done, 1);
+		local.unmatched_barrier_published = true;
+	}
+	if (local.unmatched_barrier_published) {
+		while (pg_atomic_read_u32(&batch->unmatched_done) < global.payload->participants &&
+			HybridLive(ctx, global.payload))
+			HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_DRAIN);
+		pg_read_barrier();
+		PublishMatchedBuildRows(ctx, batch);
+	}
+	return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
 }
 
 void PhysicalHashJoinProbe::InitializeHybrid(ExecCtx &ctx, uint32_t participants) {
@@ -992,6 +1080,7 @@ void PhysicalHashJoinProbe::InitializeHybrid(ExecCtx &ctx, uint32_t participants
 	pg_atomic_init_u32(&p->prepare_next, 0);
 	pg_atomic_init_u32(&p->prepared_workers, 0);
 	pg_atomic_init_u32(&p->scan_done, 0);
+	pg_atomic_init_u32(&p->initial_unmatched_done, 0);
 	pg_atomic_init_u32(&p->released_workers, 0);
 	pg_atomic_init_u32(&p->drain_phase, 0);
 	pg_atomic_init_u32(&p->abandoned, 0);
@@ -1124,9 +1213,55 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 			state.eof_published = true;
 			pg_atomic_fetch_add_u32(&p->scan_done, 1);
 		}
-		while (pg_atomic_read_u32(&p->scan_done) < p->participants && HybridLive(ctx, p))
-			HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_SCAN);
-		pg_read_barrier();
+		if (!state.initial_scan_barrier_passed) {
+			while (pg_atomic_read_u32(&p->scan_done) < p->participants && HybridLive(ctx, p))
+				HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_SCAN);
+			pg_read_barrier();
+			state.initial_scan_barrier_passed = true;
+			if (join_->join_mode() == HashJoinMatchMode::RIGHT) {
+				auto *batch = DsaPointerIsValid(p->initial_batch_dp)
+					? static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->initial_batch_dp)) : nullptr;
+				const uint32_t worker = ctx.worker_index < 0 ? p->participants - 1
+					: static_cast<uint32_t>(ctx.worker_index);
+				const uint32_t rows = batch != nullptr ? batch->row_count : 0;
+				state.initial_unmatched_cursor = static_cast<uint64_t>(rows) * worker / p->participants;
+				state.initial_unmatched_end = static_cast<uint64_t>(rows) * (worker + 1) / p->participants;
+				state.initial_unmatched_initialized = true;
+				state.initial_unmatched_join_state = join_->GetOperatorState(ctx);
+			}
+		}
+		if (HybridLive(ctx, p) && join_->join_mode() == HashJoinMatchMode::RIGHT) {
+			auto *batch = DsaPointerIsValid(p->initial_batch_dp)
+				? static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->initial_batch_dp)) : nullptr;
+			if (batch != nullptr) {
+				PipelineProfileScope scan(ctx, PipelineProfileStage::HASH_JOIN_UNMATCHED_BUILD_SCAN);
+				while (state.initial_unmatched_cursor < state.initial_unmatched_end &&
+					out.count < PIPELINE_DEFAULT_CHUNK_SIZE) {
+					const uint32_t row_idx = state.initial_unmatched_cursor++;
+					if (!join_->IsBatchBuildRowMatched(ctx, p->initial_batch_dp, row_idx))
+						join_->EmitUnmatchedBuildRow(ctx, p->initial_batch_dp, row_idx,
+							*state.initial_unmatched_join_state, out);
+				}
+				scan.AddRows(out.count);
+			}
+			if (state.initial_unmatched_cursor < state.initial_unmatched_end &&
+				out.count >= PIPELINE_DEFAULT_CHUNK_SIZE) {
+				result = OperatorResultType::HAVE_MORE_OUTPUT;
+			} else {
+				if (!state.initial_unmatched_worker_published) {
+					pg_atomic_fetch_add_u32(&p->initial_unmatched_done, 1);
+					state.initial_unmatched_worker_published = true;
+				}
+				while (pg_atomic_read_u32(&p->initial_unmatched_done) < p->participants && HybridLive(ctx, p))
+					HybridPause(ctx, PipelineProfileStage::HASH_JOIN_WAIT_DRAIN);
+				pg_read_barrier();
+				PublishMatchedBuildRows(ctx, batch);
+				if (out.count > 0)
+					result = OperatorResultType::HAVE_MORE_OUTPUT;
+			}
+		}
+		if (result == OperatorResultType::HAVE_MORE_OUTPUT)
+			goto hybrid_finalize_done;
 		if (HybridLive(ctx, p)) {
 			if (!state.leases_released) {
 				state.ReleaseInitial();
@@ -1152,8 +1287,10 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 				Finalize(ctx, *state.sink_global);
 				// Partitions without probe rows need neither a table nor a later batch.
 				auto *pairs = Pairs(ctx, p);
+				const bool right_outer = join_->join_mode() == HashJoinMatchMode::RIGHT;
 				for (uint32_t part = 0; part < p->partitions; ++part) {
-					if (((p->completed_mask >> part) & 1u) == 0 && pairs[part].rows == 0) {
+					if (!right_outer && ((p->completed_mask >> part) & 1u) == 0 &&
+						pairs[part].rows == 0) {
 						join_->ReleaseBuildPartitionAfterProbe(ctx, part);
 						p->completed_mask |= UINT64_C(1) << part;
 					}
@@ -1183,6 +1320,7 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 		}
 		if (!HybridLive(ctx, p)) result = OperatorResultType::FINISHED;
 	}
+		hybrid_finalize_done:;
 	PG_END_ENSURE_ERROR_CLEANUP(HybridErrorRelease, PointerGetDatum(&state));
 	return result;
 }

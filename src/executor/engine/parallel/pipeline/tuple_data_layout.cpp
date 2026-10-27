@@ -139,5 +139,17 @@ TupleDataLayoutSeal(TupleDataLayout *layout)
 		layout->row_width = static_cast<uint16_t>(layout->row_width + (8 - rem));
 }
 
+void
+TupleDataLayoutEnableValidity(TupleDataLayout *layout)
+{
+	Assert(layout != nullptr);
+	if (layout->column_count == 0 || layout->validity_width != 0)
+		return;
+	TupleDataLayoutSeal(layout);
+	layout->validity_width = static_cast<uint16_t>((layout->column_count + 7u) / 8u);
+	layout->row_width = static_cast<uint16_t>(layout->row_width +
+		TupleDataLayoutValidityStorageWidth(layout));
+}
+
 }  /* namespace pipeline */
 }  /* namespace pg_yaap */

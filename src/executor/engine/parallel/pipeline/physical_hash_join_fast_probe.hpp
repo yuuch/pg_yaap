@@ -61,6 +61,13 @@ void CopyRowsByResolvedMappingBatch(const PipelineChunk &left_chunk,
 				    uint16_t out_row_base,
 				    uint16_t batch_count);
 
+void CopyUnmatchedBuildRow(const TupleDataCollection *right_tdc,
+				   const uint8_t *right_row,
+				   const HashJoinResolvedOutputColumn *resolved_columns,
+				   uint16_t output_column_count,
+				   PipelineChunk &out,
+				   uint16_t out_row_idx);
+
 bool TryFastInnerJoinProbe(ExecCtx &ctx,
 			   const HashJoinFastProbeState &state,
 			   uint32_t hash_table_capacity,

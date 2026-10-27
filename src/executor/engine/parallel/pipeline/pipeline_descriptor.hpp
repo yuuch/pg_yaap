@@ -333,6 +333,7 @@ enum class HashJoinMatchMode : uint8_t {
 	SEMI = 1,
 	ANTI = 2,
 	LEFT = 3,
+	RIGHT = 4,
 };
 
 struct HashJoinOpBody {
@@ -459,6 +460,10 @@ struct HashJoinBatch {
 	pg_atomic_uint32 probe_done;
 	pg_atomic_uint32 released_workers;
 	pg_atomic_uint32 cleanup_state;
+	dsa_pointer matched_bitmap_dp; /* pg_atomic_uint32[ceil(row_count / 32)] */
+	pg_atomic_uint32 unmatched_done;
+	pg_atomic_uint32 matched_build_rows;
+	pg_atomic_uint32 profile_published;
 };
 
 struct HashJoinPartition {

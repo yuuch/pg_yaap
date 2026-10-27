@@ -107,6 +107,11 @@ struct PipelineSharedControl
 	int32            num_workers;
 	/* Backend-local execution settings captured before bgworker launch. */
 	uint8            jit_deform;
+	uint32           scan_read_stream;
+	uint32           scan_prefetch_buffers;
+	uint32           scan_prefetch_requests;
+	uint32           scan_prefetch_batch_pages;
+	uint32           profile_scan_blocks;
 
 	/*
 	 * Optional per-query profiling storage. The leader allocates the records
@@ -121,6 +126,14 @@ struct PipelineSharedControl
 	uint32           profile_event_count;
 	uint32           profile_worker_slots;
 	/* Immutable after publication; worker-exclusive Task timeline storage. */
+	uint32           scan_io_profile_mode;
+    dsa_pointer      scan_io_profile_root;
+    uint32           scan_io_reported;
+    uint32           scan_io_min_pages;
+    uint32           scan_io_wait_pct;
+    uint32           scan_profile_mode;
+	dsa_pointer      scan_profile_root;
+	uint32           scan_profile_reported;
 	uint32           timeline_mode;
 	dsa_pointer      timeline_root;
 

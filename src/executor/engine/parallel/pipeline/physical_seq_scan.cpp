@@ -1,5 +1,7 @@
 #include "parallel/pipeline/physical_seq_scan.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
+#include "parallel/pipeline/scan_io_profile.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
 
 extern "C" {
 #include "access/heapam.h"
@@ -7,6 +9,7 @@ extern "C" {
 #include "access/tableam.h"
 #include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
+#include "executor/instrument.h"
 #include "fmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
@@ -772,27 +775,175 @@ ReleaseSeqScanPage(SeqScanLocalState &local)
 	local.page_visible_index = 0;
 }
 
+/* GetData publishes only on normal C++ return. PostgreSQL ERROR longjmps
+ * may discard this last call; the abnormal report explicitly marks it partial. */
+// Empty timing brackets disproportionately affect tiny sampled stages. Subtract
+// their per-worker median cost before extrapolation; the result remains an estimate.
+static uint64
+SampledScanElapsed(instr_time end, instr_time start, const SeqScanLocalState &local,
+                   uint64 weight)
+{
+    const uint64 elapsed = ScanProfileElapsed(end, start);
+    const uint64 overhead = weight == 1 ? 0 : local.scan_clock_overhead_ns;
+    return (elapsed > overhead ? elapsed - overhead : 0) * weight;
+}
+
+class ScanGetDataCostScope
+{
+  public:
+	ScanGetDataCostScope(const ExecCtx& ctx,
+						 SeqScanLocalState& local,
+						 PipelineChunk& out,
+						 Oid relid,
+						 OpDescriptor* desc)
+	  : ctx_(ctx)
+	  , local_(local)
+	  , out_(out)
+	  , mode_(ScanProfileMode(ctx))
+    , active_(mode_ || ScanIOProfileMode(ctx))
+	{
+		if (!active_)
+			return;
+		local_.scan_cost = ScanProfileRecord{};
+		local_.scan_cost.mode = mode_;
+		local_.scan_cost.relation_oid = relid;
+		local_.scan_cost.calls = 1;
+		initialization_ns_ = local_.scan_initialization_ns;
+		local_.scan_initialization_ns = 0;
+		local_.scan_cost.setup_ns = initialization_ns_;
+        if (!local_.scan_profile_metadata_ready) {
+            if (ctx.control && ctx.dsa && DsaPointerIsValid(ctx.control->pipelines_root) &&
+                ctx.profile_event_id / 3 < static_cast<uint32>(ctx.control->num_pipelines)) {
+                auto *pipelines = static_cast<PipelineDescriptor *>(
+                    dsa_get_address(ctx.dsa, ctx.control->pipelines_root));
+                auto &pipeline = pipelines[ctx.profile_event_id / 3];
+                if (DsaPointerIsValid(pipeline.ops)) {
+                    auto *ops = static_cast<OpDescriptor *>(dsa_get_address(ctx.dsa, pipeline.ops));
+                    for (int32 i = 0; i < pipeline.op_count; ++i)
+                        if (desc == ops + i) local_.scan_profile_operator_id = i;
+                }
+            }
+            local_.scan_sample_rng ^= relid ^ (static_cast<uint32>(ctx.worker_index + 1) * 0x9e3779b9u);
+            if (!local_.scan_sample_rng) local_.scan_sample_rng = 1;
+            if (mode_ == 1) {
+                // Average each block before taking the median: individual
+                // brackets can quantize to zero on coarse hardware clocks.
+                uint64 clocks[8];
+                for (auto &value : clocks) {
+                    uint64 sum = 0;
+                    for (uint32 i = 0; i < 32; ++i) {
+                        instr_time begin, end;
+                        INSTR_TIME_SET_CURRENT(begin);
+                        INSTR_TIME_SET_CURRENT(end);
+                        sum += ScanProfileElapsed(end, begin);
+                    }
+                    value = sum / 32;
+                }
+                std::sort(std::begin(clocks), std::end(clocks));
+                local_.scan_clock_overhead_ns = clocks[4];
+            }
+            local_.scan_profile_metadata_ready = true;
+        }
+        local_.scan_cost.operator_id = local_.scan_profile_operator_id;
+		local_.scan_cost.sample_clock_overhead_ns = local_.scan_clock_overhead_ns;
+		buffer_hits_start_ = pgBufferUsage.shared_blks_hit;
+		buffer_reads_start_ = pgBufferUsage.shared_blks_read;
+		INSTR_TIME_SET_CURRENT(start_);
+	}
+	~ScanGetDataCostScope()
+	{
+		if (!active_)
+			return;
+		instr_time end;
+		INSTR_TIME_SET_CURRENT(end);
+		local_.scan_cost.source_ns = ScanProfileElapsed(end, start_) + initialization_ns_;
+		local_.scan_cost.output_rows = out_.count;
+		local_.scan_cost.shared_blks_hit = pgBufferUsage.shared_blks_hit - buffer_hits_start_;
+		local_.scan_cost.shared_blks_read = pgBufferUsage.shared_blks_read - buffer_reads_start_;
+		local_.scan_cost.pg_access_ns =
+		  local_.scan_cost.load_ns + local_.scan_cost.prepare_ns + local_.scan_cost.tuple_ns;
+		local_.scan_cost.row_to_column_ns = local_.scan_cost.qual_ns + local_.scan_cost.proj_ns;
+        if (local_.yaap_read_stream != nullptr) {
+            const auto &current = YaapReadStreamGetStats(local_.yaap_read_stream);
+            const auto &previous = local_.read_stream_published;
+            local_.scan_cost.read_stream_mode = 1;
+            local_.scan_cost.read_window_pages = current.window_pages;
+            local_.scan_cost.read_request_limit = current.max_requests;
+            local_.scan_cost.read_request_limit_stops = current.request_limit_stops - previous.request_limit_stops;
+            local_.scan_cost.read_new_io_burst_stops = current.new_io_burst_stops - previous.new_io_burst_stops;
+            local_.scan_cost.read_batch_pages = current.batch_pages;
+            local_.scan_cost.read_submit_ns = current.submit_ns - previous.submit_ns;
+            local_.scan_cost.read_wait_ns = current.wait_ns - previous.wait_ns;
+            local_.scan_cost.read_refill_ns = current.refill_ns - previous.refill_ns;
+            local_.scan_cost.read_requests = current.requests - previous.requests;
+            local_.scan_cost.read_need_wait = current.need_wait - previous.need_wait;
+            local_.scan_cost.read_requested_pages = current.requested_pages - previous.requested_pages;
+            local_.scan_cost.read_accepted_pages = current.accepted_pages - previous.accepted_pages;
+                        local_.scan_cost.read_submit_samples = current.submit_samples - previous.submit_samples;
+            local_.scan_cost.read_submit_sample_wall_ns = current.submit_sample_wall_ns - previous.submit_sample_wall_ns;
+            local_.scan_cost.read_submit_sample_cpu_ns = current.submit_sample_cpu_ns - previous.submit_sample_cpu_ns;
+            local_.scan_cost.read_wait_calls = current.wait_calls - previous.wait_calls;
+            local_.scan_cost.read_wait_samples = current.wait_samples - previous.wait_samples;
+            local_.scan_cost.read_wait_sample_wall_ns = current.wait_sample_wall_ns - previous.wait_sample_wall_ns;
+            local_.scan_cost.read_wait_sample_cpu_ns = current.wait_sample_cpu_ns - previous.wait_sample_cpu_ns;
+            local_.scan_cost.read_cpu_clock_failures = current.cpu_clock_failures - previous.cpu_clock_failures;
+            local_.scan_cost.read_refill_calls = current.refill_calls - previous.refill_calls;
+            local_.scan_cost.read_pin_limit_stops = current.pin_limit_stops - previous.pin_limit_stops;
+            local_.scan_cost.read_slot_limit_stops = current.slot_limit_stops - previous.slot_limit_stops;
+            local_.scan_cost.read_split_requests = current.split_requests - previous.split_requests;
+            local_.scan_cost.read_accepted_single = current.accepted_single - previous.accepted_single;
+            local_.scan_cost.read_accepted_multi = current.accepted_multi - previous.accepted_multi;
+            local_.scan_cost.read_peak_inflight = current.peak_inflight;
+            local_.scan_cost.read_ready_pages = current.ready_pages - previous.ready_pages;
+            if (ScanIOProfileMode(ctx_)) {
+                const auto *io = YaapReadStreamGetIOStats(local_.yaap_read_stream);
+                ScanIOProfilePublish(ctx_, local_.scan_cost, io, local_.scan_io_published);
+                if (io && local_.scan_io_published) *local_.scan_io_published = *io;
+            }
+            local_.read_stream_published = current;
+        }
+		if (!local_.yaap_read_stream && ScanIOProfileMode(ctx_))
+            ScanIOProfilePublish(ctx_, local_.scan_cost, nullptr, nullptr);
+        ScanProfilePublish(ctx_, local_.scan_cost);
+	}
+
+  private:
+	const ExecCtx& ctx_;
+	SeqScanLocalState& local_;
+	PipelineChunk& out_;
+	int mode_;
+    bool active_;
+	uint64 initialization_ns_ = 0;
+	int64 buffer_hits_start_ = 0, buffer_reads_start_ = 0;
+	instr_time start_{};
+};
+
 static bool
-LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
+LoadNextSeqScanPage(SeqScanLocalState& local, ExecCtx& ctx)
 {
 	Assert(local.scan_desc != nullptr);
-	Assert(local.read_stream != nullptr);
+	Assert(local.read_stream != nullptr || local.yaap_read_stream != nullptr);
 
 	ReleaseSeqScanPage(local);
 	if (PipelineCancelRequested(ctx))
 		return false;
 	local.scan_desc->rs_dir = ForwardScanDirection;
 
-	const bool profile_on = PipelineProfileEnabled(ctx);
+	const bool legacy_profile = PipelineProfileEnabled(ctx) && !ScanProfileMode(ctx);
+	const bool scan_profile = ScanProfileMode(ctx) != 0;
+	const bool profile_on = legacy_profile || scan_profile;
 	instr_time load_start;
 	if (profile_on)
 		INSTR_TIME_SET_CURRENT(load_start);
-	local.scan_desc->rs_cbuf = read_stream_next_buffer(local.read_stream, NULL);
+	local.scan_desc->rs_cbuf = local.yaap_read_stream != nullptr
+		? YaapReadStreamNext(local.yaap_read_stream)
+		: read_stream_next_buffer(local.read_stream, NULL);
 	if (profile_on)
 	{
 		instr_time load_end;
 		INSTR_TIME_SET_CURRENT(load_end);
-		PipelineProfileAddDiff(ctx,
+		if (scan_profile) local.scan_cost.load_ns += ScanProfileElapsed(load_end,load_start);
+		if (legacy_profile) PipelineProfileAddDiff(ctx,
 			PipelineProfileStage::SCAN_LOAD_PAGE,
 			load_end,
 			load_start);
@@ -807,6 +958,7 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 	}
 
 	local.scan_desc->rs_cblock = BufferGetBlockNumber(local.scan_desc->rs_cbuf);
+	if (scan_profile) ++local.scan_cost.pages;
 
 	instr_time prepare_start;
 	if (profile_on)
@@ -872,7 +1024,8 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 	{
 		instr_time prepare_end;
 		INSTR_TIME_SET_CURRENT(prepare_end);
-		PipelineProfileAddDiff(ctx,
+		if (scan_profile) local.scan_cost.prepare_ns += ScanProfileElapsed(prepare_end,prepare_start);
+		if (legacy_profile) PipelineProfileAddDiff(ctx,
 			PipelineProfileStage::SCAN_PREPARE_PAGE,
 			prepare_end,
 			prepare_start,
@@ -979,6 +1132,9 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 std::unique_ptr<LocalSourceState>
 PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 {
+	const bool scan_profile = ScanProfileMode(ctx) != 0 || ScanIOProfileMode(ctx);
+	instr_time init_start;
+	if (scan_profile) INSTR_TIME_SET_CURRENT(init_start);
 	auto &global = static_cast<SeqScanGlobalState &>(gstate);
 	std::unique_ptr<SeqScanLocalState> local = std::make_unique<SeqScanLocalState>();
 
@@ -992,20 +1148,47 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		nullptr,
 		global.shared != nullptr ? (ParallelTableScanDesc) &global.shared->pbscan : nullptr,
 		SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
-	if (local->scan_desc->rs_base.rs_parallel != nullptr)
-		InstallAggressiveParallelSeqScanReadStream(local->scan_desc,
-		                                           local->rel,
-		                                           local->read_stream_state,
-		                                           ctx.worker_index,
-		                                           ctx.control != nullptr ? ctx.control->num_workers : 1u,
-		                                           SeqScanTraceEnabled(ctx));
-	local->read_stream = local->scan_desc->rs_read_stream;
-	if (local->read_stream == nullptr)
-		elog(ERROR, "pg_yaap: SeqScan failed to initialize read stream");
+    if (ctx.control != nullptr && ctx.control->scan_read_stream == 1) {
+        // Workers finish one RUN task (including yielded fragments) and
+        // destroy its LocalSourceState before taking another task. A window
+        // is a ceiling, not an up-front pin reservation: do not divide it by
+        // every Scan descriptor in the query DAG. Revisit this if RUN tasks
+        // become interleaved. QueueRefill still checks actual remaining pins.
+        const uint64 participants = static_cast<uint64>(ctx.control->num_workers) + 1;
+        const uint32 pool_limit = std::max<uint64>(1, NBuffers / (4 * participants));
+        const uint32 pin_limit = GetPinLimit();
+        const uint32 reserve = std::min<uint32>(pin_limit, 17u);
+        const uint32 backend_limit = std::max(1u, pin_limit - reserve);
+        const uint32 window = std::min(ctx.control->scan_prefetch_buffers, std::min(pool_limit, backend_limit));
+        local->yaap_read_stream = YaapReadStreamBegin(local->scan_desc, local->read_stream_state,
+            ctx.worker_index, ctx.control->num_workers, SeqScanTraceEnabled(ctx), window,
+            scan_profile || PipelineProfileEnabled(ctx), ctx.control->scan_prefetch_requests, ctx.control->scan_prefetch_batch_pages);
+        if (ctx.control->profile_scan_blocks)
+            YaapReadStreamEnableBlockTrace(local->yaap_read_stream, ctx.control->profile_scan_blocks);
+        if (ScanIOProfileMode(ctx)) {
+            YaapReadStreamEnableIOProfile(local->yaap_read_stream, ScanIOProfileMode(ctx)==2,
+                ctx.control->scan_prefetch_buffers, pool_limit, backend_limit);
+            local->scan_io_published = static_cast<ScanIOStats *>(MemoryContextAllocZero(ctx.mcxt, sizeof(ScanIOStats)));
+            new (local->scan_io_published) ScanIOStats{};
+        }
+    } else {
+        if (local->scan_desc->rs_base.rs_parallel != nullptr)
+            InstallAggressiveParallelSeqScanReadStream(local->scan_desc, local->rel,
+                local->read_stream_state, ctx.worker_index,
+                ctx.control != nullptr ? ctx.control->num_workers : 1u, SeqScanTraceEnabled(ctx));
+        local->read_stream = local->scan_desc->rs_read_stream;
+        if (local->read_stream == nullptr)
+            elog(ERROR, "pg_yaap: SeqScan failed to initialize read stream");
+    }
 	local->check_serializable =
 		CheckForSerializableConflictOutNeeded(local->rel, GetActiveSnapshot());
 	local->exhausted = (global.shared == nullptr || global.shared->total_blocks == 0);
 
+	if (scan_profile) {
+		instr_time end;
+		INSTR_TIME_SET_CURRENT(end);
+		local->scan_initialization_ns = ScanProfileElapsed(end, init_start);
+	}
 	return std::unique_ptr<LocalSourceState>(std::move(local));
 }
 
@@ -1014,6 +1197,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 {
 	auto &global = static_cast<SeqScanGlobalState &>(input.global_state);
 	auto &local = static_cast<SeqScanLocalState &>(input.local_state);
+	const int scan_mode = ScanProfileMode(ctx);
+	ScanGetDataCostScope scan_cost_scope(ctx, local, out, relid_, global.desc);
+	instr_time setup_start;
+	if (scan_mode || ScanIOProfileMode(ctx)) INSTR_TIME_SET_CURRENT(setup_start);
 	const bool first_call = !local.diag_first_call_logged;
 
 	if (first_call)
@@ -1200,7 +1387,13 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	DeformBindings proj_bindings;
 	BuildDeformBindings(out_schema, out, proj_bindings);
 	const bool use_simple_filter = has_filter && simple_filter_step != nullptr;
-	const bool profile_on = PipelineProfileEnabled(ctx);
+	const bool legacy_profile = PipelineProfileEnabled(ctx) && !scan_mode;
+	if (scan_mode || ScanIOProfileMode(ctx))
+	{
+		instr_time end;
+		INSTR_TIME_SET_CURRENT(end);
+		local.scan_cost.setup_ns += ScanProfileElapsed(end, setup_start);
+	}
 
 	uint32_t tuple_checks = 0;
 	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
@@ -1216,6 +1409,17 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			break;
 		}
 
+		bool sampled = false;
+		if (scan_mode) {
+		 local.scan_sample_rng ^= local.scan_sample_rng << 13;
+		 local.scan_sample_rng ^= local.scan_sample_rng >> 17;
+		 local.scan_sample_rng ^= local.scan_sample_rng << 5;
+		 sampled = scan_mode == 2 || (local.scan_sample_rng & 63u) == 0;
+		 ++local.scan_cost.visible_rows;
+		 if (sampled) ++local.scan_cost.samples;
+		}
+		const bool profile_on = legacy_profile || sampled;
+		const uint64 sample_weight = scan_mode == 1 ? 64 : 1;
 		instr_time tuple_iter_start;
 		if (profile_on)
 			INSTR_TIME_SET_CURRENT(tuple_iter_start);
@@ -1233,7 +1437,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		{
 			instr_time tuple_iter_end;
 			INSTR_TIME_SET_CURRENT(tuple_iter_end);
-			PipelineProfileAddDiff(ctx,
+			if (sampled) local.scan_cost.tuple_ns += SampledScanElapsed(tuple_iter_end, tuple_iter_start, local, sample_weight);
+			if (legacy_profile) PipelineProfileAddDiff(ctx,
 				PipelineProfileStage::SCAN_VISIBLE_TUPLE,
 				tuple_iter_end,
 				tuple_iter_start,
@@ -1250,6 +1455,12 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		 * vast majority of tuples. */
 		if (has_filter)
 		{
+			if (scan_mode)
+			{
+				++local.scan_cost.qual_rows;
+				if (sampled)
+					++local.scan_cost.qual_samples;
+			}
 			instr_time qual_deform_start;
 			if (profile_on)
 				INSTR_TIME_SET_CURRENT(qual_deform_start);
@@ -1260,7 +1471,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			{
 				instr_time qual_deform_end;
 				INSTR_TIME_SET_CURRENT(qual_deform_end);
-				PipelineProfileAddDiff(ctx,
+				if (sampled) local.scan_cost.qual_ns += SampledScanElapsed(qual_deform_end, qual_deform_start, local, sample_weight);
+				if (legacy_profile) PipelineProfileAddDiff(ctx,
 					PipelineProfileStage::SCAN_QUAL_DEFORM,
 					qual_deform_end,
 					qual_deform_start,
@@ -1305,7 +1517,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			{
 				instr_time filter_end;
 				INSTR_TIME_SET_CURRENT(filter_end);
-				PipelineProfileAddDiff(ctx,
+				if (sampled) local.scan_cost.predicate_ns += SampledScanElapsed(filter_end, filter_start, local, sample_weight);
+				if (legacy_profile) PipelineProfileAddDiff(ctx,
 					PipelineProfileStage::SCAN_FILTER,
 					filter_end,
 					filter_start,
@@ -1313,6 +1526,12 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			}
 			if (!pass)
 				continue;
+		}
+		if (scan_mode)
+		{
+			++local.scan_cost.proj_rows;
+			if (sampled)
+				++local.scan_cost.proj_samples;
 		}
 		instr_time proj_start;
 		if (profile_on)
@@ -1322,7 +1541,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		{
 			instr_time proj_end;
 			INSTR_TIME_SET_CURRENT(proj_end);
-			PipelineProfileAddDiff(ctx,
+			if (sampled) local.scan_cost.proj_ns += SampledScanElapsed(proj_end, proj_start, local, sample_weight);
+			if (legacy_profile) PipelineProfileAddDiff(ctx,
 				PipelineProfileStage::SCAN_PROJ_DEFORM,
 				proj_end,
 				proj_start,

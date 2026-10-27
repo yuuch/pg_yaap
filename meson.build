@@ -155,3 +155,10 @@ install_data(
   ],
   install_dir: join_paths(pg_sharedir, 'extension'),
 )
+
+# Portable rule/histogram tests use no server, PG headers or external packages.
+scan_io_rules_test = executable('scan_io_rules_test',
+  ['tests/scan_io_rules.cpp', 'src/executor/engine/parallel/pipeline/scan_io_diagnosis.cpp'],
+  include_directories: include_directories('src/executor/engine'),
+  cpp_args: ['-O2', '-UNDEBUG'], install: false)
+test('pg_yaap_scan_io_rules', scan_io_rules_test, timeout: 30)

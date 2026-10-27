@@ -145,6 +145,9 @@ CopyTdcRow(const TupleDataLayout *layout,
 		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
+	if (layout->validity_width > 0)
+		std::memcpy(dst_row + TupleDataLayoutValidityOffset(layout),
+			src_row + TupleDataLayoutValidityOffset(layout), layout->validity_width);
 }
 
 static dsa_pointer
@@ -291,7 +294,13 @@ void TdcExternalSorter::Put(const TupleDataCollection *tdc, const uint8_t *row)
  MemoryContext old = MemoryContextSwitchTo(s.row_context);
  ExecClearTuple(s.slot);
  for (uint16_t k = 0; k < s.nkeys; ++k) {
-  const auto &col = s.key_layout->columns[s.sequential ? k : s.keys[k].col_idx];
+  const uint16_t key_col = s.sequential ? k : s.keys[k].col_idx;
+  const auto &col = s.key_layout->columns[key_col];
+  s.slot->tts_isnull[k] = TupleDataLayoutColumnIsNull(s.key_layout, row, key_col);
+  if (s.slot->tts_isnull[k]) {
+   s.slot->tts_values[k] = (Datum) 0;
+   continue;
+  }
   const uint8_t *value = row + col.offset;
   switch (col.kind) {
    case TdcColumnKind::INT32: { int32_t v; memcpy(&v, value, sizeof(v)); s.slot->tts_values[k] = Int32GetDatum(v); break; }
@@ -303,7 +312,6 @@ void TdcExternalSorter::Put(const TupleDataCollection *tdc, const uint8_t *row)
     s.slot->tts_values[k] = PointerGetDatum(cstring_to_text_with_len(ptr != nullptr ? ptr : "", ref.len)); break;
    }
   }
-  s.slot->tts_isnull[k] = false;
  }
  const uint32_t heap = TupleDataCollectionRequiredHeapBytesForRow(s.layout, tdc, row);
  const size_t bytes = TupleDataCollectionAllocSize(1, s.layout->row_width, heap);

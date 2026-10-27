@@ -341,6 +341,12 @@ CompareStoredOutputRows(const OutputGlobalState &global,
 		const SortKeyDesc &key = global.sort_keys[i];
 		if (key.col_idx >= global.layout->column_count)
 			continue;
+		const bool null_a = TupleDataLayoutColumnIsNull(global.layout, row_a, key.col_idx);
+		const bool null_b = TupleDataLayoutColumnIsNull(global.layout, row_b, key.col_idx);
+		if (null_a != null_b)
+			return null_a == key.nulls_first ? -1 : 1;
+		if (null_a)
+			continue;
 		const int cmp = CompareOutputKeyColumn(global.global_tdc,
 			global.layout->columns[key.col_idx],
 			row_a,
@@ -366,6 +372,12 @@ CompareChunkRowToStoredRow(const OutputGlobalState &global,
 
 		const ColumnSchema &schema_col = global.input_schema->columns[key.col_idx];
 		const TdcColumnDesc &layout_col = global.layout->columns[key.col_idx];
+		const bool lhs_null = chunk.nulls[schema_col.chunk_slot][row_idx] != 0;
+		const bool rhs_null = TupleDataLayoutColumnIsNull(global.layout, stored_row, key.col_idx);
+		if (lhs_null != rhs_null)
+			return lhs_null == key.nulls_first ? -1 : 1;
+		if (lhs_null)
+			continue;
 		int cmp = 0;
 		switch (layout_col.kind)
 		{
@@ -470,6 +482,9 @@ CopyTdcRow(const TupleDataLayout *layout,
 		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
+	if (layout->validity_width > 0)
+		std::memcpy(dst_row + TupleDataLayoutValidityOffset(layout),
+			src_row + TupleDataLayoutValidityOffset(layout), layout->validity_width);
 }
 
 static inline void
@@ -975,15 +990,16 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
         bool receiver_done = false;
         MemoryContext row_context = AllocSetContextCreate(ctx.mcxt,
             "YAAP output row", ALLOCSET_SMALL_SIZES);
-        auto emit_row = [&](const TupleDataCollection *store, const uint8_t *row) {
+		auto emit_row = [&](const TupleDataCollection *store, const uint8_t *row) {
             if (receiver_done || (max_emit_rows_ > 0 && emitted >= max_emit_rows_)) return;
             MemoryContext old = MemoryContextSwitchTo(row_context);
             ExecClearTuple(slot);
             for (uint16_t c = 0; c < natts; ++c) {
                 auto col = schema->columns[c];
                 col.type_oid = TupleDescAttr(tupdesc_, c)->atttypid;
-                slot->tts_values[c] = EncodeColumnFromRow(col, layout, store, row);
-                slot->tts_isnull[c] = false;
+				slot->tts_isnull[c] = TupleDataLayoutColumnIsNull(layout, row, c);
+				slot->tts_values[c] = slot->tts_isnull[c]
+					? (Datum) 0 : EncodeColumnFromRow(col, layout, store, row);
                 if (TupleDescAttr(tupdesc_, c)->atttypid == BPCHAROID && col.decode_kind == ColumnDecodeKind::INT32_CHAR) {
                     BpChar *bp = static_cast<BpChar *>(palloc(VARHDRSZ + 1));
                     SET_VARSIZE(bp, VARHDRSZ + 1);
@@ -1078,6 +1094,12 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 			{
 				if (key.col_idx >= layout->column_count)
 					continue;
+				const bool null_a = TupleDataLayoutColumnIsNull(layout, row_a, key.col_idx);
+				const bool null_b = TupleDataLayoutColumnIsNull(layout, row_b, key.col_idx);
+				if (null_a != null_b)
+					return null_a == key.nulls_first;
+				if (null_a)
+					continue;
 				const TdcColumnDesc &col = layout->columns[key.col_idx];
 				const int cmp = CompareOutputKeyColumn(tdc, col, row_a, row_b);
 				if (cmp != 0)
@@ -1101,8 +1123,9 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 			ColumnSchema col = schema->columns[c];
             col.type_oid = TupleDescAttr(tupdesc_, c)->atttypid;
 
-			slot->tts_values[c] = EncodeColumnFromRow(col, layout, tdc, row_ptr);
-			slot->tts_isnull[c] = false;
+			slot->tts_isnull[c] = TupleDataLayoutColumnIsNull(layout, row_ptr, c);
+			slot->tts_values[c] = slot->tts_isnull[c]
+				? (Datum) 0 : EncodeColumnFromRow(col, layout, tdc, row_ptr);
 
 			/* Q1 stores l_returnflag/l_linestatus as INT32_CHAR (single byte)
 			 * but the SQL column type is bpchar(1) (varlena). printtup calls

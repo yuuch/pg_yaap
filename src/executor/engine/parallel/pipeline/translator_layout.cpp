@@ -363,12 +363,14 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 				 const std::vector<ColumnRef> &right_cols,
 				 const std::vector<ColumnSchema> &right_schema,
 				 std::vector<HashJoinOutputColumnDesc> &out_mappings,
-				 std::vector<ColumnSchema> &out_schema)
+				 std::vector<ColumnSchema> &out_schema,
+				 bool unique_output_slots)
 {
 	uint8_t next_int32_slot = 0;
 	uint8_t next_int64_slot = 0;
 	uint8_t next_double_slot = 0;
 	uint8_t next_string_slot = 0;
+	uint8_t next_output_slot = 0;
 	out_mappings.clear();
 	out_schema.clear();
 	out_mappings.reserve(output_cols.size());
@@ -400,17 +402,17 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 			case ColumnDecodeKind::INT32_CHAR:
 			case ColumnDecodeKind::INT32_DATE:
 			case ColumnDecodeKind::INT32_INT4:
-				out_col.chunk_slot = next_int32_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int32_slot++;
 				break;
 			case ColumnDecodeKind::INT64_INT8:
 			case ColumnDecodeKind::INT64_NUMERIC_SCALED:
-				out_col.chunk_slot = next_int64_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int64_slot++;
 				break;
 			case ColumnDecodeKind::DOUBLE_FLOAT8:
-				out_col.chunk_slot = next_double_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_double_slot++;
 				break;
 			case ColumnDecodeKind::STRING_REF:
-				out_col.chunk_slot = next_string_slot++;
+				out_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_string_slot++;
 				break;
 			case ColumnDecodeKind::NONE:
 				if (pg_yaap_trace_hooks)

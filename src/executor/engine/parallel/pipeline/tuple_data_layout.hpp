@@ -17,7 +17,7 @@
  *
  * Out of scope (TODO(Q3+)):
  *   - VARCHAR/blob (would need a heap area + per-row heap_size_offset).
- *   - NULL bitmap (validity_width).
+ *   - Optional trailing NULL bitmap (validity_width bytes).
  *   - INT128 / Wide128 (interpreter-only types per project convention).
  *
  * Sizing: this struct is fixed-size (no FAM). One layout per operator;
@@ -149,14 +149,14 @@ struct TdcAggregateDesc {
  *   - Trailing pad to align row_width up to 8 bytes.
  *
  *   column_count    + aggregate_count ≤ TUPLE_DATA_MAX_COLUMNS each.
- *   validity_width  must be 0 in v1 (NOT NULL only).
+ *   validity_width  is 0 for non-null layouts, otherwise ceil(column_count / 8).
  *   row_width       always 8-byte aligned.
  */
 struct TupleDataLayout {
 	uint16_t         column_count;
 	uint16_t         aggregate_count;
 	uint16_t         row_width;
-	uint16_t         validity_width;     /* 0 in v1 */
+	uint16_t         validity_width;     /* bytes in the trailing NULL bitmap */
 	uint32_t         _pad;
 	TdcColumnDesc    columns[TUPLE_DATA_MAX_COLUMNS];
 	TdcAggregateDesc aggregates[TUPLE_DATA_MAX_COLUMNS];
@@ -193,6 +193,29 @@ uint16_t TupleDataLayoutAppendAggregate(TupleDataLayout *layout,
                                          int16_t numeric_scale);
 uint16_t TupleDataLayoutAggregateWidth(TdcAggKind kind);
 void   TupleDataLayoutSeal(TupleDataLayout *layout);
+void   TupleDataLayoutEnableValidity(TupleDataLayout *layout);
+
+static inline uint16_t
+TupleDataLayoutValidityStorageWidth(const TupleDataLayout *layout)
+{
+	return layout->validity_width == 0 ? 0 :
+		static_cast<uint16_t>((layout->validity_width + 7u) & ~7u);
+}
+
+static inline uint16_t
+TupleDataLayoutValidityOffset(const TupleDataLayout *layout)
+{
+	return static_cast<uint16_t>(layout->row_width - TupleDataLayoutValidityStorageWidth(layout));
+}
+
+static inline bool
+TupleDataLayoutColumnIsNull(const TupleDataLayout *layout, const uint8_t *row, uint16_t column)
+{
+	if (layout->validity_width == 0 || column >= layout->column_count)
+		return false;
+	const uint8_t *bitmap = row + TupleDataLayoutValidityOffset(layout);
+	return (bitmap[column >> 3] & (uint8_t(1u) << (column & 7u))) != 0;
+}
 
 /*
  * Width helper — returns the in-row byte width for a column kind.

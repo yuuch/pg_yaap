@@ -1316,6 +1316,23 @@ CollectJoinKeys(const Expression *expr,
 	return true;
 }
 
+static bool
+HasOuterHashJoin(const PipelineOperator *op)
+{
+	if (op == nullptr)
+		return false;
+	if (op->type() == pg_yaap::pipeline::PhysicalOperatorType::HASH_JOIN) {
+		const auto *join = static_cast<const PipelineHashJoin *>(op);
+		if (join->join_mode() == pg_yaap::pipeline::HashJoinMatchMode::LEFT ||
+			join->join_mode() == pg_yaap::pipeline::HashJoinMatchMode::RIGHT)
+			return true;
+	}
+	for (const auto &child : op->children())
+		if (HasOuterHashJoin(child.get()))
+			return true;
+	return false;
+}
+
 std::unique_ptr<PipelineOperator>
 BuildOutputContract(OptimizerNodeTranslation &node,
 					QueryDesc *queryDesc,
@@ -1326,6 +1343,8 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	TupleDataLayout output_layout;
 	if (!BuildColumnOnlyLayout(node.schema, output_layout))
 		return nullptr;
+	if (HasOuterHashJoin(node.op.get()))
+		TupleDataLayoutEnableValidity(&output_layout);
 	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(node.schema, state->runtime_dsa);
 	dsa_pointer output_layout_dp = SerializeTupleDataLayout(output_layout, state->runtime_dsa);
 	if (!DsaPointerIsValid(output_schema_dp) || !DsaPointerIsValid(output_layout_dp))

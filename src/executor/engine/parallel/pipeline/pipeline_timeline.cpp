@@ -23,6 +23,8 @@ extern char *pg_yaap_profile_trace_file;
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
+#include "parallel/pipeline/scan_profile.hpp"
+#include "parallel/pipeline/scan_io_profile.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -46,10 +48,45 @@ struct TimelineStats {
 // strides below are aligned to PG_CACHE_LINE_SIZE (128 bytes on this build).
 static_assert(sizeof(TimelineStats) == 64, "Unexpected timeline statistics layout");
 
+// Costs are cumulative elapsed work inside this fragment, not new intervals.
+struct ScanTaskCosts {
+ uint64 source_ns = 0, pg_access_ns = 0, row_to_column_ns = 0;
+ uint64 predicate_ns = 0, setup_ns = 0, visible_rows = 0, output_rows = 0, samples = 0;
+ uint32 mode = 0, operator_id = 0, relation_oid = 0;
+};
+
+ScanTaskCosts ScanCosts(PipelineSharedControl *control, dsa_area *dsa, int worker, uint32 event) {
+ const auto r = ScanProfileSnapshot(control, dsa, worker, event);
+ return {r.source_ns, r.pg_access_ns, r.row_to_column_ns, r.predicate_ns, r.setup_ns,
+         r.visible_rows, r.output_rows, r.samples, r.mode, r.operator_id, r.relation_oid};
+}
+
+ScanTaskCosts ScanDelta(const ScanTaskCosts &end, const ScanTaskCosts &start) {
+ return {end.source_ns - start.source_ns, end.pg_access_ns - start.pg_access_ns,
+         end.row_to_column_ns - start.row_to_column_ns, end.predicate_ns - start.predicate_ns,
+         end.setup_ns - start.setup_ns, end.visible_rows - start.visible_rows,
+         end.output_rows - start.output_rows, end.samples - start.samples, end.mode,
+         end.operator_id, end.relation_oid};
+}
+
+void AppendScanCosts(StringInfo json, const ScanTaskCosts &s, uint64 active_ns) {
+ if (!s.mode) return;
+ appendStringInfo(json, ",\"scan_cost\":{\"source_ns\":" UINT64_FORMAT
+  ",\"pg_access_ns\":" UINT64_FORMAT ",\"row_to_column_ns\":" UINT64_FORMAT
+  ",\"predicate_ns\":" UINT64_FORMAT ",\"setup_ns\":" UINT64_FORMAT
+  ",\"visible_rows\":" UINT64_FORMAT ",\"output_rows\":" UINT64_FORMAT
+  ",\"samples\":" UINT64_FORMAT ",\"operator_id\":%u,\"relation_oid\":%u,\"outside_scan_ns\":" UINT64_FORMAT ",\"mode\":\"%s\",\"tuple_times_estimated\":%s}",
+  s.source_ns, s.pg_access_ns, s.row_to_column_ns, s.predicate_ns, s.setup_ns,
+  s.visible_rows, s.output_rows, s.samples, s.operator_id, s.relation_oid,
+  active_ns > s.source_ns ? active_ns - s.source_ns : 0, s.mode == 1 ? "sample" : "exact",
+  s.mode == 1 ? "true" : "false");
+}
+
 struct TaskTraceEvent {
 	uint64 start_ns, end_ns, task_id;
 	uint32 event_id, partition_id;
 	uint32 result, reserved;
+ ScanTaskCosts scan;
 };
 
 struct TimelineSlot {
@@ -59,6 +96,7 @@ struct TimelineSlot {
 	pg_atomic_uint32 active;
 	pg_atomic_uint32 updating;
 	uint32 nested_starts;
+ ScanTaskCosts scan_start;
 };
 
 struct TimelinePhase {
@@ -127,6 +165,7 @@ bool Begin(const ExecCtx &ctx, EventId event, uint32 partition) {
 	slot->event_id = event;
 	slot->partition_id = partition;
 	slot->task_id = (static_cast<uint64>(event) << 32) | (partition == UINT32_MAX ? slot_id : partition);
+	slot->scan_start = ScanCosts(ctx.control, ctx.dsa, ctx.worker_index, event);
 	slot->start_ns = Relative(shared);
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->active, 1);
@@ -154,7 +193,8 @@ void End(PipelineSharedControl *control, dsa_area *dsa, int worker, TimelineTask
 		if (slot->trace_count < shared->capacity) {
 			auto &trace = Trace(shared, dsa, slot_id)[slot->trace_count];
 			trace = {slot->start_ns, end, slot->task_id, slot->event_id, slot->partition_id,
-				static_cast<uint32>(result), 0};
+				static_cast<uint32>(result), 0,
+                ScanDelta(ScanCosts(control, dsa, worker, slot->event_id), slot->scan_start)};
 			pg_write_barrier();
 			++slot->trace_count;
 		} else ++slot->dropped_events;
@@ -291,13 +331,25 @@ void Report(PipelineSharedControl *control, dsa_area *dsa, TimelineShared *share
 				p, slot_id, slot->worker_id, slot->pid, t.first / 1e6, t.last / 1e6, t.active / 1e6,
 				t.tasks, t.run / 1e6, t.combine / 1e6, t.finalize_active / 1e6, t.finalize_tasks);
 			if (!first_worker) appendStringInfoChar(&json, ','); first_worker = false;
-			appendStringInfo(&json, "{\"slot_id\":%u,\"worker_id\":%d,\"pid\":%d,\"first_start_ns\":" UINT64_FORMAT ",\"last_end_ns\":" UINT64_FORMAT ",\"active_ns\":" UINT64_FORMAT ",\"task_count\":" UINT64_FORMAT ",\"run_active_ns\":" UINT64_FORMAT ",\"combine_active_ns\":" UINT64_FORMAT ",\"finalize_start_ns\":" UINT64_FORMAT ",\"finalize_end_ns\":" UINT64_FORMAT ",\"finalize_active_ns\":" UINT64_FORMAT ",\"finalize_task_count\":" UINT64_FORMAT "}",
+			appendStringInfo(&json, "{\"slot_id\":%u,\"worker_id\":%d,\"pid\":%d,\"first_start_ns\":" UINT64_FORMAT ",\"last_end_ns\":" UINT64_FORMAT ",\"active_ns\":" UINT64_FORMAT ",\"task_count\":" UINT64_FORMAT ",\"run_active_ns\":" UINT64_FORMAT ",\"combine_active_ns\":" UINT64_FORMAT ",\"finalize_start_ns\":" UINT64_FORMAT ",\"finalize_end_ns\":" UINT64_FORMAT ",\"finalize_active_ns\":" UINT64_FORMAT ",\"finalize_task_count\":" UINT64_FORMAT "",
 				slot_id, slot->worker_id, slot->pid, t.first, t.last, t.active, t.tasks, t.run, t.combine,
 				t.finalize_first, t.finalize_last, t.finalize_active, t.finalize_tasks);
+            const auto scan = ScanCosts(control, dsa, slot->worker_id, p * kPhases);
+            AppendScanCosts(&json, scan, t.run);
+            if (scan.source_ns)
+                elog(NOTICE, "pg_yaap[scan-task] pipeline=%u worker=%d pid=%d run_ms=%.3f source_ms=%.3f outside_scan_ms=%.3f outside_scan_includes_waits=yes",
+                     p, slot->worker_id, slot->pid, t.run / 1e6, scan.source_ns / 1e6,
+                     (t.run > scan.source_ns ? t.run - scan.source_ns : 0) / 1e6);
+            ScanIOProfileAppendWorkerJson(control, dsa, slot->worker_id, p * kPhases, &json, success);
+            appendStringInfoChar(&json, '}');
 		}
-		appendStringInfoString(&json, "]}");
-	}
-	appendStringInfoString(&json, "]},\"traceEvents\":[");
+		appendStringInfoString(&json, "]");
+        ScanIOProfileAppendAggregateJson(control,dsa,p,&json,success);
+        appendStringInfoChar(&json,'}');
+    }
+    appendStringInfoString(&json, "]");
+    ScanIOProfileAppendAggregateJson(control,dsa,-1,&json,success);
+    appendStringInfoString(&json, "},\"traceEvents\":[");
 	if (shared->mode == 2) {
 		for (uint32 slot_id = 0; slot_id < shared->slots; ++slot_id) {
 			auto *slot = Slot(shared, dsa, slot_id);
@@ -326,10 +378,12 @@ void Report(PipelineSharedControl *control, dsa_area *dsa, TimelineShared *share
 			appendStringInfoChar(&json, ',');
 			if (e.type == 0) {
 				auto &t = Trace(shared, dsa, e.slot)[e.index];
-				appendStringInfo(&json, "{\"name\":\"Pipeline %u / %s\",\"cat\":\"pipeline\",\"ph\":\"X\",\"pid\":%d,\"tid\":%u,\"ts\":%.3f,\"dur\":%.3f,\"args\":{\"pipeline_id\":%u,\"worker_id\":%d,\"os_pid\":%d,\"event_id\":%u,\"partition_id\":%u,\"task_id\":\"" UINT64_FORMAT "\",\"result\":\"%s\"}}",
+				appendStringInfo(&json, "{\"name\":\"Pipeline %u / %s\",\"cat\":\"pipeline\",\"ph\":\"X\",\"pid\":%d,\"tid\":%u,\"ts\":%.3f,\"dur\":%.3f,\"args\":{\"pipeline_id\":%u,\"worker_id\":%d,\"os_pid\":%d,\"event_id\":%u,\"partition_id\":%u,\"task_id\":\"" UINT64_FORMAT "\",\"result\":\"%s\"",
 					t.event_id / kPhases, Kind(t.event_id), control->leader_pid, e.slot, t.start_ns / 1000.0,
 					(t.end_ns - t.start_ns) / 1000.0, t.event_id / kPhases, slot->worker_id, slot->pid,
 					t.event_id, t.partition_id, t.task_id, Outcome(t.result));
+                AppendScanCosts(&json, t.scan, t.end_ns - t.start_ns);
+                appendStringInfoString(&json, "}}");
 			} else {
 				uint32 p = e.type == 3 ? slot->event_id / kPhases : e.index;
 				appendStringInfo(&json, "{\"name\":\"Pipeline %u / %s\",\"cat\":\"pipeline\",\"ph\":\"i\",\"s\":\"t\",\"pid\":%d,\"tid\":%u,\"ts\":%.3f,\"args\":{\"pipeline_id\":%u,\"os_pid\":%d}}",
@@ -406,6 +460,8 @@ void PipelineTimelineFinished(PipelineSharedControl *control, dsa_area *dsa, uin
 }
 
 void PipelineTimelineReport(PipelineSharedControl *control, dsa_area *dsa, bool success) {
+    ScanProfileReport(control, dsa, success);
+    ScanIOProfileReport(control, dsa, success);
 	auto *shared = Shared(control, dsa); if (!shared || shared->reported) return;
 	shared->reported = true;
 	// Profiling must not replace a query error (or fail an otherwise successful

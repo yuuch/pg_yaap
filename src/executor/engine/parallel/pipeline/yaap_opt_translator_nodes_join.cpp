@@ -131,17 +131,14 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	const bool scalar_delim_join = join.delim_join && join.join_type == yaap::JOIN_SINGLE;
 	const bool semi_or_anti_join = join.join_type == yaap::JOIN_SEMI || join.join_type == yaap::JOIN_ANTI;
 	const bool left_outer_join = join.join_type == yaap::JOIN_LEFT;
-	if (join.join_type != yaap::JOIN_INNER && !left_outer_join && !scalar_delim_join && !semi_or_anti_join)
+	const bool right_outer_join = join.join_type == yaap::JOIN_RIGHT;
+	const bool outer_join = left_outer_join || right_outer_join;
+	if (join.join_type != yaap::JOIN_INNER && !outer_join && !scalar_delim_join && !semi_or_anti_join)
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer hash join rejected: join_type=%d", join.join_type);
 		return false;
 	}
-	const pg_yaap::pipeline::HashJoinMatchMode join_mode =
-		join.join_type == yaap::JOIN_SEMI ? pg_yaap::pipeline::HashJoinMatchMode::SEMI :
-		join.join_type == yaap::JOIN_ANTI ? pg_yaap::pipeline::HashJoinMatchMode::ANTI :
-		join.join_type == yaap::JOIN_LEFT ? pg_yaap::pipeline::HashJoinMatchMode::LEFT :
-		pg_yaap::pipeline::HashJoinMatchMode::INNER;
 	const bool left_join_output_matches =
 		semi_or_anti_join &&
 		join.children[0] != nullptr &&
@@ -283,6 +280,21 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	OptimizerNodeTranslation right_child;
 	if (!translate_children(left_child, right_child))
 		return false;
+	const size_t left_rows = join.children[0]->estimated_cardinality;
+	const size_t right_rows = join.children[1]->estimated_cardinality;
+	const bool swap_sides = semi_or_anti_join ? right_output_semi_or_anti :
+		((left_rows > 0 && right_rows > 0)
+			? left_rows < right_rows
+			: left_child.schema.size() < right_child.schema.size());
+	const bool preserve_probe_side =
+		(left_outer_join && !swap_sides) || (right_outer_join && swap_sides);
+	const pg_yaap::pipeline::HashJoinMatchMode join_mode =
+		join.join_type == yaap::JOIN_SEMI ? pg_yaap::pipeline::HashJoinMatchMode::SEMI :
+		join.join_type == yaap::JOIN_ANTI ? pg_yaap::pipeline::HashJoinMatchMode::ANTI :
+		outer_join
+			? (preserve_probe_side ? pg_yaap::pipeline::HashJoinMatchMode::LEFT
+									 : pg_yaap::pipeline::HashJoinMatchMode::RIGHT) :
+		pg_yaap::pipeline::HashJoinMatchMode::INNER;
 
 	std::vector<ColumnRef> left_keys;
 	std::vector<ColumnRef> right_keys;
@@ -299,8 +311,6 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		elog(LOG, "pg_yaap: hash join extracted keys left=%zu right=%zu residuals=%zu left_cols=%zu right_cols=%zu",
 			left_keys.size(), right_keys.size(), residuals.size(),
 			left_child.cols.size(), right_child.cols.size());
-	const size_t left_rows = join.children[0] != nullptr ? join.children[0]->estimated_cardinality : 0;
-	const size_t right_rows = join.children[1] != nullptr ? join.children[1]->estimated_cardinality : 0;
 	const bool left_scalar = IsScalarPhysicalNode(join.children[0].get());
 	const bool right_scalar = IsScalarPhysicalNode(join.children[1].get());
 	if (pg_yaap_trace_hooks)
@@ -384,11 +394,6 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 			 left_scalar ? 1 : 0,
 			 right_scalar ? 1 : 0);
 
-	const bool swap_sides = semi_or_anti_join ? right_output_semi_or_anti :
-		(left_outer_join ? false :
-		((left_rows > 0 && right_rows > 0)
-			? (left_rows < right_rows)
-			: (left_child.schema.size() < right_child.schema.size())));
 	const auto &probe_cols = swap_sides ? right_child.cols : left_child.cols;
 	const auto &probe_schema = swap_sides ? right_child.schema : left_child.schema;
 	const auto &probe_outputs = swap_sides ? right_child.outputs : left_child.outputs;
@@ -465,7 +470,8 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	if (!BuildColumnOnlyLayoutForRefs(probe_keys, probe_cols, probe_schema, probe_key_layout) ||
 		!BuildColumnOnlyLayoutForRefs(build_keys, build_cols, build_schema, build_key_layout) ||
 		!BuildColumnOnlyLayout(probe_schema, probe_payload_layout) ||
-		!BuildHashJoinOutputMappings(requested_output_cols, probe_cols, probe_schema, build_cols, build_schema, output_mappings, output_schema))
+		!BuildHashJoinOutputMappings(requested_output_cols, probe_cols, probe_schema,
+			build_cols, build_schema, output_mappings, output_schema, outer_join))
 	{
 		if (pg_yaap_trace_hooks)
 			elog(LOG, "pg_yaap: optimizer hash join rejected: join layout/output mapping build failed");

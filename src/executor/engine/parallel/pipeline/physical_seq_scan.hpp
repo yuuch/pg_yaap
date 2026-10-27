@@ -13,6 +13,7 @@ extern "C" {
 }
 
 #include <memory>
+#include "parallel/pipeline/scan_profile.hpp"
 
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
@@ -47,10 +48,19 @@ public:
 	Relation        rel = nullptr;
 	HeapScanDesc    scan_desc = nullptr;
 	ReadStream     *read_stream = nullptr;
+	YaapReadStream *yaap_read_stream = nullptr;
+	YaapReadStreamStats read_stream_published{};
+    ScanIOStats *scan_io_published = nullptr;
 	TupleDesc       scan_tupdesc = nullptr;
 	uint32          page_visible_index = 0;
 	bool            check_serializable = false;
 	bool            exhausted = false;
+	ScanProfileRecord scan_cost{};
+	uint64 scan_initialization_ns = 0;
+	uint64 scan_clock_overhead_ns = 0;
+	uint32 scan_sample_rng = 0x6d2b79f5u;
+	uint32 scan_profile_operator_id = UINT32_MAX;
+	bool scan_profile_metadata_ready = false;
 	bool            diag_first_call_logged = false;
 	bool            descriptor_cache_ready = false;
 	SchemaDescriptor *out_schema_cache = nullptr;
@@ -105,6 +115,11 @@ public:
 #endif
 		if (scan_desc != nullptr)
 		{
+			if (yaap_read_stream != nullptr)
+			{
+				YaapReadStreamEnd(yaap_read_stream);
+				yaap_read_stream = nullptr;
+			}
 			if (read_stream != nullptr)
 			{
 				read_stream_end(read_stream);
