@@ -66,6 +66,23 @@ process can finish one RUN and then claim another RUN of the same pipeline;
 each RUN has fresh private execution state and a distinct shared partial slot.
 The slots accommodate the ready worker cohort.
 
+```mermaid
+flowchart TB
+    Leader["Leader · build event DAG and start workers"] --> DAG
+    subgraph DAG["Event DAG · shared DSA"]
+        Run["Producer RUN"] --> Combine["COMBINE"] --> Finalize["FINALIZE"]
+        Finalize --> Next["Consumer RUN"]
+    end
+    DAG -->|Ready tasks| Queue["Shared ready queue · DSM"]
+    Queue --> Worker1["Worker process"]
+    Queue --> Worker2["Worker process"]
+    Worker1 -->|Task completion| DAG
+    Worker2 -->|Task completion| DAG
+    Worker1 --- State["Shared operator payloads · DSA"]
+    Worker2 --- State
+    State -->|Final output| Leader
+```
+
 ## Task dispatch: one global shared ready queue
 
 `DsmTaskQueue` is one bounded ring in DSM. A scheduling worker publishes a task

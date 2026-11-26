@@ -1,212 +1,130 @@
-# README.zh.md
-
-# pg_yaap — Yet Another Analytic Processing ⚡
-
 <p align="center">
-  <img src="imgs/logo.png" alt="pg_yaap logo" width="480" height="480"/>
+  <img src="imgs/logo.png" alt="pg_yaap 标志" width="200">
 </p>
 
-<p align="center">
-  <strong>把现代 OLAP 优化器和 C++ 列式执行引擎带进 PostgreSQL。</strong>
-</p>
+<h1 align="center">pg_yaap</h1>
+
+<p align="center"><strong>面向 PostgreSQL 的现代分析引擎</strong></p>
+<p align="center">现代 OLAP，原生 PostgreSQL 存储。</p>
+<p align="center">PostgreSQL 扩展 · C++17 · Apache 2.0 · 实验性项目</p>
 
 <p align="center">
-  <a href="README.md">🇺🇸 English</a>
-  ·
-  <a href="LICENSE">📄 License</a>
-  ·
-  <a href="#快速开始-">🚀 快速开始</a>
-  ·
-  <a href="#架构-">🏗️ 架构</a>
-  ·
-  <a href="#tpc-h-快照-">📊 Benchmark</a>
+  <a href="README.md">English</a> · 中文 ·
+  <a href="#性能基准">性能基准</a> · <a href="#架构">架构</a> ·
+  <a href="#快速开始">快速开始</a>
 </p>
 
+## 项目概览
 
----
+pg_yaap 为 PostgreSQL 中受支持的分析型查询提供独立优化器与 C++ 向量化执行引擎。它通过 PostgreSQL 的存储和缓冲区管理接口直接读取原生堆表。
 
-## pg_yaap 是什么？🚀
+PostgreSQL 负责 SQL 解析、系统目录、事务和客户端协议。YAAP 为接管的查询生成计划，并行执行各条 Pipeline。项目处于实验阶段，适合开发和评估，暂不建议用于生产环境。
 
-`pg_yaap` 是一个 PostgreSQL 扩展。它会在支持的分析型查询上，接管 PostgreSQL 原本的 planner / executor 路径，改用 YAAP 自己的优化器和 C++ 列式执行引擎。
+## 性能基准
 
-重点是：**YAAP 并不是要替换整个 PostgreSQL。**
+在配备 **24 GB 内存的 Apple M4 Pro** 上，YAAP 记录的 SQL 总耗时为 **SF10 20.5 秒**、**SF100 414.5 秒**。SF100 的 PostgreSQL 数据库在磁盘上约占 **125 GB**，YAAP 完成了全部 22 条查询的执行。
 
-PostgreSQL 仍然负责那些“不酷但极其重要”的数据库能力：
+| TPC-H 数据规模 | PostgreSQL | pg_duckdb | pg_yaap |
+| --- | ---: | ---: | ---: |
+| SF10 | 447.9 秒 | 95.8 秒 | **20.5 秒** |
+| SF100 | 3,302.0 秒 | 3,346.6 秒 | **414.5 秒** |
 
-* 🧾 SQL 解析
-* 🗂️ catalog 访问
-* 💾 存储
-* 🔒 事务
-* 🌐 协议和结果返回
-* 🧩 其他数据库服务端运行时
+在 SF10 的历史记录中，PostgreSQL 和 pg_duckdb 的总耗时分别是 YAAP 的 21.8 倍和 4.7 倍。各组测试条件存在差异。
 
-YAAP 接管的是分析型查询的热点路径：
+| SF100 执行情况 | PostgreSQL | pg_duckdb | pg_yaap |
+| --- | ---: | ---: | ---: |
+| 完成执行 | 18/22 | 18/22 | 22/22 |
+| 超时 | 4 | 4 | 0 |
 
-* 🧠 逻辑计划
-* 🛠️ 物理计划
-* 📦 向量化 / 列式执行
-* 🧵 并行 pipeline 执行
+**SF100 正确性**：Q1 的 `N` / `O` 组中，YAAP 返回的 `sum_charge` 为负数，两组基线均返回正数。每次基线超时按 600 秒计入总耗时，两组基线的 `shared_buffers` 为 2 GB，YAAP 为 4 GB。表格记录耗时与执行完成情况，结果一致性仍待验证。
 
-简单说：PostgreSQL 还是数据库主体，YAAP 给部分 OLAP 查询换上一条更现代的执行路径。
+详见[测试条件、逐查询图表与复现入口](docs/benchmark.md)。
 
----
+## 核心特性
 
-## 为什么做 pg_yaap？⚡
+| 特性 | 实现 |
+| --- | --- |
+| 独立优化器 | YAAP 自有逻辑与物理计划，支持子查询去关联、谓词下推和基于代价的连接排序。 |
+| 向量化执行 | 每个列式 `DataChunk` 最多容纳 2,048 行，算子按批处理。 |
+| 并行 Pipeline | 事件 DAG 调度 `RUN`、`COMBINE` 和 `FINALIZE` 阶段。 |
+| 多进程运行时 | PostgreSQL 后台进程从共享就绪队列领取任务，通过 DSM 和 DSA 共享状态。 |
+| 超内存处理 | 执行引擎按内存预算管理中间数据，分区哈希连接等算子支持溢写。 |
+| PostgreSQL 原生存储 | 通过 PostgreSQL 缓冲区管理器和快照读取原生堆表。 |
 
-PostgreSQL 是非常优秀的通用数据库，但分析型查询通常需要一种和传统 tuple-at-a-time 执行器完全不同的执行模型。
+## 架构
 
-`pg_yaap` 探索的是这条路线，但不把 PostgreSQL 做成 fork：
+![系统架构图，展示 PostgreSQL 解析与存储如何与 YAAP 规划和执行配合](imgs/arch.png)
 
-* 🐘 保留 PostgreSQL parser、catalog、storage 和事务语义
-* 🧠 对支持的分析型查询使用 YAAP 自己的优化器
-* 📦 用 columnar batch 处理数据，而不是逐 tuple 执行
-* 🏗️ 用 pipeline 组织执行，并显式处理 pipeline breaker
-* 🔥 YAAP 一旦接管查询，就不做静默 fallback，而是明确成功或失败
+规划器 Hook 生成 YAAP 物理计划，执行层将计划转换为多条 Pipeline，再通过 PostgreSQL 的元组接口返回结果。YAAP 接管查询后，规划或执行失败会直接报错。
 
-没有魔法。没有偷偷 fallback。YAAP 接管了查询，就由 YAAP 对结果负责。
+同一进程内的算子沿 Pipeline 直接传递列式批次。哈希表构建、聚合等 Pipeline breaker 发布共享状态，供下游 Pipeline 读取。Leader 构建事件图并启动 Worker。Worker 激活就绪阶段，从查询级共享队列领取各条 Pipeline 的任务。详见[执行引擎架构与调度设计](docs/pipeline_runtime.md#pipelines-and-event-dependencies)。
 
----
+运行时将调度事件和各进程耗时导出为 Chrome Trace JSON，可在 Perfetto 中查看。详见[执行追踪](docs/execution_trace.md)。
 
-## 核心想法 🧠
+## 快速开始
 
-* **YAAP 自有优化器**
-  支持的分析型查询会进入 YAAP 的逻辑和物理优化器。
+### 构建依赖
 
-* **列式执行引擎**
-  执行阶段以 batch / DataChunk 为核心，而不是 PostgreSQL 原生的逐 tuple 执行模型。
+- **PostgreSQL 18.3** 是 CI 验证版本。使用与目标服务端配套的 `pg_config` 和服务端开发头文件。
+- C 和 C++17 编译工具链、Meson、Ninja。
+- 若目标 PostgreSQL 启用了 LLVM，需要相容的 LLVM 开发文件与 `llvm-config`。可通过 `-Dllvm_config=/path/to/llvm-config` 指定路径。未启用 LLVM 的 PostgreSQL 采用非 JIT 路径。
 
-* **Pipeline 执行模型**
-  使用 pipeline 组织算子执行，并显式处理 join、aggregation、sort 等 pipeline breaker。
+### 构建与安装
 
-* **PostgreSQL 原生接入**
-  通过 PostgreSQL hook 接入，最终仍然通过 PostgreSQL 正常的 tuple 接口返回结果。
+在仓库根目录执行，安装账号需有目标 PostgreSQL 安装目录的写权限。
 
-* **不做静默 fallback**
-  YAAP 一旦声明接管某个查询，就应该由 YAAP 执行；不支持或执行失败时明确暴露问题。
-
----
-
-## 架构 🏗️
-
-![YAAP 架构](imgs/arch.png)
-
-高层说明：
-
-高层说明：
-
-1. `planner_hook` 将被接受的查询路由到 YAAP 的逻辑与物理规划器，生成 YAAP 的物理计划（PhysicalOperator）。
-2. 在 `ExecutorStart`/`ExecutorRun` 阶段，已被 YAAP 接管的查询由桥接层交给 YAAP 运行时执行。
-3. YAAP 运行时以列式数据块（DataChunk）为单位，通过并行 pipeline 执行，并通过 PostgreSQL 的常规 tuple 接口将结果返回给客户端。
-
-4. 结果再转换回 PostgreSQL 正常的 tuple 接口返回。
-
-任务调度、共享状态归属、进程间同步及当前限制见 [Pipeline 运行时与进程通信](docs/pipeline_runtime.md)。
-
----
-
-## TPC-H 快照 📊
-
-![TPC-H median runtime chart](imgs/comparison.svg)
-
-> 最新 `pg_yaap` SF10 快照（Apple M4 Pro / 24GB，`shared_buffers=4GB`，`pg_yaap.memory_limit=8GB`，12 workers）：22/22 查询 SQL 总耗时 **20.5s**（墙钟 **21.4s**，此前为 30.8s；对照基线 PostgreSQL `447.9s`、`pg_duckdb` `95.8s`）。Benchmark 结果会受到硬件、PostgreSQL 配置、数据规模、查询覆盖范围、YAAP 支持程度等因素影响，这里的图表是当前阶段的性能快照，不代表所有环境下的通用结论。
-
-### SF100（100GB）
-
-![TPC-H SF100 对比图](imgs/comparison-sf100.svg)
-
-本快照基于 `tpch100g` 数据库（磁盘占用约 125GB），运行于 24GB 内存的 M4 Pro。最新 `pg_yaap` 结果（`shared_buffers=4GB`、12 workers、`pg_yaap.memory_limit=8GB`）在 **22/22** 查询上全部通过、0 超时，SQL 总耗时 **414.5s**（墙钟 **425.3s**，较此前 `619.5s` 提速 1.49×）；PostgreSQL 原生（`3,302.0s`，18/22 通过、4 超时）与 `pg_duckdb`（`3,346.6s`，18/22 通过、4 超时，默认 4GiB 内存与扫描并行度）来自 `shared_buffers=2GB` 基线测试，总耗时中每个 timeout 按 600 秒计。
-
-**正确性注意：**SF100 Q1 的 `N|O` 组 `sum_charge` 不一致：YAAP 返回负数，而 PostgreSQL 和 pg_duckdb 返回正数。图表比较的是耗时，不代表结果一致。
-
----
-
-## 构建 🔧
-
-### Meson
-
-```bash
-meson setup build -Dpg_config=/path/to/pg_config -Dbuildtype=release
+```sh
+meson setup build -Dpg_config=/path/to/postgresql/bin/pg_config -Dbuildtype=release
 meson compile -C build
 meson install -C build
 ```
 
-需要在离线 Linux 从 PostgreSQL 源码开始构建时，可制作只包含源码（不含 Git 历史、构建产物和数据）的 tar 包，再在目标机一键构建 PostgreSQL 与扩展：
+从 PostgreSQL 源码构建或在离线环境安装，见[离线构建指南](docs/offline-linux-build.md)。
 
-```bash
-./scripts/make_offline_bundle.sh --output /path/to/pg_yaap-offline.tar.gz
-# 解包后：
-./pg_yaap/scripts/build_postgres_and_yaap.sh --prefix "$HOME/pgsql-yaap"
-```
+### 运行与验证
 
-只构建扩展或了解离线依赖、LLVM/PostgreSQL 要求和运行配置，见[离线构建与安装指南](docs/offline-linux-build.md)：
-
-```bash
-./scripts/build_install.sh --pg-config /path/to/pg_config
-```
-
-### PGXS / Makefile
-
-```bash
-make PG_CONFIG=/path/to/pg_config
-make PG_CONFIG=/path/to/pg_config install
-```
-
----
-
-## 快速开始 🧪
+使用超级用户通过 `psql` 连接测试数据库，在当前会话加载 YAAP。
 
 ```sql
 LOAD 'pg_yaap';
-SET pg_yaap.enabled = on;
-SET pg_yaap.parallel = on;
+SHOW pg_yaap.enabled;
 ```
 
-之后像平常一样在 PostgreSQL 里执行 YAAP 当前支持的分析型 SQL。
+对分析查询运行普通 `EXPLAIN`，查看计划是否包含 `Planner: YAAP optimizer` 和 `YAAP Physical Plan`。要确认实际执行路径，可启用 `pg_yaap.trace_execution_path`，执行查询后在服务端日志中查找 `pg_yaap_path: path=pipeline detail=yaap_pipeline`。
 
-```sql
-SELECT
-    l_returnflag,
-    l_linestatus,
-    sum(l_quantity) AS sum_qty,
-    sum(l_extendedprice) AS sum_base_price
-FROM lineitem
-GROUP BY l_returnflag, l_linestatus
-ORDER BY l_returnflag, l_linestatus;
-```
+## 设计路线
 
----
+| 设计维度 | PostgreSQL | pg_duckdb | pg_yaap |
+| --- | --- | --- | --- |
+| 查询优化器与执行引擎 | PostgreSQL | 嵌入式 DuckDB | YAAP |
+| 执行模型 | 以元组为单位 | DuckDB 向量化执行 | YAAP 向量化执行 |
+| 并行执行 | PostgreSQL 多进程 | DuckDB 多线程，堆表扫描可使用 PostgreSQL Worker | PostgreSQL 后台进程 |
+| 查询 PostgreSQL 原生表 | 支持 | 支持 | 支持 |
 
-## 当前定位 🚧
+YAAP 围绕 PostgreSQL 多进程架构实现了自己的优化器、算子和调度器。表中的 pg_duckdb 一列描述上游项目的设计。参见 [pg_duckdb 项目配置](https://github.com/duckdb/pg_duckdb/blob/main/docs/settings.md)。
 
-`pg_yaap` 主要面向分析型查询处理，不是为了替代 PostgreSQL 成为一个新的通用数据库内核。
+## 当前状态与演进方向
 
-适合：
+- **优化器** · 为受支持的分析 SQL 生成逻辑与物理计划。
+- **执行引擎** · 并行顺序扫描、哈希连接、哈希聚合、完美哈希聚合、Top-N 和磁盘溢写。
+- **运行时** · 按查询启动的后台 Worker、事件 DAG 调度、共享任务队列和执行追踪。
+- **当前限制** · SQL 覆盖有限。排序采用单进程 PostgreSQL tuplesort。YAAP 的定点整数 `NUMERIC` 计算可能与 PostgreSQL 精确十进制结果有差异。
 
-* ✅ scan-heavy 的 OLAP 查询
-* ✅ TPC-H 风格分析型负载
-* ✅ PostgreSQL 内部的现代优化器 / 执行器实验
-* ✅ 列式、向量化、pipeline 执行模型研究
-* ✅ pipeline 和并行执行研究
+可探索的方向包括 TPC-H 结果校验与正确性修复、并行排序、Worker 池化、更广的 SQL 覆盖，以及内存和 I/O 优化。
 
-不追求：
+## 文档
 
-* ❌ 替换 PostgreSQL 存储引擎
-* ❌ 替换 PostgreSQL parser 或 catalog
-* ❌ 做一个通用 PostgreSQL fork
-* ❌ 用静默 fallback 掩盖不支持的执行路径
-* ❌ 通用 OLTP 加速
+| 主题 | 参考资料 |
+| --- | --- |
+| Pipeline 调度与 Worker 生命周期 | [Pipeline 运行时](docs/pipeline_runtime.md) |
+| 磁盘溢写与分区探测 | [混合哈希连接](docs/hybrid_hash_join.md)、[分区哈希连接探测](docs/hash_join_partition_probe.md) |
+| 内存预算 | [DSA 内存限制](docs/dsa_memory_limits.md) |
+| 追踪配置与事件类型 | [执行追踪](docs/execution_trace.md) |
+| 基准测试方法 | [TPC-H 性能快照](docs/benchmark.md) |
+| 离线构建 PostgreSQL 与 YAAP | [离线 Linux 构建](docs/offline-linux-build.md) |
 
----
+## 致谢与许可证
 
-## 致谢 🙏
+感谢 PostgreSQL 项目提供的扩展基础设施，以及 DuckDB 对 YAAP 优化器与执行引擎设计的启发。
 
-感谢 PostgreSQL 项目提供的 hook 架构、扩展生态和长期积累的数据库工程基础。
-
-感谢 DuckDB 在优化器结构、向量化执行和列式分析处理方面带来的启发。
-
----
-
-## License 📄
-
-Apache License 2.0 — see [LICENSE](LICENSE).
-
+pg_yaap 采用 [Apache License 2.0](LICENSE)。

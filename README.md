@@ -1,199 +1,130 @@
-# pg_yaap — Yet Another Analytic Processing ⚡
-
 <p align="center">
-  <img src="imgs/logo.png" alt="pg_yaap logo" width="480" height="480"/>
+  <img src="imgs/logo.png" alt="pg_yaap logo" width="200">
 </p>
 
-<p align="center">
-  <strong>Modern OLAP inside PostgreSQL: a YAAP-owned optimizer plus a C++ columnar execution engine.</strong>
-</p>
+<h1 align="center">pg_yaap</h1>
+
+<p align="center"><strong>A modern analytical engine for PostgreSQL</strong></p>
+<p align="center">Modern OLAP. Native PostgreSQL storage.</p>
+<p align="center">PostgreSQL extension · C++17 · Apache 2.0 · Experimental</p>
 
 <p align="center">
-  <a href="README.zh.md">🇨🇳 中文</a>
-  ·
-  <a href="LICENSE">📄 License</a>
-  ·
-  <a href="#quick-start-">🚀 Quick Start</a>
-  ·
-  <a href="#architecture-">🏗️ Architecture</a>
-  ·
-  <a href="#tpc-h-snapshot-">📊 Benchmark</a>
+  English · <a href="README.zh.md">中文</a> ·
+  <a href="#benchmarks">Benchmarks</a> · <a href="#architecture">Architecture</a> ·
+  <a href="#quick-start">Quick Start</a>
 </p>
 
+## Overview
 
----
+pg_yaap gives supported analytical queries a dedicated optimizer and a vectorized C++ execution engine inside PostgreSQL. It reads native heap tables through PostgreSQL's storage and buffer management APIs.
 
-## What is pg_yaap? 🚀
+PostgreSQL handles SQL parsing, catalogs, transactions, and client protocol. YAAP plans admitted queries and runs them through parallel pipelines. The project is experimental and intended for development and evaluation.
 
-`pg_yaap` is a PostgreSQL extension that replaces PostgreSQL's planner and executor path for supported analytical queries with a YAAP-owned optimizer and a C++ columnar execution engine.
+## Benchmarks
 
-The key point: **YAAP does not replace PostgreSQL itself.**
+On an **Apple M4 Pro with 24 GB RAM**, YAAP recorded **20.5 s at SF10** and **414.5 s at SF100** in total SQL time. At SF100, it completed all 22 queries against a PostgreSQL database occupying about **125 GB on disk**.
 
-PostgreSQL still owns the boring-but-critical database stuff:
+| TPC-H scale | PostgreSQL | pg_duckdb | pg_yaap |
+| --- | ---: | ---: | ---: |
+| SF10 | 447.9 s | 95.8 s | **20.5 s** |
+| SF100 | 3,302.0 s | 3,346.6 s | **414.5 s** |
 
-* 🧾 SQL parsing
-* 🗂️ catalog access
-* 💾 storage
-* 🔒 transactions
-* 🌐 protocol and result delivery
-* 🧩 the rest of the server runtime
+At SF10, the recorded PostgreSQL and pg_duckdb totals were 21.8× and 4.7× the YAAP total. These are ratios of historical runs with different test settings.
 
-YAAP takes over the analytical hot path:
+| SF100 execution outcome | PostgreSQL | pg_duckdb | pg_yaap |
+| --- | ---: | ---: | ---: |
+| Queries completed | 18/22 | 18/22 | 22/22 |
+| Timeouts | 4 | 4 | 0 |
 
-* 🧠 logical planning
-* 🛠️ physical planning
-* 📦 vectorized / columnar execution
-* 🧵 parallel pipeline execution
+**SF100 correctness:** YAAP returned a negative `sum_charge` for the Q1 `N` / `O` group. Both baselines returned a positive value. Each baseline timeout adds 600 s to its total, and the baselines used 2 GB of `shared_buffers` versus 4 GB for YAAP. The table reports execution time and completion. Result equivalence has not been established.
 
-In short: PostgreSQL remains the system of record. YAAP gives selected OLAP queries a much more modern execution path.
+See the [benchmark conditions, per-query charts, and reproduction entry points](docs/benchmark.md).
 
----
+## Key Features
 
-## Why pg_yaap? ⚡
+| Feature | Implementation |
+| --- | --- |
+| Independent optimizer | YAAP logical and physical planning, including decorrelation, predicate pushdown, and cost-based join ordering. |
+| Vectorized execution | Columnar `DataChunk` batches of up to 2,048 rows and batch-oriented operators. |
+| Parallel pipelines | A dependency DAG schedules `RUN`, `COMBINE`, and `FINALIZE` stages. |
+| Multi-process runtime | PostgreSQL background workers claim tasks from a shared ready queue, with shared state in DSM and DSA. |
+| Larger-than-memory processing | Memory-aware execution with spillable intermediates, including partitioned hash joins. |
+| Native PostgreSQL storage | Heap scans use PostgreSQL's buffer manager and snapshots. |
 
-PostgreSQL is great as a general-purpose database, but analytical workloads often want a very different execution model from the classic tuple-at-a-time executor.
+## Architecture
 
-`pg_yaap` explores that direction without turning PostgreSQL into a fork:
+![System architecture showing PostgreSQL parsing and storage around YAAP planning and execution](imgs/arch.png)
 
-* 🐘 keep PostgreSQL parser, catalog, storage, and transaction semantics
-* 🧠 use a YAAP-owned optimizer for supported analytical queries
-* 📦 process data in columnar batches instead of one tuple at a time
-* 🏗️ organize execution around pipelines and explicit pipeline breakers
-* 🔥 fail loudly after YAAP claims a query instead of silently falling back
+The planner hook builds a YAAP physical plan. The executor lowers it into pipelines and returns rows through PostgreSQL's tuple interface. Once YAAP claims a query, planning or execution failures surface as errors.
 
-No magic. No hidden fallback. If YAAP owns the query, YAAP owns the result.
+Within a process, operators pass columnar batches directly along a pipeline. A pipeline breaker such as a hash build or aggregation publishes shared state for downstream pipelines. The leader builds the event graph and starts workers. Workers activate ready stages and claim tasks across pipelines from the query-wide queue. See the [execution engine architecture and scheduler](docs/pipeline_runtime.md#pipelines-and-event-dependencies).
 
----
+The runtime exports scheduler events and per-process timings as Chrome Trace JSON for Perfetto. See [Execution Trace](docs/execution_trace.md).
 
-## Core ideas 🧠
+## Quick Start
 
-* **YAAP-owned optimizer**
-  Supported analytical queries are routed into YAAP's logical and physical planners.
+### Requirements
 
-* **Columnar execution engine**
-  Runtime execution is based on batches instead of PostgreSQL's traditional per-tuple executor model.
+- **PostgreSQL 18.3** is the CI target. Use the target server's `pg_config` and server development headers.
+- A C and C++17 toolchain, Meson, and Ninja.
+- LLVM development files and a compatible `llvm-config` when PostgreSQL was built with LLVM. Pass `-Dllvm_config=/path/to/llvm-config` if needed. A PostgreSQL build without LLVM uses the non-JIT path.
 
-* **Pipeline-based execution**
-  Operators are organized into execution pipelines, with joins, aggregation, and sort treated as explicit pipeline breakers.
+### Build and install
 
-* **PostgreSQL-native integration**
-  YAAP enters through PostgreSQL hooks and returns results through PostgreSQL's normal tuple interfaces.
+From the repository root, using an account that can write to the target PostgreSQL installation:
 
-* **No silent fallback**
-  Once YAAP admits a query, it should either run it or fail clearly. This keeps development and benchmarking honest.
-
----
-
-## Architecture 🏗️
-
-![YAAP architecture](imgs/arch.png)
-
-At a high level:
-
-1. `planner_hook` routes supported queries into YAAP's logical and physical planners.
-2. `ExecutorStart` and `ExecutorRun` hand admitted queries to YAAP's runtime.
-3. YAAP executes columnar batches through parallel pipelines.
-4. Results are converted back to PostgreSQL's normal tuple interface.
-
-See [Pipeline runtime and process communication](docs/pipeline_runtime.md) for task scheduling, shared-state ownership, synchronization, and current limits.
-
----
-
-## TPC-H snapshot 📊
-
-![TPC-H median runtime chart](imgs/comparison.svg)
-
-> Updated `pg_yaap` SF10 snapshot (Apple M4 Pro / 24GB, `shared_buffers=4GB`, `pg_yaap.memory_limit=8GB`, 12 workers): **20.5s** SQL time (**21.4s** wall time) across all 22/22 queries (down from 30.8s; vs PostgreSQL `447.9s` and `pg_duckdb` `95.8s` from the baseline run). Benchmark numbers depend on hardware, PostgreSQL configuration, dataset scale factor, query coverage, and whether the query is fully supported by YAAP. Treat this chart as a snapshot, not a universal claim.
-
-### SF100 (100GB)
-
-![TPC-H SF100 comparison](imgs/comparison-sf100.svg)
-
-This snapshot uses the `tpch100g` database (about 125GB on disk) on a 24GB M4 Pro. In the updated `pg_yaap` run (`shared_buffers=4GB`, 12 workers, `pg_yaap.memory_limit=8GB`), all **22/22** queries complete in **414.5s** SQL time (**425.3s** wall time, 0 timeouts — down from `619.5s`). PostgreSQL native (`3,302.0s`, 18/22 OK, 4 timeouts) and `pg_duckdb` (`3,346.6s`, 18/22 OK, 4 timeouts, default 4GiB memory and scan parallelism) are from the `shared_buffers=2GB` baseline run; each timeout counts as 600 seconds in the total.
-
-**Correctness note:** YAAP's SF100 Q1 `N|O` `sum_charge` differs from both PostgreSQL and pg_duckdb: YAAP returns a negative value while the other two return a positive value. The chart compares runtime; it does not imply matching results.
-
----
-
-## Build 🔧
-
-### Meson
-
-```bash
-meson setup build -Dpg_config=/path/to/pg_config
+```sh
+meson setup build -Dpg_config=/path/to/postgresql/bin/pg_config -Dbuildtype=release
 meson compile -C build
 meson install -C build
 ```
 
-### PGXS / Makefile
+For a build from PostgreSQL source or an offline installation, see the [offline build guide (中文)](docs/offline-linux-build.md).
 
-```bash
-make PG_CONFIG=/path/to/pg_config
-make PG_CONFIG=/path/to/pg_config install
-```
+### Run and verify
 
----
-
-## Quick start 🧪
+Connect to a test database with `psql` as a superuser and load YAAP for the session.
 
 ```sql
 LOAD 'pg_yaap';
-SET pg_yaap.enabled = on;
-SET pg_yaap.parallel = on;
+SHOW pg_yaap.enabled;
 ```
 
-Then run supported analytical SQL queries as usual.
+Run plain `EXPLAIN` on an analytical query to check for `Planner: YAAP optimizer` and `YAAP Physical Plan`. To confirm execution, enable `pg_yaap.trace_execution_path` and look for `pg_yaap_path: path=pipeline detail=yaap_pipeline` in the server log after running the query.
 
-```sql
-SELECT
-    l_returnflag,
-    l_linestatus,
-    sum(l_quantity) AS sum_qty,
-    sum(l_extendedprice) AS sum_base_price
-FROM lineitem
-GROUP BY l_returnflag, l_linestatus
-ORDER BY l_returnflag, l_linestatus;
-```
+## Design Philosophy
 
----
+| Design choice | PostgreSQL | pg_duckdb | pg_yaap |
+| --- | --- | --- | --- |
+| Query optimizer and execution engine | PostgreSQL | Embedded DuckDB | YAAP |
+| Execution model | Tuple-oriented | Vectorized DuckDB | Vectorized YAAP |
+| Parallel execution | PostgreSQL processes | DuckDB threads, with PostgreSQL workers available for heap scans | PostgreSQL background workers |
+| Query native PostgreSQL tables | Yes | Yes | Yes |
 
-## Current scope 🚧
+YAAP is designed around PostgreSQL's multi-process architecture, with its own optimizer, operators, and scheduler. The pg_duckdb column describes the upstream design. [pg_duckdb project and settings](https://github.com/duckdb/pg_duckdb/blob/main/docs/settings.md)
 
-`pg_yaap` is focused on analytical query processing. It is not trying to replace PostgreSQL as a database system.
+## Current Status and Roadmap
 
-Good fit:
+- **Optimizer** · Logical and physical planning for supported analytical SQL.
+- **Executor** · Parallel sequential scan, hash join, hash and perfect hash aggregation, Top-N, and disk spill.
+- **Runtime** · Per-query background workers, event DAG scheduling, a shared task queue, and execution tracing.
+- **Current limits** · SQL coverage is partial. Sort uses single-process PostgreSQL tuplesort. YAAP's scaled-integer `NUMERIC` can differ from PostgreSQL's exact decimal results.
 
-* ✅ scan-heavy OLAP queries
-* ✅ TPC-H-style analytical workloads
-* ✅ modern optimizer / executor experiments inside PostgreSQL
-* ✅ columnar and vectorized execution research
-* ✅ pipeline and parallel execution research
+Potential roadmap items include TPC-H result validation and correctness fixes, parallel sort, worker pooling, broader SQL coverage, and memory and I/O optimization.
 
-Not the goal:
+## Documentation
 
-* ❌ replacing PostgreSQL storage
-* ❌ replacing PostgreSQL parser or catalog
-* ❌ becoming a general-purpose PostgreSQL fork
-* ❌ silently masking unsupported behavior with fallback execution
-* ❌ general OLTP acceleration
+| Topic | Reference |
+| --- | --- |
+| Pipeline scheduling and worker lifecycle | [Pipeline runtime](docs/pipeline_runtime.md) |
+| Spill and partitioned probe | [Hybrid hash join](docs/hybrid_hash_join.md), [Partitioned hash join probe](docs/hash_join_partition_probe.md) |
+| Memory budgeting | [DSA memory limits](docs/dsa_memory_limits.md) |
+| Trace setup and event types | [Execution Trace](docs/execution_trace.md) |
+| Benchmark methodology | [TPC-H snapshots](docs/benchmark.md) |
+| Building PostgreSQL and YAAP offline | [Offline Linux build (中文)](docs/offline-linux-build.md) |
 
----
+## Acknowledgements and License
 
-## Acknowledgements 🙏
+Thanks to PostgreSQL for the extension infrastructure and to DuckDB for inspiring YAAP's optimizer and execution design.
 
-Thanks to the PostgreSQL project for its hook architecture, extension ecosystem, and decades of database engineering.
-
-Thanks to DuckDB for inspiring many modern ideas around optimizer structure, vectorized execution, and columnar analytical processing.
-
----
-
-## 中文版 🇨🇳
-
-For the Chinese version, see [README.zh.md](README.zh.md).
-
----
-
-## License 📄
-
-Apache License 2.0 — see [LICENSE](LICENSE).
-
+pg_yaap is licensed under the [Apache License 2.0](LICENSE).
