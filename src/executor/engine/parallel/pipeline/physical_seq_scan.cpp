@@ -1019,8 +1019,52 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			                   n_filter_steps_,
 			                   &local.simple_filter_step_cache);
 		}
+		local.n_active_runtime_filters = 0;
+		local.runtime_filter_empty_shortcircuit = false;
+		for (uint8_t rfi = 0; rfi < n_runtime_filters_ && rfi < MAX_SEQ_SCAN_RUNTIME_FILTERS; ++rfi)
+		{
+			const auto &rf_desc = runtime_filters_[rfi];
+			if (!DsaPointerIsValid(rf_desc.filter_dp))
+				continue;
+			const auto *rf = static_cast<const HashJoinRuntimeFilter *>(
+				dsa_get_address(global.dsa, rf_desc.filter_dp));
+			if (rf == nullptr || pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&rf->ready)) == 0)
+				continue;
+			pg_read_barrier();
+			if (rf->empty_build != 0)
+			{
+				local.runtime_filter_empty_shortcircuit = true;
+				local.exhausted = true;
+				break;
+			}
+			if (rf->bloom_usable == 0 && rf->has_minmax == 0)
+				continue;
+			if (rf_desc.attno < 1 || rf_desc.attno > local.scan_tupdesc->natts)
+				continue;
+			Form_pg_attribute attr = TupleDescAttr(local.scan_tupdesc, rf_desc.attno - 1);
+			if (attr->attisdropped)
+				continue;
+			CompactAttribute *cattr = TupleDescCompactAttr(local.scan_tupdesc, rf_desc.attno - 1);
+			auto &af = local.active_runtime_filters[local.n_active_runtime_filters++];
+			af.attno = rf_desc.attno;
+			af.is_int64 = (rf_desc.decode_kind == ColumnDecodeKind::INT64_INT8);
+			const int16 expected_len = af.is_int64 ? 8 : 4;
+			af.attcacheoff = (cattr->attbyval && cattr->attlen == expected_len && cattr->attcacheoff >= 0)
+				? cattr->attcacheoff
+				: -1;
+			af.min_val = rf->min_val;
+			af.max_val = rf->max_val;
+			af.has_minmax = (rf->has_minmax != 0);
+			af.bloom_usable = (rf->bloom_usable != 0 && DsaPointerIsValid(rf->words_dp));
+			af.words = af.bloom_usable
+				? static_cast<const pg_atomic_uint64 *>(dsa_get_address(global.dsa, rf->words_dp))
+				: nullptr;
+			af.word_mask = rf->word_mask;
+		}
 		local.descriptor_cache_ready = true;
 	}
+	if (local.runtime_filter_empty_shortcircuit)
+		return SourceResultType::FINISHED;
 
 	SchemaDescriptor *out_schema = local.out_schema_cache;
 	FilterInputDesc *filter_inputs = local.filter_inputs_cache;
@@ -1189,6 +1233,65 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 
 		if (tuple.t_data == nullptr)
 			continue;
+
+		/* Runtime HashJoin Bloom + Min/Max filter pushdown: reject non-matching
+		 * probe keys using a single fixed-offset tuple read before running
+		 * filter_deformer, proj_deformer, or downstream hash-join probes. */
+		if (local.n_active_runtime_filters > 0)
+		{
+			const bool has_nulls = (tuple.t_data->t_infomask & HEAP_HASNULL) != 0;
+			const uint32_t tup_natts = HeapTupleHeaderGetNatts(tuple.t_data);
+			const char *tup_base = reinterpret_cast<const char *>(tuple.t_data) + tuple.t_data->t_hoff;
+			bool rf_pass = true;
+			for (uint8_t rfi = 0; rfi < local.n_active_runtime_filters; ++rfi)
+			{
+				const auto &af = local.active_runtime_filters[rfi];
+				int64_t key_val = 0;
+				if (likely(!has_nulls && af.attcacheoff >= 0 && af.attno <= tup_natts))
+				{
+					if (af.is_int64)
+					{
+						std::memcpy(&key_val, tup_base + af.attcacheoff, sizeof(int64_t));
+					}
+					else
+					{
+						int32_t v32;
+						std::memcpy(&v32, tup_base + af.attcacheoff, sizeof(int32_t));
+						key_val = static_cast<int64_t>(v32);
+					}
+				}
+				else
+				{
+					bool isnull = false;
+					Datum d = heap_getattr(&tuple, af.attno, local.scan_tupdesc, &isnull);
+					if (isnull)
+					{
+						rf_pass = false;
+						break;
+					}
+					key_val = af.is_int64 ? DatumGetInt64(d) : static_cast<int64_t>(DatumGetInt32(d));
+				}
+				if (af.has_minmax && (key_val < af.min_val || key_val > af.max_val))
+				{
+					rf_pass = false;
+					break;
+				}
+				if (af.bloom_usable)
+				{
+					const uint64_t h = RuntimeFilterHashKey(key_val);
+					const uint32_t idx = static_cast<uint32_t>(h >> 32) & af.word_mask;
+					const uint64_t mask = RuntimeFilterWordMask(h);
+					const uint64_t word = *reinterpret_cast<const uint64_t *>(&af.words[idx]);
+					if ((word & mask) != mask)
+					{
+						rf_pass = false;
+						break;
+					}
+				}
+			}
+			if (!rf_pass)
+				continue;
+		}
 
 		/* B.1 Option C: deform filter cols first (1-row scratch at row 0),
 		 * evaluate predicate inline; only on survival do we deform the

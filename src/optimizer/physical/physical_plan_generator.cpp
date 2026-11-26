@@ -644,6 +644,8 @@ void FinalizeAggregateCanonicalization(PhysicalOperator& op) {
 		}
 		case PhysicalOperatorType::SET_OPERATION:
 		case PhysicalOperatorType::DELIM_SCAN:
+		case PhysicalOperatorType::MATERIALIZED_CTE:
+		case PhysicalOperatorType::CTE_SCAN:
 		case PhysicalOperatorType::CROSS_PRODUCT:
 			return;
 	}
@@ -656,6 +658,9 @@ bool IsScalarPhysicalNode(const PhysicalOperator* op) {
 	if (op->type == PhysicalOperatorType::HASH_GROUP_BY) {
 		auto* aggregate = static_cast<const PhysicalHashAggregate*>(op);
 		return aggregate->groups.empty();
+	}
+	if (op->type == PhysicalOperatorType::MATERIALIZED_CTE && op->children.size() == 2) {
+		return IsScalarPhysicalNode(op->children[1].get());
 	}
 	if ((op->type == PhysicalOperatorType::FILTER ||
 		 op->type == PhysicalOperatorType::PROJECTION ||
@@ -735,6 +740,10 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalOpera
             return CreatePlan(static_cast<LogicalDependentJoin&>(op));
         case LogicalOperatorType::LOGICAL_DELIM_GET:
             return CreatePlan(static_cast<LogicalDelimGet&>(op));
+        case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+            return CreatePlan(static_cast<LogicalMaterializedCTE&>(op));
+        case LogicalOperatorType::LOGICAL_CTE_REF:
+            return CreatePlan(static_cast<LogicalCTERef&>(op));
         case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
             return CreatePlan(static_cast<LogicalCrossProduct&>(op));
         case LogicalOperatorType::LOGICAL_ORDER:
@@ -967,6 +976,66 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalDelim
             ColumnBinding{op.table_index, ProjectionIndex{idx}},
             "delim",
             std::move(column_name)});
+    }
+    return physical;
+}
+
+std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalMaterializedCTE& op) {
+    if (op.children.size() != 2 || !op.children[0] || !op.children[1]) {
+        throw std::runtime_error("LogicalMaterializedCTE expects two children");
+    }
+    auto producer = CreatePlan(*op.children[0]);
+    std::vector<OutputColumn> resolved_outputs;
+    resolved_outputs.reserve(op.output_bindings.size());
+    for (size_t idx = 0; idx < op.output_bindings.size(); ++idx) {
+        const auto& target_binding = op.output_bindings[idx];
+        OutputColumn col{};
+        col.binding = target_binding;
+        col.table_name = op.cte_name.empty() ? "cte" : op.cte_name;
+        col.column_name = idx < op.output_names.size() ? op.output_names[idx] : "c" + std::to_string(idx);
+        for (const auto& prod_out : producer->outputs) {
+            if (BindingEquals(prod_out.binding, target_binding)) {
+                col.table_name = prod_out.table_name;
+                col.column_name = prod_out.column_name;
+                col.type_oid = prod_out.type_oid;
+                col.typmod = prod_out.typmod;
+                break;
+            }
+        }
+        resolved_outputs.push_back(std::move(col));
+    }
+    cte_outputs_[op.table_index.index] = std::move(resolved_outputs);
+    auto consumer = CreatePlan(*op.children[1]);
+    cte_outputs_.erase(op.table_index.index);
+
+    auto physical = std::make_unique<PhysicalMaterializedCTE>(
+        op.table_index, op.cte_name, op.output_bindings, EstimateCardinality(op));
+    CopyOutputs(*physical, *consumer);
+    physical->children.push_back(std::move(producer));
+    physical->children.push_back(std::move(consumer));
+    return physical;
+}
+
+std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalCTERef& op) {
+    auto physical = std::make_unique<PhysicalCTEScan>(
+        op.table_index, op.cte_index, op.cte_name, EstimateCardinality(op));
+    physical->output_names = op.output_names;
+    auto it = cte_outputs_.find(op.cte_index.index);
+    if (it != cte_outputs_.end()) {
+        physical->outputs.reserve(it->second.size());
+        for (size_t idx = 0; idx < it->second.size(); ++idx) {
+            OutputColumn col = it->second[idx];
+            col.binding = ColumnBinding{op.table_index, ProjectionIndex{idx}};
+            physical->outputs.push_back(std::move(col));
+        }
+    } else {
+        physical->outputs.reserve(op.output_names.size());
+        for (size_t idx = 0; idx < op.output_names.size(); ++idx) {
+            physical->outputs.push_back(OutputColumn{
+                ColumnBinding{op.table_index, ProjectionIndex{idx}},
+                op.cte_name.empty() ? "cte" : op.cte_name,
+                op.output_names[idx]});
+        }
     }
     return physical;
 }

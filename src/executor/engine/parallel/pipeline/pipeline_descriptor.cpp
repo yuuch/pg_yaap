@@ -214,6 +214,9 @@ EmitSeqScan(const PhysicalSeqScan &op, OpDescriptor &out)
 	out.body.seq_scan.n_filter_steps = op.n_filter_steps();
 	out.body.seq_scan.filter_bool_regs = op.filter_bool_regs();
 	out.body.seq_scan.filter_string_const_bytes = op.filter_string_const_bytes();
+	out.body.seq_scan.n_runtime_filters = op.n_runtime_filters();
+	for (uint8_t i = 0; i < MAX_SEQ_SCAN_RUNTIME_FILTERS; ++i)
+		out.body.seq_scan.runtime_filters[i] = op.runtime_filter(i);
 }
 
 static void
@@ -351,6 +354,7 @@ EmitHashJoin(const PhysicalHashJoin &op, OpDescriptor &out)
 	out.body.hash_join.filter_steps = op.filter_steps_dp();
 	out.body.hash_join.filter_string_consts = op.filter_string_consts_dp();
 	out.body.hash_join.shared_payload = op.shared_payload_dp();
+	out.body.hash_join.runtime_filter = op.runtime_filter_dp();
 	out.body.hash_join.n_left_keys = op.n_left_keys();
 	out.body.hash_join.n_right_keys = op.n_right_keys();
 	out.body.hash_join.output_column_count = op.output_column_count();
@@ -395,7 +399,8 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 	switch (op.kind)
 	{
 		case OpKind::SEQ_SCAN:
-			return std::make_unique<PhysicalSeqScan>(
+		{
+			auto scan = std::make_unique<PhysicalSeqScan>(
 				op.body.seq_scan.relid,
 				op.body.seq_scan.input_schema,
 				op.body.seq_scan.output_schema,
@@ -410,6 +415,10 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.seq_scan.filter_string_const_bytes,
 				op.body.seq_scan.shared_payload,
 				const_cast<OpDescriptor *>(&op));
+			for (uint8_t i = 0; i < op.body.seq_scan.n_runtime_filters && i < MAX_SEQ_SCAN_RUNTIME_FILTERS; ++i)
+				scan->AttachRuntimeFilter(op.body.seq_scan.runtime_filters[i]);
+			return scan;
+		}
 
 		case OpKind::MATERIALIZE:
             return std::make_unique<PhysicalMaterialize>(op.body.materialize.layout, op.body.materialize.shared_payload, nullptr, op.body.materialize.scan);
@@ -588,6 +597,7 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.hash_join.n_right_keys,
 				op.body.hash_join.max_rows,
 				const_cast<OpDescriptor *>(&op));
+			join->SetRuntimeFilter(op.body.hash_join.runtime_filter);
 			if (op.kind == OpKind::HASH_JOIN_PROBE)
 				return std::make_unique<PhysicalHashJoinProbe>(
 					std::move(join), const_cast<OpDescriptor *>(&op));

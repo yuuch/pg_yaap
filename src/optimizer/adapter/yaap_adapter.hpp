@@ -36,6 +36,8 @@ enum class LogicalOperatorType {
     LOGICAL_DEPENDENT_JOIN,
     LOGICAL_DELIM_JOIN,
     LOGICAL_DELIM_GET,
+    LOGICAL_MATERIALIZED_CTE,
+    LOGICAL_CTE_REF,
     LOGICAL_ORDER,
     LOGICAL_WINDOW,
     LOGICAL_LIMIT,
@@ -296,6 +298,36 @@ public:
 
     explicit LogicalDelimGet(TableIndex table_index)
         : LogicalOperator(LogicalOperatorType::LOGICAL_DELIM_GET), table_index(table_index) {}
+};
+
+// DuckDB-style materialized CTE: children[0] is the CTE producer, children[1] is the consumer tree.
+class LogicalMaterializedCTE : public LogicalOperator {
+public:
+    TableIndex table_index;
+    std::string cte_name;
+    std::vector<ColumnBinding> output_bindings;
+    std::vector<std::string> output_names;
+
+    LogicalMaterializedCTE(TableIndex table_index, std::string cte_name)
+        : LogicalOperator(LogicalOperatorType::LOGICAL_MATERIALIZED_CTE),
+          table_index(table_index),
+          cte_name(std::move(cte_name)) {}
+};
+
+// DuckDB-style CTE scan referencing a LogicalMaterializedCTE by cte_index.
+class LogicalCTERef : public LogicalOperator {
+public:
+    TableIndex table_index;
+    TableIndex cte_index;
+    std::string cte_name;
+    std::vector<std::string> output_names;
+    std::vector<ColumnTypeInfo> output_types;
+
+    LogicalCTERef(TableIndex table_index, TableIndex cte_index, std::string cte_name)
+        : LogicalOperator(LogicalOperatorType::LOGICAL_CTE_REF),
+          table_index(table_index),
+          cte_index(cte_index),
+          cte_name(std::move(cte_name)) {}
 };
 // LogicalGet represents a table scan
 class LogicalGet : public LogicalOperator {

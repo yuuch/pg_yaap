@@ -361,6 +361,58 @@ inline bool HashJoinNeedsUnmatchedBuildRows(HashJoinMatchMode mode) {
 	return mode == HashJoinMatchMode::RIGHT || mode == HashJoinMatchMode::BUILD_ANTI;
 }
 
+static constexpr uint32_t MAX_SEQ_SCAN_RUNTIME_FILTERS = 4;
+
+/*
+ * Runtime Bloom + Min/Max filter produced by a PhysicalHashJoin build pipeline
+ * and consumed by an upstream PhysicalSeqScan on the probe side.
+ * Populated during build SinkChunk/FinishLocalSink/Finalize; immutable during
+ * probe SeqScan.GetData because the event DAG guarantees build FINALIZE completes
+ * before the probe pipeline RUN event starts.
+ */
+struct HashJoinRuntimeFilter {
+	slock_t          mutex;
+	pg_atomic_uint32 ready;          /* 0 = building, 1 = finalized & readable */
+	uint8_t          empty_build;    /* 1 iff total_rows == 0 */
+	uint8_t          bloom_usable;   /* 1 iff words_dp valid & not saturated */
+	uint8_t          has_minmax;     /* 1 iff total_rows > 0 */
+	uint8_t          key_is_int64;   /* 0 = INT32 (int4/date), 1 = INT64 (int8) */
+	uint32_t         num_words;      /* power of 2, 0 if bloom disabled */
+	uint32_t         word_mask;      /* num_words - 1 */
+	uint64_t         estimated_rows; /* optimizer build cardinality hint */
+	uint64_t         total_rows;     /* non-null build keys inserted */
+	int64_t          min_val;
+	int64_t          max_val;
+	dsa_pointer      words_dp;       /* pg_atomic_uint64[num_words] */
+};
+
+static inline uint64_t
+RuntimeFilterHashKey(int64_t key)
+{
+	uint64_t x = static_cast<uint64_t>(key);
+	x ^= x >> 33;
+	x *= UINT64_C(0xff51afd7ed558ccd);
+	x ^= x >> 33;
+	x *= UINT64_C(0xc4ceb9fe1a85ec53);
+	x ^= x >> 33;
+	return x;
+}
+
+static inline uint64_t
+RuntimeFilterWordMask(uint64_t h)
+{
+	return (UINT64_C(1) << (h & 63u)) |
+	       (UINT64_C(1) << ((h >> 6) & 63u)) |
+	       (UINT64_C(1) << ((h >> 12) & 63u));
+}
+
+struct SeqScanRuntimeFilterDesc {
+	dsa_pointer      filter_dp;   /* HashJoinRuntimeFilter * in DSA */
+	uint16_t         attno;       /* 1-based PG attribute number */
+	ColumnDecodeKind decode_kind; /* INT32_INT4, INT32_DATE, or INT64_INT8 */
+	uint8_t          _pad0;
+};
+
 struct HashJoinOpBody {
 	dsa_pointer left_input_schema;
 	dsa_pointer right_input_schema;
@@ -376,6 +428,7 @@ struct HashJoinOpBody {
 	dsa_pointer filter_string_consts; /* char[filter_string_const_bytes] */
 	dsa_pointer shared_payload;
 	dsa_pointer probe_shared_payload;
+	dsa_pointer runtime_filter; /* optional HashJoinRuntimeFilter * */
 	uint16_t    n_left_keys;
 	uint16_t    n_right_keys;
 	uint16_t    output_column_count;
@@ -488,6 +541,10 @@ struct HashJoinBatch {
 	dsa_pointer matched_bitmap_dp; /* pg_atomic_uint32[ceil(row_count / 32)] */
 	pg_atomic_uint32 unmatched_done;
 	pg_atomic_uint32 matched_build_rows;
+	uint8_t     is_subpartition;
+	uint8_t     _sub_pad[7];
+	dsa_pointer sub_build_key_first_dp;
+	dsa_pointer sub_build_row_first_dp;
 };
 
 struct HashJoinPartition {
@@ -641,6 +698,9 @@ struct SeqScanOpBody {
 	uint16_t    n_filter_steps;
 	uint16_t    filter_bool_regs;
 	uint32_t    filter_string_const_bytes;
+	SeqScanRuntimeFilterDesc runtime_filters[MAX_SEQ_SCAN_RUNTIME_FILTERS];
+	uint8_t     n_runtime_filters;
+	uint8_t     _rf_pad[7];
 };
 
 struct HashAggOpBody {

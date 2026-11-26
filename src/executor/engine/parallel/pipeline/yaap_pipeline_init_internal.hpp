@@ -68,12 +68,14 @@ using yaap::BoundFunctionExpression;
 using yaap::Expression;
 using yaap::ExpressionType;
 using yaap::PhysicalCrossProduct;
+using yaap::PhysicalCTEScan;
 using yaap::PhysicalDelimScan;
 using yaap::PhysicalDistinct;
 using yaap::PhysicalFilter;
 using yaap::PhysicalHashAggregate;
 using yaap::PhysicalHashJoin;
 using yaap::PhysicalLimit;
+using yaap::PhysicalMaterializedCTE;
 using yaap::PhysicalOperator;
 using yaap::PhysicalOperatorType;
 using yaap::PhysicalOrderBy;
@@ -210,6 +212,27 @@ struct DelimMaterializeContext {
  ~DelimMaterializeContext() { current=previous; }
 };
 
+struct CteMaterializeContext {
+ size_t cte_index = 0;
+ std::vector<ColumnSchema> output_schema;
+ uint32_t estimated_groups = 0;
+ std::unique_ptr<pipeline::PhysicalMaterialize> producer_owner;
+ pipeline::PhysicalMaterialize *producer_raw = nullptr;
+ CteMaterializeContext *previous = nullptr;
+ inline static thread_local CteMaterializeContext *current = nullptr;
+ CteMaterializeContext(size_t cte_index,
+                       std::vector<ColumnSchema> output_schema,
+                       uint32_t estimated_groups,
+                       std::unique_ptr<pipeline::PhysicalMaterialize> producer_owner)
+  : cte_index(cte_index),
+    output_schema(std::move(output_schema)),
+    estimated_groups(estimated_groups),
+    producer_owner(std::move(producer_owner)),
+    producer_raw(this->producer_owner.get()),
+    previous(current) { current = this; }
+ ~CteMaterializeContext() { current = previous; }
+};
+
 std::string
 CurrentSupportPath(const SupportContext &ctx);
 
@@ -245,6 +268,12 @@ AnalyzeHashAggregateNode(const PhysicalHashAggregate &agg, SupportContext &ctx);
 
 OptimizerPlanSupportStatus
 AnalyzeDelimScanNode(const PhysicalDelimScan &scan, SupportContext &ctx);
+
+OptimizerPlanSupportStatus
+AnalyzeMaterializedCteNode(const PhysicalMaterializedCTE &cte, SupportContext &ctx);
+
+OptimizerPlanSupportStatus
+AnalyzeCteScanNode(const PhysicalCTEScan &scan, SupportContext &ctx);
 
 OptimizerPlanSupportStatus
 AnalyzeOrderByNode(const PhysicalOrderBy &order, SupportContext &ctx);
@@ -635,7 +664,8 @@ LowerOptimizerExpr(const Expression *expr,
 				   const std::vector<ColumnSchema> &schema,
 				   const std::vector<MaterializedOptExpr> *cache,
 				   int8_t &out_scale,
-				   uint8_t &out_slot);
+				   uint8_t &out_slot,
+				   bool require_int64_slot = false);
 
 bool
 LowerOptimizerBoolExpr(const Expression *expr,
@@ -721,7 +751,8 @@ LowerOptimizerExpr(const Expression *expr,
 				   const std::vector<ColumnSchema> &schema,
 				   const std::vector<MaterializedOptExpr> *cache,
 				   int8_t &out_scale,
-				   uint8_t &out_slot);
+				   uint8_t &out_slot,
+				   bool require_int64_slot);
 
 bool
 InferProjectionExprSchema(const Expression *expr,
@@ -825,6 +856,18 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 					   QueryDesc *queryDesc,
 					   PgYaapQueryState *state,
 					   OptimizerNodeTranslation &out);
+
+bool
+TranslateMaterializedCteNode(const PhysicalMaterializedCTE &cte,
+							 QueryDesc *queryDesc,
+							 PgYaapQueryState *state,
+							 const std::vector<ColumnRef> *required_output_cols,
+							 OptimizerNodeTranslation &out);
+
+bool
+TranslateCteScanNode(const PhysicalCTEScan &scan,
+					 PgYaapQueryState *state,
+					 OptimizerNodeTranslation &out);
 
 bool
 TranslateHashJoinNode(const PhysicalHashJoin &join,

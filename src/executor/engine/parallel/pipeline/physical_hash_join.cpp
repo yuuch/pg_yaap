@@ -133,6 +133,81 @@ ResolvePayload(dsa_area *dsa, dsa_pointer payload_dp)
 	return static_cast<HashJoinSharedPayload *>(dsa_get_address(dsa, payload_dp));
 }
 
+static HashJoinRuntimeFilter *
+ResolveRuntimeFilter(dsa_area *dsa, dsa_pointer rf_dp)
+{
+	if (!DsaPointerIsValid(rf_dp))
+		return nullptr;
+	return static_cast<HashJoinRuntimeFilter *>(dsa_get_address(dsa, rf_dp));
+}
+
+static void
+InitializeRuntimeFilterStorage(ExecCtx &ctx, HashJoinRuntimeFilter *rf)
+{
+	if (rf == nullptr || DsaPointerIsValid(rf->words_dp))
+		return;
+	const uint64_t est = std::max<uint64_t>(rf->estimated_rows, 1024u);
+	/* Target ~16 bits/key (est / 4 uint64 words), clamped to [2 KB, 8 MB]
+	 * and capped at hard_limit / 16 so tight-memory queries never OOM. */
+	uint64_t max_bytes = UINT64_C(8) * 1024 * 1024;
+	if (ctx.control != nullptr && DsaPointerIsValid(ctx.control->buffer_state_root))
+	{
+		const auto *budget = static_cast<const buffer::YaapBufferSharedState *>(
+			dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
+		if (budget != nullptr && budget->hard_limit > 0)
+			max_bytes = std::min(max_bytes, budget->hard_limit / 16u);
+	}
+	const uint64_t max_words = max_bytes / sizeof(uint64_t);
+	if (max_words < 256u)
+		return;
+	const uint64_t target_words = std::max<uint64_t>(256u, est / 4u);
+	uint32_t words = 256u;
+	while (words < target_words && static_cast<uint64_t>(words) * 2u <= max_words)
+		words <<= 1;
+	dsa_pointer words_dp = dsa_allocate_extended(
+		ctx.dsa,
+		static_cast<size_t>(words) * sizeof(uint64_t),
+		DSA_ALLOC_ZERO | DSA_ALLOC_NO_OOM);
+	if (!DsaPointerIsValid(words_dp))
+		return;
+	rf->words_dp = words_dp;
+	rf->num_words = words;
+	rf->word_mask = words - 1u;
+}
+
+static void
+PublishLocalRuntimeFilter(HashJoinGlobalSinkState &global, HashJoinLocalSinkState &local)
+{
+	if (global.runtime_filter == nullptr || local.rf_published)
+		return;
+	local.rf_published = true;
+	if (local.rf_rows == 0)
+		return;
+	auto *rf = global.runtime_filter;
+	SpinLockAcquire(&rf->mutex);
+	if (local.rf_min < rf->min_val)
+		rf->min_val = local.rf_min;
+	if (local.rf_max > rf->max_val)
+		rf->max_val = local.rf_max;
+	rf->total_rows += local.rf_rows;
+	SpinLockRelease(&rf->mutex);
+}
+
+static void
+FinalizeRuntimeFilter(HashJoinRuntimeFilter *rf)
+{
+	if (rf == nullptr || pg_atomic_read_u32(&rf->ready) != 0)
+		return;
+	rf->empty_build = (rf->total_rows == 0) ? 1 : 0;
+	rf->has_minmax = (rf->total_rows > 0) ? 1 : 0;
+	rf->bloom_usable = (rf->total_rows > 0 &&
+	                    DsaPointerIsValid(rf->words_dp) &&
+	                    rf->num_words > 0 &&
+	                    rf->total_rows <= static_cast<uint64_t>(rf->num_words) * 24u) ? 1 : 0;
+	pg_write_barrier();
+	pg_atomic_write_u32(&rf->ready, 1u);
+}
+
 static const TupleDataLayout *
 ResolveLayout(dsa_area *dsa, dsa_pointer layout_dp)
 {
@@ -2159,6 +2234,12 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 	state->output_columns_dp = output_columns_dp_;
 	state->build_layout_dp = right_payload_layout_dp_;
 	state->shared_payload_dp = shared_payload_dp();
+	state->runtime_filter_dp = DsaPointerIsValid(runtime_filter_dp_)
+		? runtime_filter_dp_
+		: (desc_ != nullptr ? desc_->body.hash_join.runtime_filter : InvalidDsaPointer);
+	state->runtime_filter = ResolveRuntimeFilter(ctx.dsa, state->runtime_filter_dp);
+	if (ctx.initialize_shared_state && state->runtime_filter != nullptr)
+		InitializeRuntimeFilterStorage(ctx, state->runtime_filter);
 	if (!DsaPointerIsValid(state->probe_key_layout_dp) && desc_ != nullptr)
 		state->probe_key_layout_dp = desc_->body.hash_join.left_key_layout;
 	if (!DsaPointerIsValid(state->build_key_layout_dp) && desc_ != nullptr)
@@ -2569,6 +2650,65 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 	}
 	if (chunk_has_null_key)
 		(void) pg_atomic_fetch_or_u32(&global.payload->build_has_null_key, 1u);
+	if (global.runtime_filter != nullptr && in.count > 0 && local.build_key_layout->column_count > 0)
+	{
+		auto *rf = global.runtime_filter;
+		const auto &kcol = local.build_key_layout->columns[0];
+		const uint16_t slot = kcol.src_col_idx;
+		const uint8_t *nulls = in.nulls[slot];
+		auto *words = DsaPointerIsValid(rf->words_dp)
+			? static_cast<pg_atomic_uint64 *>(dsa_get_address(ctx.dsa, rf->words_dp))
+			: nullptr;
+		const uint32_t wmask = rf->word_mask;
+		int64_t lmin = local.rf_min;
+		int64_t lmax = local.rf_max;
+		uint64_t lrows = local.rf_rows;
+		if (kcol.kind == TdcColumnKind::INT32)
+		{
+			const int32_t *vals = in.int32_columns[slot];
+			for (uint16_t r = 0; r < in.count; ++r)
+			{
+				if (nulls[r] != 0)
+					continue;
+				const int64_t v = static_cast<int64_t>(vals[r]);
+				if (v < lmin) lmin = v;
+				if (v > lmax) lmax = v;
+				++lrows;
+				if (words != nullptr)
+				{
+					const uint64_t h = RuntimeFilterHashKey(v);
+					const uint32_t idx = static_cast<uint32_t>(h >> 32) & wmask;
+					const uint64_t mask = RuntimeFilterWordMask(h);
+					if ((pg_atomic_read_u64(&words[idx]) & mask) != mask)
+						(void) pg_atomic_fetch_or_u64(&words[idx], mask);
+				}
+			}
+		}
+		else if (kcol.kind == TdcColumnKind::INT64)
+		{
+			const int64_t *vals = in.int64_columns[slot];
+			for (uint16_t r = 0; r < in.count; ++r)
+			{
+				if (nulls[r] != 0)
+					continue;
+				const int64_t v = vals[r];
+				if (v < lmin) lmin = v;
+				if (v > lmax) lmax = v;
+				++lrows;
+				if (words != nullptr)
+				{
+					const uint64_t h = RuntimeFilterHashKey(v);
+					const uint32_t idx = static_cast<uint32_t>(h >> 32) & wmask;
+					const uint64_t mask = RuntimeFilterWordMask(h);
+					if ((pg_atomic_read_u64(&words[idx]) & mask) != mask)
+						(void) pg_atomic_fetch_or_u64(&words[idx], mask);
+				}
+			}
+		}
+		local.rf_min = lmin;
+		local.rf_max = lmax;
+		local.rf_rows = lrows;
+	}
 	if (global.payload->direct_segmented_build)
 	{
 		if (global.payload->build_partition_count > 1)
@@ -2820,6 +2960,8 @@ SinkCombineResultType
 PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 {
 	auto &global = static_cast<HashJoinGlobalSinkState &>(input.global_state);
+	if (input.local_state != nullptr)
+		PublishLocalRuntimeFilter(global, static_cast<HashJoinLocalSinkState &>(*input.local_state));
 	if (global.payload != nullptr && global.payload->direct_segmented_build &&
 		global.payload->build_partition_count > 1)
 	{
@@ -3067,6 +3209,8 @@ SinkCombineResultType
 PhysicalHashJoin::FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input)
 {
 	auto &global = static_cast<HashJoinGlobalSinkState &>(input.global_state);
+	if (input.local_state != nullptr)
+		PublishLocalRuntimeFilter(global, static_cast<HashJoinLocalSinkState &>(*input.local_state));
 	if (global.payload != nullptr && global.payload->direct_segmented_build)
 		return Combine(ctx, input);
 	/* Flat DSA rows are already registered, including any growth. Their
@@ -3282,6 +3426,7 @@ PhysicalHashJoin::FinalizePartition(ExecCtx &ctx,
 		payload->segmented_row_count = static_cast<uint32_t>(total_rows);
 		payload->combined = true;
 		payload->segmented_build = true;
+		FinalizeRuntimeFilter(global.runtime_filter);
 		payload->finalized = true;
 		global.finalized = true;
 	}
@@ -3312,6 +3457,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 			global.payload->segmented_row_count = static_cast<uint32_t>(rows);
 			global.payload->segmented_build = true;
 			global.payload->combined = true;
+			FinalizeRuntimeFilter(global.runtime_filter);
 			global.payload->finalized = true;
 			global.finalized = true;
 			return SinkFinalizeType::READY;
@@ -3319,6 +3465,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 		/* Partition directories were built by worker FINALIZE tasks. */
 		if (!global.payload->finalized)
 			elog(ERROR, "pg_yaap: partitioned segmented hash join finalized on the leader before its workers");
+		FinalizeRuntimeFilter(global.runtime_filter);
 		global.finalized = true;
 		return SinkFinalizeType::READY;
 	}
@@ -3372,6 +3519,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 				rows->finalized = true;
 		}
 		global.payload->combined = true;
+		FinalizeRuntimeFilter(global.runtime_filter);
 		global.payload->finalized = true;
 		global.finalized = true;
 		return SinkFinalizeType::READY;
@@ -3528,6 +3676,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 			window.Release();
 		}
 		global.payload->combined = true;
+		FinalizeRuntimeFilter(global.runtime_filter);
 		global.payload->finalized = true;
 		global.finalized = true;
 		return SinkFinalizeType::READY;
@@ -3638,6 +3787,7 @@ PhysicalHashJoin::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 		global.build_keys->finalized = true;
 	if (global.build_rows != nullptr)
 		global.build_rows->finalized = true;
+	FinalizeRuntimeFilter(global.runtime_filter);
 	global.payload->finalized = true;
 	global.finalized = true;
 	return SinkFinalizeType::READY;
@@ -3766,18 +3916,8 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 	uint32_t row_end = batch->row_count;
 	for (uint32_t next = partition_id + 1; next < payload->build_partition_count && next < 64; ++next)
 		if ((batch->partition_mask >> next) & 1u) { row_end = batch->partition_offsets[next]; break; }
-	uint64_t expected_rows = 0;
-	for (uint32_t slot = 0; slot < payload->local_state_slot_count; ++slot) {
-		if (!DsaPointerIsValid(registry[slot].partition_state_dp)) continue;
-		auto *parts = static_cast<HashJoinLocalPartitionState *>(dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
-		auto &part = parts[partition_id];
-		expected_rows += part.row_count;
-		if (part.row_count == 0) continue;
-		ChainCursor keys = initialize_cursor(part.build_key_segment_desc_dp, part.row_count);
-		ChainCursor rows;
-		if (row_refs != key_refs)
-			rows = initialize_cursor(part.build_row_segment_desc_dp, part.row_count);
-		for (uint32_t local_idx = 0; local_idx < part.row_count; ++local_idx, ++row_idx) {
+	auto ingest_chain = [&](ChainCursor keys, ChainCursor rows, uint32_t chain_rows) {
+		for (uint32_t local_idx = 0; local_idx < chain_rows; ++local_idx, ++row_idx) {
 			if ((local_idx & 1023u) == 0) CHECK_FOR_INTERRUPTS();
 			if (row_idx >= row_end || row_idx >= batch->row_count)
 				elog(ERROR, "pg_yaap: batch hash join global row out of bounds");
@@ -3808,6 +3948,31 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 		buffer::YaapSegmentRowRef extra;
 		if (next_ref(keys, &extra) || (row_refs != key_refs && next_ref(rows, &extra)))
 			elog(ERROR, "pg_yaap: batch hash join chain has excess rows");
+	};
+	uint64_t expected_rows = 0;
+	if (batch->is_subpartition != 0) {
+		expected_rows = batch->row_count;
+		if (batch->row_count > 0) {
+			ChainCursor keys;
+			keys.next_dp = batch->sub_build_key_first_dp;
+			ChainCursor rows;
+			if (row_refs != key_refs)
+				rows.next_dp = batch->sub_build_row_first_dp;
+			ingest_chain(keys, rows, batch->row_count);
+		}
+	} else {
+		for (uint32_t slot = 0; slot < payload->local_state_slot_count; ++slot) {
+			if (!DsaPointerIsValid(registry[slot].partition_state_dp)) continue;
+			auto *parts = static_cast<HashJoinLocalPartitionState *>(dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
+			auto &part = parts[partition_id];
+			expected_rows += part.row_count;
+			if (part.row_count == 0) continue;
+			ChainCursor keys = initialize_cursor(part.build_key_segment_desc_dp, part.row_count);
+			ChainCursor rows;
+			if (row_refs != key_refs)
+				rows = initialize_cursor(part.build_row_segment_desc_dp, part.row_count);
+			ingest_chain(keys, rows, part.row_count);
+		}
 	}
 	if (static_cast<uint64_t>(batch->partition_offsets[partition_id]) + expected_rows != row_idx || row_idx != row_end)
 		elog(ERROR, "pg_yaap: batch hash join partition row count mismatch");
@@ -3857,6 +4022,19 @@ PhysicalHashJoin::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx)
 	uint32 expected = 0;
 	if (!pg_atomic_compare_exchange_u32(&payload->release_state, &expected, 1))
 		return;
+
+	dsa_pointer rf_dp = DsaPointerIsValid(runtime_filter_dp_)
+		? runtime_filter_dp_
+		: (desc_ != nullptr ? desc_->body.hash_join.runtime_filter : InvalidDsaPointer);
+	if (auto *rf = ResolveRuntimeFilter(ctx.dsa, rf_dp); rf != nullptr)
+	{
+		if (DsaPointerIsValid(rf->words_dp))
+		{
+			dsa_free(ctx.dsa, rf->words_dp);
+			rf->words_dp = InvalidDsaPointer;
+		}
+		rf->bloom_usable = 0;
+	}
 
 	const uint64_t global_keys_bytes = EstimateTdcAllocBytes(ctx.dsa, payload->build_keys_dp);
 	const uint64_t global_rows_bytes = EstimateTdcAllocBytes(ctx.dsa, payload->build_rows_dp);

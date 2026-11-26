@@ -114,6 +114,7 @@ BuildPipelineFromOptimizerPlan(QueryDesc *queryDesc,
 	if (pg_yaap_trace_hooks)
 		elog(LOG, "pg_yaap: optimizer pipeline builder entering node lowering");
 	DelimMaterializeContext::current = nullptr;
+	CteMaterializeContext::current = nullptr;
 	if (!TranslateOptimizerNode(*bundle.physical_plan, queryDesc, state, nullptr, node) || node.op == nullptr)
 		return nullptr;
 	if (pg_yaap_trace_hooks)
@@ -190,6 +191,12 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 
 		case PhysicalOperatorType::DELIM_SCAN:
 			return TranslateDelimScanNode(static_cast<const PhysicalDelimScan &>(op), queryDesc, state, out);
+
+		case PhysicalOperatorType::MATERIALIZED_CTE:
+			return TranslateMaterializedCteNode(static_cast<const PhysicalMaterializedCTE &>(op), queryDesc, state, required_output_cols, out);
+
+		case PhysicalOperatorType::CTE_SCAN:
+			return TranslateCteScanNode(static_cast<const PhysicalCTEScan &>(op), state, out);
 
 		case PhysicalOperatorType::ORDER_BY:
 		{

@@ -220,6 +220,24 @@ AnalyzeDelimScanNode(const PhysicalDelimScan &scan, SupportContext &ctx)
 }
 
 OptimizerPlanSupportStatus
+AnalyzeMaterializedCteNode(const PhysicalMaterializedCTE &cte, SupportContext &ctx)
+{
+	if (cte.output_bindings.empty())
+		return MakeSupportError(ctx, "MATERIALIZED_CTE missing output bindings");
+	return AnalyzeChildren(cte, ctx, 2);
+}
+
+OptimizerPlanSupportStatus
+AnalyzeCteScanNode(const PhysicalCTEScan &scan, SupportContext &ctx)
+{
+	if (!scan.children.empty())
+		return MakeSupportError(ctx, "CTE_SCAN should not have children");
+	if (scan.outputs.empty())
+		return MakeSupportError(ctx, "CTE_SCAN missing outputs");
+	return MakeSupportOk();
+}
+
+OptimizerPlanSupportStatus
 AnalyzeOrderByNode(const PhysicalOrderBy &order, SupportContext &ctx)
 {
 	for (Expression *expr : order.orders)
@@ -254,6 +272,10 @@ AnalyzeOptimizerPlanNode(const PhysicalOperator &op, SupportContext &ctx)
 			return AnalyzeHashAggregateNode(static_cast<const PhysicalHashAggregate &>(op), ctx);
 		case PhysicalOperatorType::DELIM_SCAN:
 			return AnalyzeDelimScanNode(static_cast<const PhysicalDelimScan &>(op), ctx);
+		case PhysicalOperatorType::MATERIALIZED_CTE:
+			return AnalyzeMaterializedCteNode(static_cast<const PhysicalMaterializedCTE &>(op), ctx);
+		case PhysicalOperatorType::CTE_SCAN:
+			return AnalyzeCteScanNode(static_cast<const PhysicalCTEScan &>(op), ctx);
 		case PhysicalOperatorType::ORDER_BY:
 			return AnalyzeOrderByNode(static_cast<const PhysicalOrderBy &>(op), ctx);
 		default:
@@ -304,6 +326,8 @@ OptimizerOpTypeName(const PhysicalOperator &op)
 		case PhysicalOperatorType::WINDOW: return "WINDOW";
 		case PhysicalOperatorType::HASH_JOIN: return OptimizerJoinOpTypeName(static_cast<const PhysicalHashJoin &>(op));
 		case PhysicalOperatorType::DELIM_SCAN: return "DELIM_SCAN";
+		case PhysicalOperatorType::MATERIALIZED_CTE: return "MATERIALIZED_CTE";
+		case PhysicalOperatorType::CTE_SCAN: return "CTE_SCAN";
 		case PhysicalOperatorType::CROSS_PRODUCT: return "CROSS_PRODUCT";
 		case PhysicalOperatorType::HASH_GROUP_BY:
 		{
@@ -617,6 +641,19 @@ OptimizerPlanNodeDetails(const PhysicalOperator &op)
 			const auto &delim_scan = static_cast<const PhysicalDelimScan &>(op);
 			if (!delim_scan.correlated_columns.empty())
 				details.push_back("corr=" + std::to_string(delim_scan.correlated_columns.size()));
+			break;
+		}
+		case PhysicalOperatorType::MATERIALIZED_CTE:
+		{
+			const auto &cte = static_cast<const PhysicalMaterializedCTE &>(op);
+			details.push_back("cte=" + cte.cte_name);
+			details.push_back("cols=" + std::to_string(cte.output_bindings.size()));
+			break;
+		}
+		case PhysicalOperatorType::CTE_SCAN:
+		{
+			const auto &scan = static_cast<const PhysicalCTEScan &>(op);
+			details.push_back("cte=" + scan.cte_name);
 			break;
 		}
 		case PhysicalOperatorType::CROSS_PRODUCT:

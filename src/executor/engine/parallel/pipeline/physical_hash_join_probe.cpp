@@ -21,6 +21,19 @@ namespace {
 
 struct ProbeChain { dsa_pointer first; uint64_t rows; };
 struct ProbePair { uint32_t state; uint32_t next_slot; uint32_t active_chains; uint64_t rows; };
+static constexpr uint32_t kRepartitionFanout = 8;
+static constexpr uint32_t kMaxRepartitionDepth = 4;
+static constexpr uint32_t kMaxSubPartitionStack = 64;
+struct SubPartitionItem {
+	uint32_t    root_part;
+	uint32_t    depth;
+	uint32_t    build_rows;
+	uint32_t    _pad0;
+	uint64_t    probe_rows;
+	dsa_pointer build_key_first_dp;
+	dsa_pointer build_row_first_dp;
+	dsa_pointer probe_first_dp;
+};
 struct ProbePayload {
 	slock_t mutex;
 	dsa_pointer arena_dp;
@@ -48,6 +61,8 @@ struct ProbePayload {
 	bool hybrid;
 	bool finalized;
 	bool consumed;
+	uint32_t sub_stack_size;
+	SubPartitionItem sub_stack[kMaxSubPartitionStack];
 };
 
 struct ProbeSinkGlobal final : GlobalSinkState {
@@ -421,34 +436,566 @@ void DestroyBatch(ExecCtx &ctx, dsa_pointer dp) {
 	 * still observing cleanup_state must not dereference freed metadata. */
 }
 
+uint32_t RepartitionSubBucket(uint64_t hash, uint32_t depth) {
+	uint64_t x = hash ^ (static_cast<uint64_t>(depth) * UINT64_C(0x9e3779b97f4a7c15));
+	x ^= x >> 30;
+	x *= UINT64_C(0xbf58476d1ce4e5b9);
+	x ^= x >> 27;
+	x *= UINT64_C(0x94d049bb133111eb);
+	x ^= x >> 31;
+	return static_cast<uint32_t>(x) & (kRepartitionFanout - 1u);
+}
+
+uint32_t RequiredHeapBytesForTdcRow(const TupleDataLayout *layout, const uint8_t *row) {
+	uint32_t total = 0;
+	for (uint16_t i = 0; i < layout->column_count; ++i) {
+		const auto &col = layout->columns[i];
+		if (col.kind != TdcColumnKind::STRING_REF) continue;
+		VecStringRef ref;
+		std::memcpy(&ref, row + col.offset, sizeof(ref));
+		if (ref.len > 8) total += ref.len;
+	}
+	return total;
+}
+
+void CopyTdcRow(const TupleDataLayout *layout,
+                const TupleDataCollection *src_tdc,
+                const uint8_t *src_row,
+                TupleDataCollection *dst_tdc,
+                uint8_t *dst_row) {
+	std::memcpy(dst_row, src_row, layout->row_width);
+	for (uint16_t i = 0; i < layout->column_count; ++i) {
+		const auto &col = layout->columns[i];
+		if (col.kind != TdcColumnKind::STRING_REF)
+			continue;
+		VecStringRef src_ref;
+		std::memcpy(&src_ref, src_row + col.offset, sizeof(src_ref));
+		if (src_ref.len <= 8)
+			continue;
+		const char *src_ptr = VecStringRefDataPtr(src_ref,
+			src_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(src_tdc)) : nullptr);
+		VecStringRef dst_ref;
+		if (!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
+			elog(ERROR, "pg_yaap: hash join repartition row copy ran out of heap");
+		std::memcpy(dst_row + col.offset, &dst_ref, sizeof(dst_ref));
+	}
+}
+
+void RetireSegmentChain(ExecCtx &ctx, dsa_pointer arena_dp, dsa_pointer first_dp) {
+	for (dsa_pointer dp = first_dp; DsaPointerIsValid(dp);) {
+		auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, dp));
+		const dsa_pointer next = segment->chain_next_dp;
+		const buffer::YaapSegmentHandle handle{segment->arena_id, segment->segment_id, segment->generation};
+		Retire(ctx, arena_dp, handle);
+		dp = next;
+	}
+}
+
+void RetireSubPartitionBuild(ExecCtx &ctx, HashJoinSharedPayload *build,
+                             dsa_pointer key_first_dp, dsa_pointer row_first_dp) {
+	if (DsaPointerIsValid(key_first_dp))
+		RetireSegmentChain(ctx, build->segment_arena_dp, key_first_dp);
+	if (DsaPointerIsValid(row_first_dp) && row_first_dp != key_first_dp)
+		RetireSegmentChain(ctx, build->segment_arena_dp, row_first_dp);
+}
+
+BatchPlan DescribeSubPartitionBatch(ExecCtx &ctx, PhysicalHashJoin &join,
+                                    HashJoinSharedPayload *build, const SubPartitionItem &item) {
+	BatchPlan plan;
+	const uint32_t part = item.root_part;
+	plan.rows = item.build_rows;
+	if (plan.rows > UINT32_MAX / 2u) {
+		plan.directory_bytes = UINT64_MAX;
+		return plan;
+	}
+	uint64_t buckets = 16;
+	while (buckets < plan.rows * 2u) buckets <<= 1;
+	if (buckets > UINT32_MAX) {
+		plan.directory_bytes = UINT64_MAX;
+		return plan;
+	}
+	plan.offsets[part] = 0;
+	plan.bucket_offsets[part] = 0;
+	plan.bucket_masks[part] = static_cast<uint32_t>(buckets - 1u);
+	plan.capacity = static_cast<uint32_t>(buckets);
+	auto scan_chain = [&](dsa_pointer first_dp) {
+		for (dsa_pointer dp = first_dp; DsaPointerIsValid(dp);) {
+			auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, dp));
+			++plan.segments;
+			plan.segment_bytes += segment->capacity;
+			plan.map_count = std::max(plan.map_count, segment->segment_id + 1);
+			dp = segment->chain_next_dp;
+		}
+	};
+	if (DsaPointerIsValid(item.build_key_first_dp))
+		scan_chain(item.build_key_first_dp);
+	if (!build->build_rows_use_keys && DsaPointerIsValid(item.build_row_first_dp) &&
+		item.build_row_first_dp != item.build_key_first_dp)
+		scan_chain(item.build_row_first_dp);
+	const uint64_t entries = std::max<uint64_t>(1, plan.rows);
+	if (HashJoinTracksBuildMatches(join.join_mode()))
+		plan.matched_word_count = static_cast<uint32_t>((entries + 31u) / 32u);
+	plan.directory_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32) +
+		entries * (sizeof(uint32_t) + sizeof(uint16_t) +
+			(build->build_rows_use_keys ? 1u : 2u) * sizeof(HashJoinBatchRowRef)) +
+		static_cast<uint64_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32) +
+		static_cast<uint64_t>(plan.segments) * sizeof(HashJoinBatchSegment) +
+		static_cast<uint64_t>(plan.map_count) * sizeof(uint32_t);
+	return plan;
+}
+
+dsa_pointer CreateSubPartitionBatch(ExecCtx &ctx, PhysicalHashJoin &join,
+                                    HashJoinSharedPayload *build, ProbePayload *p,
+                                    const SubPartitionItem &item) {
+	const uint32_t part = item.root_part;
+	const uint64_t mask = UINT64_C(1) << part;
+	const auto plan = DescribeSubPartitionBatch(ctx, join, build, item);
+	if (plan.directory_bytes == UINT64_MAX)
+		elog(ERROR, "pg_yaap: sub-partition batch hash table exceeds row-index range");
+	ChargeBatchDirectory(ctx, join, plan.directory_bytes);
+	const dsa_pointer dp = dsa_allocate0(ctx.dsa, sizeof(HashJoinBatch));
+	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, dp));
+	batch->partition_mask = mask;
+	batch->charged_bytes = plan.directory_bytes;
+	batch->row_count = static_cast<uint32_t>(plan.rows);
+	batch->hash_capacity = plan.capacity;
+	batch->segment_count = plan.segments;
+	batch->segment_map_count = plan.map_count;
+	batch->is_subpartition = 1;
+	batch->sub_build_key_first_dp = item.build_key_first_dp;
+	batch->sub_build_row_first_dp = build->build_rows_use_keys ? item.build_key_first_dp : item.build_row_first_dp;
+	if (plan.matched_word_count > 0) {
+		batch->matched_bitmap_dp = YaapDsaAllocate(ctx.dsa,
+			static_cast<size_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32));
+		auto *matched_words = static_cast<pg_atomic_uint32 *>(dsa_get_address(ctx.dsa, batch->matched_bitmap_dp));
+		for (uint32_t i = 0; i < plan.matched_word_count; ++i)
+			pg_atomic_init_u32(&matched_words[i], 0);
+	}
+	std::memcpy(batch->partition_offsets, plan.offsets, sizeof(plan.offsets));
+	std::memcpy(batch->bucket_offsets, plan.bucket_offsets, sizeof(plan.bucket_offsets));
+	std::memcpy(batch->bucket_masks, plan.bucket_masks, sizeof(plan.bucket_masks));
+	pg_atomic_init_u32(&batch->next_pin, 0);
+	pg_atomic_init_u32(&batch->pinned_workers, 0);
+	pg_atomic_init_u32(&batch->directory_ready, 0);
+	pg_atomic_init_u32(&batch->next_partition, 0);
+	pg_atomic_init_u32(&batch->built_workers, 0);
+	pg_atomic_init_u32(&batch->probe_done, 0);
+	pg_atomic_init_u32(&batch->released_workers, 0);
+	pg_atomic_init_u32(&batch->cleanup_state, 0);
+	pg_atomic_init_u32(&batch->unmatched_done, 0);
+	pg_atomic_init_u32(&batch->matched_build_rows, 0);
+	const size_t entries = std::max<uint32_t>(1, batch->row_count);
+	batch->hash_table_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.capacity) * sizeof(pg_atomic_uint32));
+	batch->hash_links_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(uint32_t));
+	batch->hash_salts_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(uint16_t));
+	batch->key_refs_dp = YaapDsaAllocate(ctx.dsa, entries * sizeof(HashJoinBatchRowRef));
+	batch->row_refs_dp = build->build_rows_use_keys ? batch->key_refs_dp
+		: YaapDsaAllocate(ctx.dsa, entries * sizeof(HashJoinBatchRowRef));
+	if (plan.segments) batch->segments_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.segments) * sizeof(HashJoinBatchSegment));
+	if (plan.map_count) batch->segment_map_dp = YaapDsaAllocate(ctx.dsa, static_cast<size_t>(plan.map_count) * sizeof(uint32_t));
+	auto *heads = static_cast<pg_atomic_uint32 *>(dsa_get_address(ctx.dsa, batch->hash_table_dp));
+	for (uint32_t i = 0; i < plan.capacity; ++i) pg_atomic_init_u32(&heads[i], UINT32_MAX);
+	auto *segments = plan.segments ? static_cast<HashJoinBatchSegment *>(dsa_get_address(ctx.dsa, batch->segments_dp)) : nullptr;
+	auto *map = plan.map_count ? static_cast<uint32_t *>(dsa_get_address(ctx.dsa, batch->segment_map_dp)) : nullptr;
+	if (map) std::memset(map, 0xFF, static_cast<size_t>(plan.map_count) * sizeof(uint32_t));
+	uint32_t index = 0;
+	auto add_chain = [&](dsa_pointer first_dp) {
+		for (dsa_pointer sdp = first_dp; DsaPointerIsValid(sdp);) {
+			auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, sdp));
+			if (index >= plan.segments || segment->segment_id >= plan.map_count || map[segment->segment_id] != UINT32_MAX)
+				elog(ERROR, "pg_yaap: invalid or duplicate sub-partition batch segment");
+			segments[index] = HashJoinBatchSegment{segment->self_dp, InvalidDsaPointer,
+				segment->arena_id, segment->segment_id, segment->generation, segment->capacity};
+			map[segment->segment_id] = index++;
+			sdp = segment->chain_next_dp;
+		}
+	};
+	if (DsaPointerIsValid(item.build_key_first_dp))
+		add_chain(item.build_key_first_dp);
+	if (!build->build_rows_use_keys && DsaPointerIsValid(item.build_row_first_dp) &&
+		item.build_row_first_dp != item.build_key_first_dp)
+		add_chain(item.build_row_first_dp);
+	if (index != plan.segments) elog(ERROR, "pg_yaap: sub-partition batch segment count changed");
+
+	/* Distribute the sub-partition's probe segments round-robin across p->slots
+	 * so all workers can probe the sub-partition in parallel. */
+	auto *chains = Chains(ctx, p);
+	for (uint32_t s = 0; s < p->slots; ++s)
+		chains[s * p->partitions + part] = ProbeChain{InvalidDsaPointer, 0};
+	uint32_t rr = 0;
+	for (dsa_pointer pdp = item.probe_first_dp; DsaPointerIsValid(pdp);) {
+		auto *seg = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, pdp));
+		const dsa_pointer next = seg->chain_next_dp;
+		auto &dst_chain = chains[rr * p->partitions + part];
+		seg->chain_next_dp = dst_chain.first;
+		dst_chain.first = pdp;
+		dst_chain.rows += 1;
+		rr = (rr + 1u) % p->slots;
+		pdp = next;
+	}
+	auto *pairs = Pairs(ctx, p);
+	pairs[part] = ProbePair{0, 0, 0, item.probe_rows};
+	return dp;
+}
+
+void RepartitionAndPushSubItems(ExecCtx &ctx, PhysicalHashJoinProbe &op,
+                                HashJoinSharedPayload *build, ProbePayload *p,
+                                uint32_t root_part, uint32_t new_depth,
+                                bool from_top_level, const SubPartitionItem *parent_item) {
+	if (new_depth > kMaxRepartitionDepth)
+		elog(ERROR, "pg_yaap: hash join build partition exceeds memory_limit even after max recursive repartitioning depth (%u)",
+			kMaxRepartitionDepth);
+	if (p->sub_stack_size + kRepartitionFanout > kMaxSubPartitionStack)
+		elog(ERROR, "pg_yaap: hash join recursive repartition stack overflow");
+
+	PhysicalHashJoin &join = op.join();
+	const auto *build_key_layout = static_cast<const TupleDataLayout *>(
+		dsa_get_address(ctx.dsa, join.right_key_layout_dp()));
+	const auto *build_row_layout = static_cast<const TupleDataLayout *>(
+		dsa_get_address(ctx.dsa, join.right_payload_layout_dp()));
+	const auto *probe_layout = static_cast<const TupleDataLayout *>(
+		dsa_get_address(ctx.dsa, p->layout_dp));
+	const auto *probe_key_layout = static_cast<const TupleDataLayout *>(
+		dsa_get_address(ctx.dsa, join.left_key_layout_dp()));
+	const auto *build_arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, build->segment_arena_dp);
+	const auto *probe_arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, p->arena_dp);
+
+	buffer::YaapSpillStore spill(ctx.mcxt);
+	spill.AttachSharedFileSet(&ctx.control->spill_fileset, nullptr);
+
+	auto compute_segment_rows = [](const TupleDataLayout *layout, uint32_t seg_size) -> uint32_t {
+		uint32_t rows = 8192;
+		while (rows > 1 && offsetof(TupleDataCollection, rows) +
+			static_cast<uint64_t>(rows) * layout->row_width +
+			TupleDataCollectionDefaultHeapCapacity(layout, rows) > seg_size)
+			rows /= 2;
+		return std::max<uint32_t>(1, rows);
+	};
+
+	const uint32_t build_key_seg_rows = compute_segment_rows(build_key_layout, build_arena->segment_size);
+	const uint32_t build_row_seg_rows = build->build_rows_use_keys ? build_key_seg_rows
+		: compute_segment_rows(build_row_layout, build_arena->segment_size);
+	const uint32_t probe_seg_rows = compute_segment_rows(probe_layout, probe_arena->segment_size);
+
+	auto seal_and_spill_writer = [&](buffer::YaapSegmentedTdc &writer) {
+		if (!writer.active.IsValid()) return;
+		auto *seg = buffer::YaapSharedSegmentResolve(ctx.dsa, writer.arena_dp, writer.active);
+		if (seg != nullptr &&
+			pg_atomic_read_u32(&seg->state) == static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL)) {
+			buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
+			Spill(ctx, writer.arena_dp, seg, spill);
+		}
+	};
+
+	auto append_with_spill = [&](buffer::YaapSegmentedTdc writers[kRepartitionFanout],
+	                             uint32_t sub, dsa_pointer arena_dp, dsa_pointer layout_dp,
+	                             const TupleDataLayout *layout, uint32_t seg_rows,
+	                             uint32_t heap, const char *label,
+	                             TupleDataCollection **out_tdc, uint8_t **out_row) {
+		auto &w = writers[sub];
+		if (!DsaPointerIsValid(w.arena_dp)) {
+			buffer::YaapSegmentedTdcInit(&w, arena_dp, layout_dp, ExecutionTaskSlot(ctx),
+				layout->row_width, seg_rows,
+				TupleDataCollectionDefaultHeapCapacity(layout, seg_rows),
+				build->owner_tag, label);
+		}
+		if (w.active.IsValid()) {
+			auto *seg = buffer::YaapSharedSegmentResolve(ctx.dsa, w.arena_dp, w.active);
+			if (seg != nullptr &&
+				pg_atomic_read_u32(&seg->state) == static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL)) {
+				auto *tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, seg->payload_dp));
+				if (tdc != nullptr && !TupleDataCollectionHasSpaceForAppend(tdc, heap))
+					seal_and_spill_writer(w);
+			}
+		}
+		buffer::YaapSegmentedRowHandle handle;
+		if (!buffer::YaapSegmentedTdcAppendWithHeap(ctx.dsa, Budget(ctx), &w, heap, &handle, out_tdc, out_row)) {
+			for (uint32_t k = 0; k < kRepartitionFanout; ++k)
+				seal_and_spill_writer(writers[k]);
+			while (join.EvictUnusedBuildSegment(ctx, buffer::YaapSegmentHandle{})) {}
+			if (!buffer::YaapSegmentedTdcAppendWithHeap(ctx.dsa, Budget(ctx), &w, heap, &handle, out_tdc, out_row))
+				elog(ERROR, "pg_yaap: hash join recursive repartition writer ran out of memory");
+		}
+	};
+
+	/* 1. Repartition build segments into kRepartitionFanout sub-chains. */
+	buffer::YaapSegmentedTdc key_writers[kRepartitionFanout]{};
+	buffer::YaapSegmentedTdc row_writers[kRepartitionFanout]{};
+	uint32_t sub_build_rows[kRepartitionFanout]{};
+	uint64_t total_build_rows = 0;
+
+	struct StreamingChainReader {
+		dsa_pointer next_dp = InvalidDsaPointer;
+		dsa_pointer current_dp = InvalidDsaPointer;
+		buffer::YaapSharedSegmentReadLease lease;
+		const TupleDataCollection *tdc = nullptr;
+		uint32_t row = 0;
+		uint32_t count = 0;
+	};
+	auto advance_reader = [&](StreamingChainReader &r, dsa_pointer arena_dp) -> bool {
+		while (r.row == r.count) {
+			if (r.lease.IsValid()) {
+				const auto handle = r.lease.handle;
+				buffer::YaapSharedSegmentReleaseRead(ctx.dsa, arena_dp, &r.lease);
+				Retire(ctx, arena_dp, handle);
+				r.tdc = nullptr;
+			}
+			if (!DsaPointerIsValid(r.next_dp)) return false;
+			auto *seg = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, r.next_dp));
+			r.current_dp = r.next_dp;
+			r.next_dp = seg->chain_next_dp;
+			Acquire(ctx, join, arena_dp, seg, spill, &r.lease);
+			r.tdc = static_cast<const TupleDataCollection *>(r.lease.data);
+			r.count = pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&r.tdc->row_count));
+			r.row = 0;
+		}
+		return true;
+	};
+	auto close_reader = [&](StreamingChainReader &r, dsa_pointer arena_dp) {
+		if (r.lease.IsValid()) {
+			const auto handle = r.lease.handle;
+			buffer::YaapSharedSegmentReleaseRead(ctx.dsa, arena_dp, &r.lease);
+			Retire(ctx, arena_dp, handle);
+			r.tdc = nullptr;
+		}
+	};
+
+	auto split_build_pair = [&](dsa_pointer key_first_dp, dsa_pointer row_first_dp) {
+		StreamingChainReader kr, rr;
+		kr.next_dp = key_first_dp;
+		if (!build->build_rows_use_keys) rr.next_dp = row_first_dp;
+		uint32_t checks = 0;
+		while (advance_reader(kr, build->segment_arena_dp)) {
+			if ((checks++ & 1023u) == 0) CHECK_FOR_INTERRUPTS();
+			const uint8_t *krow = TupleDataCollectionGetRowConst(kr.tdc, kr.row++);
+			const uint8_t *prow = nullptr;
+			if (!build->build_rows_use_keys) {
+				if (!advance_reader(rr, build->segment_arena_dp))
+					elog(ERROR, "pg_yaap: repartition build payload chain ended early");
+				prow = TupleDataCollectionGetRowConst(rr.tdc, rr.row++);
+			}
+			const uint64_t hash = HashGroupRow(build_key_layout, kr.tdc, krow);
+			const uint32_t sub = RepartitionSubBucket(hash, new_depth);
+			TupleDataCollection *dst_ktdc = nullptr;
+			uint8_t *dst_krow = nullptr;
+			const uint32_t kheap = RequiredHeapBytesForTdcRow(build_key_layout, krow);
+			append_with_spill(key_writers, sub, build->segment_arena_dp, join.right_key_layout_dp(),
+				build_key_layout, build_key_seg_rows, kheap, "hash join repartition build keys",
+				&dst_ktdc, &dst_krow);
+			CopyTdcRow(build_key_layout, kr.tdc, krow, dst_ktdc, dst_krow);
+			if (!build->build_rows_use_keys) {
+				TupleDataCollection *dst_rtdc = nullptr;
+				uint8_t *dst_rrow = nullptr;
+				const uint32_t rheap = RequiredHeapBytesForTdcRow(build_row_layout, prow);
+				append_with_spill(row_writers, sub, build->segment_arena_dp, join.right_payload_layout_dp(),
+					build_row_layout, build_row_seg_rows, rheap, "hash join repartition build rows",
+					&dst_rtdc, &dst_rrow);
+				CopyTdcRow(build_row_layout, rr.tdc, prow, dst_rtdc, dst_rrow);
+			}
+			++sub_build_rows[sub];
+			++total_build_rows;
+		}
+		close_reader(kr, build->segment_arena_dp);
+		if (!build->build_rows_use_keys)
+			close_reader(rr, build->segment_arena_dp);
+	};
+
+	if (from_top_level) {
+		auto *registry = static_cast<HashJoinLocalBuildRegistryEntry *>(
+			dsa_get_address(ctx.dsa, build->local_build_registry_dp));
+		for (uint32_t slot = 0; slot < build->local_state_slot_count; ++slot) {
+			if (!DsaPointerIsValid(registry[slot].partition_state_dp)) continue;
+			auto *locals = static_cast<HashJoinLocalPartitionState *>(
+				dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
+			auto &part = locals[root_part];
+			if (part.row_count == 0) continue;
+			const auto *kdesc = DsaPointerIsValid(part.build_key_segment_desc_dp)
+				? buffer::YaapSegmentedTdcResolveDesc(ctx.dsa, part.build_key_segment_desc_dp) : nullptr;
+			const auto *rdesc = (!build->build_rows_use_keys && DsaPointerIsValid(part.build_row_segment_desc_dp))
+				? buffer::YaapSegmentedTdcResolveDesc(ctx.dsa, part.build_row_segment_desc_dp) : nullptr;
+			if (kdesc != nullptr)
+				split_build_pair(kdesc->first_desc_dp, rdesc != nullptr ? rdesc->first_desc_dp : InvalidDsaPointer);
+			part.build_key_segment_desc_dp = InvalidDsaPointer;
+			part.build_row_segment_desc_dp = InvalidDsaPointer;
+			part.row_count = 0;
+		}
+	} else {
+		split_build_pair(parent_item->build_key_first_dp, parent_item->build_row_first_dp);
+	}
+
+	dsa_pointer sub_build_key_first[kRepartitionFanout]{};
+	dsa_pointer sub_build_row_first[kRepartitionFanout]{};
+	uint32_t max_sub_build_rows = 0;
+	for (uint32_t k = 0; k < kRepartitionFanout; ++k) {
+		seal_and_spill_writer(key_writers[k]);
+		if (key_writers[k].first.IsValid())
+			sub_build_key_first[k] = buffer::YaapSharedSegmentResolve(
+				ctx.dsa, key_writers[k].arena_dp, key_writers[k].first)->self_dp;
+		else
+			sub_build_key_first[k] = InvalidDsaPointer;
+		if (!build->build_rows_use_keys) {
+			seal_and_spill_writer(row_writers[k]);
+			if (row_writers[k].first.IsValid())
+				sub_build_row_first[k] = buffer::YaapSharedSegmentResolve(
+					ctx.dsa, row_writers[k].arena_dp, row_writers[k].first)->self_dp;
+			else
+				sub_build_row_first[k] = InvalidDsaPointer;
+		} else {
+			sub_build_row_first[k] = sub_build_key_first[k];
+		}
+		if (sub_build_rows[k] > max_sub_build_rows)
+			max_sub_build_rows = sub_build_rows[k];
+	}
+
+	/* Detect unbreakable skew: if all rows landed in a single sub-bucket,
+	 * further hashing cannot shrink the partition. */
+	if (total_build_rows > 0 && max_sub_build_rows == total_build_rows) {
+		for (uint32_t k = 0; k < kRepartitionFanout; ++k)
+			RetireSubPartitionBuild(ctx, build, sub_build_key_first[k], sub_build_row_first[k]);
+		elog(ERROR, "pg_yaap: hash join build partition exceeds memory_limit due to extreme key skew (%llu identical-hash rows)",
+			(unsigned long long) total_build_rows);
+	}
+
+	/* 2. Repartition probe segments into matching kRepartitionFanout sub-chains. */
+	buffer::YaapSegmentedTdc probe_writers[kRepartitionFanout]{};
+	uint64_t sub_probe_rows[kRepartitionFanout]{};
+	auto scratch_chunk = std::make_unique<PipelineChunk>();
+
+	auto split_probe_chain = [&](dsa_pointer probe_first_dp) {
+		StreamingChainReader pr;
+		pr.next_dp = probe_first_dp;
+		uint32_t checks = 0;
+		while (advance_reader(pr, p->arena_dp)) {
+			if ((checks++ & 1023u) == 0) CHECK_FOR_INTERRUPTS();
+			const uint8_t *prow = TupleDataCollectionGetRowConst(pr.tdc, pr.row++);
+			scratch_chunk->reset();
+			Gather(probe_layout, pr.tdc, prow, *scratch_chunk, 0);
+			for (uint32_t s = 0; s < 16; ++s)
+				scratch_chunk->nulls[s][0] = prow[p->null_offset + s];
+			scratch_chunk->count = 1;
+			const uint64_t hash = HashGroup(probe_key_layout, *scratch_chunk, 0);
+			const uint32_t sub = RepartitionSubBucket(hash, new_depth);
+			TupleDataCollection *dst_ptdc = nullptr;
+			uint8_t *dst_prow = nullptr;
+			const uint32_t pheap = RequiredHeapBytesForTdcRow(probe_layout, prow);
+			append_with_spill(probe_writers, sub, p->arena_dp, p->layout_dp,
+				probe_layout, probe_seg_rows, pheap, "hash join repartition probe rows",
+				&dst_ptdc, &dst_prow);
+			CopyTdcRow(probe_layout, pr.tdc, prow, dst_ptdc, dst_prow);
+			std::memcpy(dst_prow + p->null_offset, prow + p->null_offset, 16);
+			++sub_probe_rows[sub];
+		}
+		close_reader(pr, p->arena_dp);
+	};
+
+	if (from_top_level) {
+		auto *chains = Chains(ctx, p);
+		for (uint32_t s = 0; s < p->slots; ++s) {
+			auto &chain = chains[s * p->partitions + root_part];
+			if (DsaPointerIsValid(chain.first)) {
+				split_probe_chain(chain.first);
+				chain.first = InvalidDsaPointer;
+				chain.rows = 0;
+			}
+		}
+	} else {
+		if (DsaPointerIsValid(parent_item->probe_first_dp))
+			split_probe_chain(parent_item->probe_first_dp);
+	}
+
+	const bool needs_unmatched_build = HashJoinNeedsUnmatchedBuildRows(join.join_mode());
+	const bool preserves_unmatched_probe =
+		join.join_mode() == HashJoinMatchMode::LEFT ||
+		join.join_mode() == HashJoinMatchMode::ANTI ||
+		join.join_mode() == HashJoinMatchMode::MARK ||
+		join.join_mode() == HashJoinMatchMode::MARK_FILTER_NOT;
+
+	uint32_t pushed = 0;
+	for (uint32_t k = 0; k < kRepartitionFanout; ++k) {
+		seal_and_spill_writer(probe_writers[k]);
+		dsa_pointer probe_first = probe_writers[k].first.IsValid()
+			? buffer::YaapSharedSegmentResolve(ctx.dsa, probe_writers[k].arena_dp, probe_writers[k].first)->self_dp
+			: InvalidDsaPointer;
+		if (sub_build_rows[k] == 0 && !preserves_unmatched_probe) {
+			if (DsaPointerIsValid(probe_first))
+				RetireSegmentChain(ctx, p->arena_dp, probe_first);
+			RetireSubPartitionBuild(ctx, build, sub_build_key_first[k], sub_build_row_first[k]);
+			continue;
+		}
+		if (sub_probe_rows[k] == 0 && !needs_unmatched_build) {
+			RetireSubPartitionBuild(ctx, build, sub_build_key_first[k], sub_build_row_first[k]);
+			continue;
+		}
+		p->sub_stack[p->sub_stack_size++] = SubPartitionItem{
+			root_part,
+			new_depth,
+			sub_build_rows[k],
+			0,
+			sub_probe_rows[k],
+			sub_build_key_first[k],
+			sub_build_row_first[k],
+			probe_first
+		};
+		++pushed;
+	}
+	elog(DEBUG1,
+		 "pg_yaap: hash join recursive repartition part=%u depth=%u build_rows=%llu -> %u sub-partitions",
+		 root_part, new_depth, (unsigned long long) total_build_rows, pushed);
+}
+
 dsa_pointer CreateDeferredBatch(ExecCtx &ctx, PhysicalHashJoinProbe &op, ProbePayload *p) {
 	auto *build = BuildPayload(ctx, op.join());
-	const uint64_t all = p->partitions == 64 ? UINT64_MAX : (UINT64_C(1) << p->partitions) - 1;
-	const uint64_t candidates = all & ~p->completed_mask;
-	if (candidates == 0) return InvalidDsaPointer;
-	uint64_t mask = ChooseBatch(ctx, op.join(), build, candidates, AdmissionBudget(ctx, p));
-	if (mask == 0) {
-		/* Soft admission may be smaller than one partition. A single batch
-		 * may exceed soft quota, but its pinned rows+directory must fit hard. */
+	auto hard_admission_budget = [&]() -> uint64_t {
 		auto *budget = Budget(ctx);
 		const uint64_t saved = p->budget;
 		p->budget = budget->hard_limit;
-		const uint64_t hard_available = AdmissionBudget(ctx, p);
+		const uint64_t avail = AdmissionBudget(ctx, p);
 		p->budget = saved;
-		for (uint32_t part = 0; part < p->partitions; ++part) {
-			if (((candidates >> part) & 1u) &&
-				BatchFootprint(DescribeBatch(ctx, op.join(), build, UINT64_C(1) << part)) <= hard_available) {
-				mask = UINT64_C(1) << part;
-				break;
+		return avail;
+	};
+	for (;;) {
+		/* First drain any recursively repartitioned sub-partitions (DFS order). */
+		if (p->sub_stack_size > 0) {
+			SubPartitionItem item = p->sub_stack[--p->sub_stack_size];
+			const uint64_t footprint = BatchFootprint(
+				DescribeSubPartitionBatch(ctx, op.join(), build, item));
+			if (footprint > hard_admission_budget())
+				while (op.join().EvictUnusedBuildSegment(ctx, buffer::YaapSegmentHandle{})) {}
+			if (footprint <= hard_admission_budget())
+				return CreateSubPartitionBatch(ctx, op.join(), build, p, item);
+			RepartitionAndPushSubItems(ctx, op, build, p,
+				item.root_part, item.depth + 1u, false, &item);
+			continue;
+		}
+		const uint64_t all = p->partitions == 64 ? UINT64_MAX : (UINT64_C(1) << p->partitions) - 1;
+		const uint64_t candidates = all & ~p->completed_mask;
+		if (candidates == 0) return InvalidDsaPointer;
+		uint64_t mask = ChooseBatch(ctx, op.join(), build, candidates, AdmissionBudget(ctx, p));
+		if (mask == 0) {
+			while (op.join().EvictUnusedBuildSegment(ctx, buffer::YaapSegmentHandle{})) {}
+			const uint64_t hard_available = hard_admission_budget();
+			uint32_t first_candidate = UINT32_MAX;
+			for (uint32_t part = 0; part < p->partitions; ++part) {
+				if (((candidates >> part) & 1u) == 0) continue;
+				if (first_candidate == UINT32_MAX) first_candidate = part;
+				if (BatchFootprint(DescribeBatch(ctx, op.join(), build, UINT64_C(1) << part)) <= hard_available) {
+					mask = UINT64_C(1) << part;
+					break;
+				}
+			}
+			if (mask == 0) {
+				/* No remaining partition fits in memory: recursively repartition
+				 * the first oversized partition into kRepartitionFanout sub-partitions. */
+				p->completed_mask |= (UINT64_C(1) << first_candidate);
+				RepartitionAndPushSubItems(ctx, op, build, p, first_candidate, 1u, true, nullptr);
+				continue;
 			}
 		}
-		if (mask == 0)
-			elog(ERROR, "pg_yaap: no build partition fits a fully resident hash batch; recursive repartitioning required");
+		auto *pairs = Pairs(ctx, p);
+		for (uint32_t part = 0; part < p->partitions; ++part)
+			if ((mask >> part) & 1u) pairs[part].state = 0;
+		return CreateBatch(ctx, op.join(), build, mask);
 	}
-	auto *pairs = Pairs(ctx, p);
-	for (uint32_t part = 0; part < p->partitions; ++part)
-		if ((mask >> part) & 1u) pairs[part].state = 0;
-	return CreateBatch(ctx, op.join(), build, mask);
 }
 
 enum class PairClaimResult { CLAIMED, EXHAUSTED };
@@ -701,10 +1248,17 @@ void AdvanceBatch(ExecCtx &ctx, PhysicalHashJoinProbe &op, HybridProbeState &sta
 	uint32_t expected = 0;
 	if (pg_atomic_compare_exchange_u32(&batch->cleanup_state, &expected, 1)) {
 		const uint64_t mask = batch->partition_mask;
+		const bool is_sub = (batch->is_subpartition != 0);
+		const dsa_pointer sub_key_first = batch->sub_build_key_first_dp;
+		const dsa_pointer sub_row_first = batch->sub_build_row_first_dp;
 		DestroyBatch(ctx, state.active_batch_dp);
-		for (uint32_t part = 0; part < p->partitions; ++part)
-			if ((mask >> part) & 1u) op.join().ReleaseBuildPartitionAfterProbe(ctx, part);
-		p->completed_mask |= mask;
+		if (is_sub) {
+			RetireSubPartitionBuild(ctx, BuildPayload(ctx, op.join()), sub_key_first, sub_row_first);
+		} else {
+			for (uint32_t part = 0; part < p->partitions; ++part)
+				if ((mask >> part) & 1u) op.join().ReleaseBuildPartitionAfterProbe(ctx, part);
+			p->completed_mask |= mask;
+		}
 		p->current_batch_dp = CreateDeferredBatch(ctx, op, p);
 		pg_write_barrier();
 		pg_atomic_write_u32(&batch->cleanup_state, 2);
@@ -1250,7 +1804,26 @@ void PhysicalHashJoinProbe::ReleaseAfterConsumerRun(ExecCtx &ctx) {
 	if (p->hybrid && pg_atomic_read_u32(&p->abandoned) == 0 &&
 		(pg_atomic_read_u32(&p->drain_phase) != 2 || p->active_pairs != 0 || p->initial_bytes != 0))
 		elog(ERROR, "pg_yaap: hybrid hash join cleanup before complete drain");
-	DestroyBatch(ctx, p->current_batch_dp);
+	if (DsaPointerIsValid(p->current_batch_dp)) {
+		auto *cur_batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->current_batch_dp));
+		if (cur_batch != nullptr && cur_batch->charged_bytes != 0 && cur_batch->is_subpartition != 0) {
+			const dsa_pointer sk = cur_batch->sub_build_key_first_dp;
+			const dsa_pointer sr = cur_batch->sub_build_row_first_dp;
+			DestroyBatch(ctx, p->current_batch_dp);
+			if (auto *b = BuildPayload(ctx, *join_); b != nullptr)
+				RetireSubPartitionBuild(ctx, b, sk, sr);
+		} else {
+			DestroyBatch(ctx, p->current_batch_dp);
+		}
+	}
+	if (auto *b = BuildPayload(ctx, *join_); b != nullptr) {
+		while (p->sub_stack_size > 0) {
+			const auto &item = p->sub_stack[--p->sub_stack_size];
+			RetireSubPartitionBuild(ctx, b, item.build_key_first_dp, item.build_row_first_dp);
+			if (DsaPointerIsValid(item.probe_first_dp))
+				RetireSegmentChain(ctx, p->arena_dp, item.probe_first_dp);
+		}
+	}
 	/* RUN task completion releases every source lease first. On an early
 	 * downstream stop, retire the remaining probe chains as well. */
 	auto *chains = Chains(ctx, p);

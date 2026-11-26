@@ -36,6 +36,8 @@ public:
 	TupleDataCollection   *build_rows = nullptr;
 	uint32_t               local_state_slot_count = 0;
 	bool                   finalized = false;
+	dsa_pointer            runtime_filter_dp = InvalidDsaPointer;
+	HashJoinRuntimeFilter *runtime_filter = nullptr;
 };
 
 class HashJoinLocalSinkState final : public LocalSinkState {
@@ -56,6 +58,10 @@ public:
 	bool segmented_writer_initialized = false;
 	uint32_t spill_scan_ticks = 0;
 	uint64_t build_input_rows = 0;
+	int64_t  rf_min = INT64_MAX;
+	int64_t  rf_max = INT64_MIN;
+	uint64_t rf_rows = 0;
+	bool     rf_published = false;
 };
 
 class PhysicalHashJoin final : public PhysicalOperator {
@@ -213,6 +219,8 @@ public:
 	HashJoinMatchMode join_mode() const { return join_mode_; }
 	uint32_t filter_string_const_bytes() const { return filter_string_const_bytes_; }
 	dsa_pointer shared_payload_dp() const;
+	dsa_pointer runtime_filter_dp() const { return runtime_filter_dp_; }
+	void SetRuntimeFilter(dsa_pointer dp) { runtime_filter_dp_ = dp; }
 	uint16_t n_left_keys() const { return n_left_keys_; }
 	uint16_t n_right_keys() const { return n_right_keys_; }
 	uint32_t max_rows() const { return max_rows_; }
@@ -242,6 +250,7 @@ private:
 	HashJoinMatchMode join_mode_;
 	uint32_t     filter_string_const_bytes_;
 	dsa_pointer  shared_payload_dp_;
+	dsa_pointer  runtime_filter_dp_ = InvalidDsaPointer;
 	uint16_t     n_left_keys_;
 	uint16_t     n_right_keys_;
 	uint32_t     max_rows_;

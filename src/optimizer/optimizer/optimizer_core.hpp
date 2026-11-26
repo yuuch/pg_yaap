@@ -44,7 +44,8 @@ enum class OptimizerPass {
     SCAN_FILTER_FOLDING,
     REMOVE_UNUSED_COLUMNS,
     CARDINALITY_ESTIMATOR,
-    JOIN_ORDER
+    JOIN_ORDER,
+    COMMON_SUBPLAN_ELIMINATION
 };
 
 class OptimizerRule {
@@ -140,6 +141,12 @@ public:
 private:
     RelationStats Rewrite(LogicalOperator& plan);
     RelationStatisticsHelper statistics_helper_;
+};
+
+class CommonSubplanElimination : public OptimizerRule {
+public:
+    OptimizerPass Pass() const override;
+    std::unique_ptr<LogicalOperator> Optimize(std::unique_ptr<LogicalOperator> plan) override;
 };
 
 class JoinOrderOptimizer : public OptimizerRule {

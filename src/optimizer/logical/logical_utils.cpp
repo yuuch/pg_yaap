@@ -188,6 +188,17 @@ void CollectOutputTables(LogicalOperator* op, std::set<size_t>& table_indexes) {
             table_indexes.insert(delim_get->table_index.index);
             break;
         }
+        case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+            if (op->children.size() == 2) {
+                CollectOutputTables(op->children[1].get(), table_indexes);
+            }
+            return;
+        }
+        case LogicalOperatorType::LOGICAL_CTE_REF: {
+            auto* cte_ref = static_cast<LogicalCTERef*>(op);
+            table_indexes.insert(cte_ref->table_index.index);
+            break;
+        }
         default:
             for (auto& child : op->children) {
                 CollectOutputTables(child.get(), table_indexes);

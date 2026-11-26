@@ -104,6 +104,11 @@ IsScalarPhysicalNode(const PhysicalOperator *op)
 		const auto *agg = static_cast<const PhysicalHashAggregate *>(op);
 		return agg->groups.empty();
 	}
+	if (op->type == PhysicalOperatorType::MATERIALIZED_CTE &&
+		op->children.size() == 2 && op->children[1] != nullptr)
+	{
+		return IsScalarPhysicalNode(op->children[1].get());
+	}
 	if ((op->type == PhysicalOperatorType::FILTER ||
 		 op->type == PhysicalOperatorType::PROJECTION ||
 		 op->type == PhysicalOperatorType::ORDER_BY ||
@@ -716,7 +721,7 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 		InvalidDsaPointer,
 		static_cast<uint16_t>(probe_keys.size()),
 		static_cast<uint16_t>(build_keys.size()),
-		EstimateHashJoinBuildRows(swap_sides ? left_child.schema.size() : right_child.schema.size()));
+		EstimateHashJoinBuildRows(swap_sides ? left_rows : right_rows));
 	if (swap_sides)
 	{
 		join_op->AddChild(std::move(right_child.op));
@@ -726,6 +731,127 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	{
 		join_op->AddChild(std::move(left_child.op));
 		join_op->AddChild(std::move(right_child.op));
+	}
+
+	/* Push a runtime Bloom + Min/Max filter from build key #0 to the probe-side
+	 * PhysicalSeqScan whenever join semantics allow dropping unmatched probe rows. */
+	const bool runtime_filter_safe_mode =
+		join_mode == pg_yaap::pipeline::HashJoinMatchMode::INNER ||
+		join_mode == pg_yaap::pipeline::HashJoinMatchMode::SEMI ||
+		join_mode == pg_yaap::pipeline::HashJoinMatchMode::BUILD_SEMI ||
+		join_mode == pg_yaap::pipeline::HashJoinMatchMode::BUILD_ANTI;
+	if (runtime_filter_safe_mode &&
+		!probe_keys.empty() && !build_keys.empty() &&
+		probe_key_layout.column_count >= 1 && build_key_layout.column_count >= 1 &&
+		probe_key_layout.columns[0].kind == build_key_layout.columns[0].kind)
+	{
+		const ColumnSchema *probe_key_col = nullptr;
+		const ColumnSchema *build_key_col = nullptr;
+		if (LookupRawColumn(probe_keys[0], probe_cols, probe_schema, probe_key_col) &&
+			LookupRawColumn(build_keys[0], build_cols, build_schema, build_key_col) &&
+			probe_key_col != nullptr && build_key_col != nullptr &&
+			probe_key_col->decode_kind == build_key_col->decode_kind &&
+			(probe_key_col->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+			 probe_key_col->decode_kind == ColumnDecodeKind::INT32_DATE ||
+			 probe_key_col->decode_kind == ColumnDecodeKind::INT64_INT8))
+		{
+			const PhysicalOperator *opt_cur = probe_source_op;
+			PipelineOperator *pipe_cur = join_op->children()[0].get();
+			ColumnRef key_ref = probe_keys[0];
+			while (opt_cur != nullptr && pipe_cur != nullptr)
+			{
+				if (opt_cur->type == PhysicalOperatorType::TABLE_SCAN &&
+					pipe_cur->type() == pg_yaap::pipeline::PhysicalOperatorType::SEQ_SCAN)
+				{
+					const auto *opt_scan = static_cast<const PhysicalTableScan *>(opt_cur);
+					auto *pipe_scan = static_cast<PipelineSeqScan *>(pipe_cur);
+					if (pipe_scan->relid() == opt_scan->relid &&
+						key_ref.varno == static_cast<Index>(opt_scan->table_index.index + 1) &&
+						key_ref.attno >= 1)
+					{
+						dsa_pointer rf_dp = dsa_allocate_extended(
+							state->runtime_dsa,
+							sizeof(pg_yaap::pipeline::HashJoinRuntimeFilter),
+							DSA_ALLOC_ZERO | DSA_ALLOC_NO_OOM);
+						if (DsaPointerIsValid(rf_dp))
+						{
+							auto *rf = static_cast<pg_yaap::pipeline::HashJoinRuntimeFilter *>(
+								dsa_get_address(state->runtime_dsa, rf_dp));
+							SpinLockInit(&rf->mutex);
+							pg_atomic_init_u32(&rf->ready, 0);
+							rf->key_is_int64 = (probe_key_col->decode_kind == ColumnDecodeKind::INT64_INT8) ? 1 : 0;
+							rf->estimated_rows = swap_sides ? left_rows : right_rows;
+							rf->min_val = INT64_MAX;
+							rf->max_val = INT64_MIN;
+							rf->words_dp = InvalidDsaPointer;
+							pg_yaap::pipeline::SeqScanRuntimeFilterDesc desc{};
+							desc.filter_dp = rf_dp;
+							desc.attno = static_cast<uint16_t>(key_ref.attno);
+							desc.decode_kind = probe_key_col->decode_kind;
+							if (pipe_scan->AttachRuntimeFilter(desc))
+							{
+								join_op->SetRuntimeFilter(rf_dp);
+								if (pg_yaap_trace_hooks)
+									elog(LOG,
+										 "pg_yaap: attached runtime filter relid=%u attno=%u est_rows=%llu mode=%d",
+										 pipe_scan->relid(),
+										 static_cast<unsigned>(desc.attno),
+										 static_cast<unsigned long long>(rf->estimated_rows),
+										 static_cast<int>(join_mode));
+							}
+							else
+								dsa_free(state->runtime_dsa, rf_dp);
+						}
+					}
+					break;
+				}
+				if (opt_cur->type == PhysicalOperatorType::FILTER && opt_cur->children.size() == 1)
+				{
+					if (pipe_cur->type() == pg_yaap::pipeline::PhysicalOperatorType::FILTER &&
+						!pipe_cur->children().empty())
+						pipe_cur = pipe_cur->children()[0].get();
+					opt_cur = opt_cur->children[0].get();
+					continue;
+				}
+				if (opt_cur->type == PhysicalOperatorType::PROJECTION && opt_cur->children.size() == 1)
+				{
+					const auto *opt_proj = static_cast<const PhysicalProjection *>(opt_cur);
+					if (key_ref.varno == static_cast<Index>(opt_proj->table_index.index + 1))
+					{
+						if (key_ref.attno < 1 ||
+							static_cast<size_t>(key_ref.attno) > opt_proj->select_list.size())
+							break;
+						const auto *cr = dynamic_cast<const BoundColumnRefExpression *>(
+							opt_proj->select_list[static_cast<size_t>(key_ref.attno - 1)]);
+						if (cr == nullptr)
+							break;
+						key_ref = BindingToColumnRef(cr->binding);
+					}
+					if (pipe_cur->type() == pg_yaap::pipeline::PhysicalOperatorType::PROJECTION &&
+						!pipe_cur->children().empty())
+						pipe_cur = pipe_cur->children()[0].get();
+					opt_cur = opt_cur->children[0].get();
+					continue;
+				}
+				if (opt_cur->type == PhysicalOperatorType::HASH_JOIN &&
+					opt_cur->children.size() == 2 &&
+					pipe_cur->type() == pg_yaap::pipeline::PhysicalOperatorType::HASH_JOIN &&
+					pipe_cur->children().size() == 2)
+				{
+					const auto *inner_pipe_join = static_cast<const PipelineHashJoin *>(pipe_cur);
+					if (inner_pipe_join->join_mode() != pg_yaap::pipeline::HashJoinMatchMode::INNER &&
+						inner_pipe_join->join_mode() != pg_yaap::pipeline::HashJoinMatchMode::SEMI)
+						break;
+					const auto *inner_opt_join = static_cast<const PhysicalHashJoin *>(opt_cur);
+					opt_cur = inner_opt_join->build_left
+						? inner_opt_join->children[1].get()
+						: inner_opt_join->children[0].get();
+					pipe_cur = pipe_cur->children()[0].get();
+					continue;
+				}
+				break;
+			}
+		}
 	}
 
 	std::vector<ColumnRef> parent_facing_cols =

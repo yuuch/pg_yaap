@@ -289,6 +289,9 @@ std::unique_ptr<LogicalOperator> LogicalOptimizer::Optimize(std::unique_ptr<Logi
 
     RunOptimizer(OptimizerPass::CARDINALITY_ESTIMATOR, cardinality_estimator, plan);
 
+    CommonSubplanElimination common_subplan_elimination;
+    RunOptimizer(OptimizerPass::COMMON_SUBPLAN_ELIMINATION, common_subplan_elimination, plan);
+
     return plan;
 }
 

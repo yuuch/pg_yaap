@@ -557,6 +557,22 @@ std::vector<ProducedOutput> CollectProducedOutputs(LogicalOperator* input) {
             }
             break;
         }
+        case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+            if (input->children.size() == 2) {
+                return CollectProducedOutputs(input->children[1].get());
+            }
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_CTE_REF: {
+            auto* cte_ref = static_cast<LogicalCTERef*>(input);
+            for (size_t idx = 0; idx < cte_ref->output_names.size(); ++idx) {
+                outputs.push_back(MakeProducedOutput(
+                    ColumnBinding{cte_ref->table_index, ProjectionIndex{idx}},
+                    cte_ref->cte_name.empty() ? "cte" : cte_ref->cte_name,
+                    cte_ref->output_names[idx]));
+            }
+            break;
+        }
 		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 		case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
@@ -850,6 +866,17 @@ void CollectOutputTables(LogicalOperator* op, std::set<size_t>& table_indexes) {
         case LogicalOperatorType::LOGICAL_DELIM_GET: {
             auto* delim_get = static_cast<LogicalDelimGet*>(op);
             table_indexes.insert(delim_get->table_index.index);
+            break;
+        }
+        case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+            if (op->children.size() == 2) {
+                CollectOutputTables(op->children[1].get(), table_indexes);
+            }
+            return;
+        }
+        case LogicalOperatorType::LOGICAL_CTE_REF: {
+            auto* cte_ref = static_cast<LogicalCTERef*>(op);
+            table_indexes.insert(cte_ref->table_index.index);
             break;
         }
         default:
