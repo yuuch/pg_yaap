@@ -1,9 +1,7 @@
-# README.zh.md
-
-# pg_yaap — Yet Another Analytic Processing ⚡
+# pg_yaap — Yet Another Analytic Processing
 
 <p align="center">
-  <img src="imgs/logo.png" alt="pg_yaap logo" width="480" height="480"/>
+  <img src="imgs/logo.png" alt="pg_yaap logo" width="480"/>
 </p>
 
 <p align="center">
@@ -11,118 +9,93 @@
 </p>
 
 <p align="center">
-  <a href="README.md">🇺🇸 English</a>
+  <a href="https://github.com/yuuch/pg_yaap/actions/workflows/pg_yaap-ci.yml"><img src="https://github.com/yuuch/pg_yaap/actions/workflows/pg_yaap-ci.yml/badge.svg" alt="CI"/></a>
+  <a href="README.md">English</a>
   ·
-  <a href="LICENSE">📄 License</a>
+  <a href="#架构">架构</a>
   ·
-  <a href="#快速开始-">🚀 快速开始</a>
+  <a href="#tpc-h-基准快照">TPC-H Benchmark</a>
   ·
-  <a href="#架构-">🏗️ 架构</a>
+  <a href="#构建">构建</a>
   ·
-  <a href="#tpc-h-快照-">📊 Benchmark</a>
+  <a href="#快速开始">快速开始</a>
+  ·
+  <a href="#相关文档">文档</a>
+  ·
+  <a href="LICENSE">License</a>
 </p>
 
+---
+
+## 概览
+
+`pg_yaap` 是一个 PostgreSQL 扩展。它在不 fork PostgreSQL 内核的前提下，为支持的分析型查询接入一套独立的 C++ 优化器与向量化列式执行引擎。
+
+PostgreSQL 依然是数据库主体，继续负责：
+- SQL 解析、Catalog 元数据与事务 / MVCC 语义
+- 存储引擎、Buffer Manager 与 `ReadStream` I/O
+- 客户端连接协议与结果返回接口
+
+`pg_yaap` 接管分析型查询的核心热路径：
+- **YAAP 自有优化器**：参考 DuckDB 的逻辑规划、子查询去相关（decorrelation）、CSE/CTE 复用、谓词下推以及基于 DP 的 Join 重排序。
+- **列式执行引擎**：以固定大小的 `DataChunk` 批次为单位执行与表达式求值，替代传统的逐 tuple 火山模型。
+- **LLVM JIT 元组解码**：可选通过 LLVM JIT 将 PostgreSQL 堆元组直接解码为列式内存布局（`pg_yaap.jit_deform`）。
+- **基于 Event DAG 的并行 Pipeline**：多后台进程（bgworker）协同执行，支持自适应 radix 分区 Hybrid Hash Join、Runtime Bloom Filter 下推、Hash / Perfect-Hash 聚合以及有界内存落盘（spill-to-disk）。
+- **内建执行追踪**：支持轻量化导出 Perfetto / Chrome Trace JSON（`pg_yaap.trace_enabled`），无需系统级 root/dtrace/perf 权限即可定位多进程瓶颈。
+- **不做静默 fallback**：YAAP 一旦声明接管查询，就会完整执行或明确报错暴露问题，不会用静默回退掩盖正确性或性能缺陷。
 
 ---
 
-## pg_yaap 是什么？🚀
-
-`pg_yaap` 是一个 PostgreSQL 扩展。它会在支持的分析型查询上，接管 PostgreSQL 原本的 planner / executor 路径，改用 YAAP 自己的优化器和 C++ 列式执行引擎。
-
-重点是：**YAAP 并不是要替换整个 PostgreSQL。**
-
-PostgreSQL 仍然负责那些“不酷但极其重要”的数据库能力：
-
-* 🧾 SQL 解析
-* 🗂️ catalog 访问
-* 💾 存储
-* 🔒 事务
-* 🌐 协议和结果返回
-* 🧩 其他数据库服务端运行时
-
-YAAP 接管的是分析型查询的热点路径：
-
-* 🧠 逻辑计划
-* 🛠️ 物理计划
-* 📦 向量化 / 列式执行
-* 🧵 并行 pipeline 执行
-
-简单说：PostgreSQL 还是数据库主体，YAAP 给部分 OLAP 查询换上一条更现代的执行路径。
-
----
-
-## 为什么做 pg_yaap？⚡
-
-PostgreSQL 是非常优秀的通用数据库，但分析型查询通常需要一种和传统 tuple-at-a-time 执行器完全不同的执行模型。
-
-`pg_yaap` 探索的是这条路线，但不把 PostgreSQL 做成 fork：
-
-* 🐘 保留 PostgreSQL parser、catalog、storage 和事务语义
-* 🧠 对支持的分析型查询使用 YAAP 自己的优化器
-* 📦 用 columnar batch 处理数据，而不是逐 tuple 执行
-* 🏗️ 用 pipeline 组织执行，并显式处理 pipeline breaker
-* 🔥 YAAP 一旦接管查询，就不做静默 fallback，而是明确成功或失败
-
-没有魔法。没有偷偷 fallback。YAAP 接管了查询，就由 YAAP 对结果负责。
-
----
-
-## 核心想法 🧠
-
-* **YAAP 自有优化器**
-  支持的分析型查询会进入 YAAP 的逻辑和物理优化器。
-
-* **列式执行引擎**
-  执行阶段以 batch / DataChunk 为核心，而不是 PostgreSQL 原生的逐 tuple 执行模型。
-
-* **Pipeline 执行模型**
-  使用 pipeline 组织算子执行，并显式处理 join、aggregation、sort 等 pipeline breaker。
-
-* **PostgreSQL 原生接入**
-  通过 PostgreSQL hook 接入，最终仍然通过 PostgreSQL 正常的 tuple 接口返回结果。
-
-* **不做静默 fallback**
-  YAAP 一旦声明接管某个查询，就应该由 YAAP 执行；不支持或执行失败时明确暴露问题。
-
----
-
-## 架构 🏗️
+## 架构
 
 ![YAAP 架构](imgs/arch.png)
 
-高层说明：
+1. `planner_hook` 将支持的 `Query` 树转换为 YAAP 的逻辑与物理计划（`PhysicalOperator`）。
+2. `ExecutorStart` 与 `ExecutorRun` 通过桥接层将已接管的物理计划下发至并行 pipeline 运行时。
+3. Leader 与多个后台 worker 按 Event DAG 调度并执行列式 `DataChunk` 数据流。
+4. 最终结果转换回 PostgreSQL 标准的 `TupleTableSlot` 并返回给客户端。
 
-高层说明：
-
-1. `planner_hook` 将被接受的查询路由到 YAAP 的逻辑与物理规划器，生成 YAAP 的物理计划（PhysicalOperator）。
-2. 在 `ExecutorStart`/`ExecutorRun` 阶段，已被 YAAP 接管的查询由桥接层交给 YAAP 运行时执行。
-3. YAAP 运行时以列式数据块（DataChunk）为单位，通过并行 pipeline 执行，并通过 PostgreSQL 的常规 tuple 接口将结果返回给客户端。
-
-4. 结果再转换回 PostgreSQL 正常的 tuple 接口返回。
-
-任务调度、共享状态归属、进程间同步及当前限制见 [Pipeline 运行时与进程通信](docs/pipeline_runtime.md)。
+任务调度、共享状态归属、进程间同步及当前限制详见 [docs/pipeline_runtime.md](docs/pipeline_runtime.md)。
 
 ---
 
-## TPC-H 快照 📊
+## TPC-H 基准快照
 
-![TPC-H median runtime chart](imgs/comparison.svg)
+以下快照测试运行于 **Apple M4 Pro（24 GB 内存）**，`pg_yaap` 配置为 `shared_buffers=4GB`、12 workers、`pg_yaap.memory_limit=8GB`，并与基线下的原生 PostgreSQL 及 `pg_duckdb` 对比：
 
-> 最新 `pg_yaap` SF10 快照（Apple M4 Pro / 24GB，`shared_buffers=4GB`，`pg_yaap.memory_limit=8GB`，12 workers）：22/22 查询 SQL 总耗时 **20.5s**（墙钟 **21.4s**，此前为 30.8s；对照基线 PostgreSQL `447.9s`、`pg_duckdb` `95.8s`）。Benchmark 结果会受到硬件、PostgreSQL 配置、数据规模、查询覆盖范围、YAAP 支持程度等因素影响，这里的图表是当前阶段的性能快照，不代表所有环境下的通用结论。
+| 数据规模 | 引擎 | 通过 / 总数 | SQL 耗时 | 墙钟耗时 | 备注与配置 |
+|---|---|---|---|---|---|
+| **SF10** | `pg_yaap` | **22 / 22** | **20.5 s** | **21.4 s** | `shared_buffers=4GB`，12 workers，`memory_limit=8GB` |
+| **SF10** | `pg_duckdb` | 22 / 22 | 95.8 s | — | 基线对比测试 |
+| **SF10** | PostgreSQL | 22 / 22 | 447.9 s | — | 基线对比测试 |
+| **SF100** | `pg_yaap` | **22 / 22** | **414.5 s** | **425.3 s** | `shared_buffers=4GB`，12 workers，`memory_limit=8GB`，0 超时 |
+| **SF100** | PostgreSQL | 18 / 22 | 3,302.0 s | — | `shared_buffers=2GB` 基线；4 条超时（每条按 600 s 计） |
+| **SF100** | `pg_duckdb` | 18 / 22 | 3,346.6 s | — | `shared_buffers=2GB` 基线，默认 4 GiB 内存；4 条超时（每条 600 s） |
 
-### SF100（100GB）
+### SF10（10 GB）
 
-![TPC-H SF100 对比图](imgs/comparison-sf100.svg)
+![TPC-H SF10 耗时对比](imgs/comparison.svg)
 
-本快照基于 `tpch100g` 数据库（磁盘占用约 125GB），运行于 24GB 内存的 M4 Pro。最新 `pg_yaap` 结果（`shared_buffers=4GB`、12 workers、`pg_yaap.memory_limit=8GB`）在 **22/22** 查询上全部通过、0 超时，SQL 总耗时 **414.5s**（墙钟 **425.3s**，较此前 `619.5s` 提速 1.49×）；PostgreSQL 原生（`3,302.0s`，18/22 通过、4 超时）与 `pg_duckdb`（`3,346.6s`，18/22 通过、4 超时，默认 4GiB 内存与扫描并行度）来自 `shared_buffers=2GB` 基线测试，总耗时中每个 timeout 按 600 秒计。
+### SF100（100 GB）
 
-**正确性注意：**SF100 Q1 的 `N|O` 组 `sum_charge` 不一致：YAAP 返回负数，而 PostgreSQL 和 pg_duckdb 返回正数。图表比较的是耗时，不代表结果一致。
+![TPC-H SF100 耗时对比](imgs/comparison-sf100.svg)
+
+测试机上的 `tpch100g` 数据库磁盘占用约 125 GB。以上数据仅作为当前阶段在特定硬件与配置下的性能快照。
+
+> **正确性说明：**在 SF100 Q1 中，YAAP 输出的 `N|O` 分组 `sum_charge` 与 PostgreSQL 和 `pg_duckdb` 不一致（YAAP 因定标整数溢出返回负数，另外两者返回正数）。图表仅比较查询耗时，不代表该查询数值结果完全一致。
 
 ---
 
-## 构建 🔧
+## 构建
 
-### Meson
+### 环境要求
+
+- **PostgreSQL 18.x** 开发环境（`pg_config` 在 `PATH` 中或显式指定；建议 PostgreSQL 启用 `-Dllvm=enabled` 以开启 JIT 解码）
+- **C++17** 编译器（Clang 或 GCC）
+- **Meson** 与 **Ninja**
+- 与 PostgreSQL 对应的 **LLVM** 工具链（可选，当 PostgreSQL 启用 `USE_LLVM` 时自动启用）
+
+### 使用 Meson 构建
 
 ```bash
 meson setup build -Dpg_config=/path/to/pg_config -Dbuildtype=release
@@ -130,40 +103,33 @@ meson compile -C build
 meson install -C build
 ```
 
-需要在离线 Linux 从 PostgreSQL 源码开始构建时，可制作只包含源码（不含 Git 历史、构建产物和数据）的 tar 包，再在目标机一键构建 PostgreSQL 与扩展：
+### 辅助脚本与离线 Linux 构建
+
+`scripts/` 目录提供了扩展安装以及全量离线源码打包构建脚本：
 
 ```bash
+# 针对已有 pg_config 一键构建并安装扩展
+./scripts/build_install.sh --pg-config /path/to/pg_config
+
+# 制作仅包含源码（PostgreSQL + pg_yaap）的离线包，并在目标机器构建
 ./scripts/make_offline_bundle.sh --output /path/to/pg_yaap-offline.tar.gz
-# 解包后：
 ./pg_yaap/scripts/build_postgres_and_yaap.sh --prefix "$HOME/pgsql-yaap"
 ```
 
-只构建扩展或了解离线依赖、LLVM/PostgreSQL 要求和运行配置，见[离线构建与安装指南](docs/offline-linux-build.md)：
-
-```bash
-./scripts/build_install.sh --pg-config /path/to/pg_config
-```
-
-### PGXS / Makefile
-
-```bash
-make PG_CONFIG=/path/to/pg_config
-make PG_CONFIG=/path/to/pg_config install
-```
+离线环境依赖、LLVM 与 PostgreSQL 构建说明详见 [docs/offline-linux-build.md](docs/offline-linux-build.md)。
 
 ---
 
-## 快速开始 🧪
+## 快速开始
+
+在会话中加载扩展（或将 `pg_yaap` 加入 `shared_preload_libraries`）：
 
 ```sql
 LOAD 'pg_yaap';
 SET pg_yaap.enabled = on;
 SET pg_yaap.parallel = on;
-```
+SET pg_yaap.parallel_max_workers = 4;
 
-之后像平常一样在 PostgreSQL 里执行 YAAP 当前支持的分析型 SQL。
-
-```sql
 SELECT
     l_returnflag,
     l_linestatus,
@@ -174,39 +140,82 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
 ```
 
----
+### 常用配置项（GUCs）
 
-## 当前定位 🚧
-
-`pg_yaap` 主要面向分析型查询处理，不是为了替代 PostgreSQL 成为一个新的通用数据库内核。
-
-适合：
-
-* ✅ scan-heavy 的 OLAP 查询
-* ✅ TPC-H 风格分析型负载
-* ✅ PostgreSQL 内部的现代优化器 / 执行器实验
-* ✅ 列式、向量化、pipeline 执行模型研究
-* ✅ pipeline 和并行执行研究
-
-不追求：
-
-* ❌ 替换 PostgreSQL 存储引擎
-* ❌ 替换 PostgreSQL parser 或 catalog
-* ❌ 做一个通用 PostgreSQL fork
-* ❌ 用静默 fallback 掩盖不支持的执行路径
-* ❌ 通用 OLTP 加速
+| 参数名 | 默认值 | 说明 |
+|---|---|---|
+| `pg_yaap.enabled` | `on` | 接管 planner / executor hook 的总开关 |
+| `pg_yaap.parallel` | `on` | 开启并行 pipeline 执行路径 |
+| `pg_yaap.parallel_max_workers` | `4` | 单查询最大后台 worker 数（`0`–`1024`） |
+| `pg_yaap.parallel_min_relation_blocks` | `1024` | 启用并行执行所需的最小表块数阈值 |
+| `pg_yaap.jit_deform` | `on` | 开启 LLVM JIT 元组解码 |
+| `pg_yaap.hash_join_partition_probe` | `on` | 开启按分区对执行的 Hybrid Hash Join |
+| `pg_yaap.memory_limit` | `256MB` | pipeline breaker 共享内存硬预算（`>= 64MB`） |
+| `pg_yaap.memory_soft_limit` | `-1` | 触发算子落盘的软阈值 MB（`-1` 为硬上限的 75%） |
+| `pg_yaap.dsa_memory_limit` | `-1` | 查询 DSA 段总容量上限 MB（`-1` 为自动预留元数据余量） |
+| `pg_yaap.trace_enabled` | `off` | 开启轻量级每进程 Execution Trace 记录 |
+| `pg_yaap.trace_output_dir` | `""` | 导出 Perfetto JSON 的服务端绝对目录（仅超级用户可设） |
 
 ---
 
-## 致谢 🙏
+## 测试
 
-感谢 PostgreSQL 项目提供的 hook 架构、扩展生态和长期积累的数据库工程基础。
+### C++ 单元测试
 
-感谢 DuckDB 在优化器结构、向量化执行和列式分析处理方面带来的启发。
+```bash
+meson test -C build --print-errorlogs
+```
+
+### Python 集成测试
+
+`tests/` 下的集成测试仅依赖 Python 标准库和 `psql`。运行前请先启动 PostgreSQL（因为用例会测到 12 workers，启动时建议配置 `-c max_worker_processes=32 -c max_parallel_workers=12`）：
+
+```bash
+export PSQL=/path/to/psql
+export YAAP_LIBRARY=/path/to/pg_yaap.so   # macOS 下为 .dylib
+export PGHOST=/tmp PGPORT=55432 PGUSER=postgres PGDATABASE=postgres
+
+python3 tests/hybrid_hash_join.py
+python3 tests/right_outer_hash_join.py
+python3 tests/memory_runtime.py
+python3 tests/pipeline_scheduling.py
+python3 tests/pipeline_stage_plans.py
+python3 tests/execution_trace.py --abnormal
+```
 
 ---
 
-## License 📄
+## 项目定位
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+**适合的场景：**
+- 重扫描（scan-heavy）的 OLAP 查询与 TPC-H 风格分析型负载
+- PostgreSQL 内部的现代优化器、列式向量化与并行 pipeline 执行实验
 
+**不追求的目标：**
+- 替换 PostgreSQL 存储引擎、parser、catalog 或事务体系
+- 维护一个独立的 PostgreSQL fork
+- 通用 OLTP 场景加速
+- 用静默 fallback 掩盖不支持的执行路径
+
+---
+
+## 相关文档
+
+- [Pipeline 运行时与进程通信](docs/pipeline_runtime.md)
+- [Execution Trace（Layer 1 Perfetto 导出）](docs/execution_trace.md)
+- [Hybrid Radix Hash Join](docs/hybrid_hash_join.md) 与 [分区对 Probe](docs/hash_join_partition_probe.md)
+- [DSA 内存上限语义](docs/dsa_memory_limits.md)
+- [Physical SeqScan ReadStream](docs/yaap_read_stream.md)
+- [离线 Linux 构建指南](docs/offline-linux-build.md)
+
+---
+
+## 致谢
+
+感谢 PostgreSQL 社区提供的 hook 架构、扩展生态和长期沉淀的数据库工程基础，也感谢 DuckDB 在优化器架构、向量化执行与列式分析处理上带来的灵感。
+
+---
+
+## License
+
+Apache License 2.0 — 详见 [LICENSE](LICENSE)。
