@@ -23,6 +23,7 @@ namespace pipeline {
 enum class PhysicalOperatorType : uint8_t {
 	SEQ_SCAN,
 	DELIM_SCAN,
+	MATERIALIZE,
 	HASH_AGGREGATE,
 	PERFECT_HASH_AGGREGATE,
 	HASH_JOIN,
@@ -32,6 +33,7 @@ enum class PhysicalOperatorType : uint8_t {
 	OUTPUT,
 	FILTER,
 	PROJECTION,
+	HASH_JOIN_PROBE,
 };
 
 class MetaPipeline;
@@ -96,12 +98,28 @@ public:
 		(void) ctx; (void) input;
 		return SinkCombineResultType::FINISHED;
 	}
+	/* Complete the RUN's process-private sink writers before publishing task
+	 * completion. Later COMBINE tasks must depend only on shared payloads. */
+	virtual SinkCombineResultType FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input) {
+		(void) ctx; (void) input;
+		return SinkCombineResultType::FINISHED;
+	}
 	virtual SinkFinalizeType Finalize(ExecCtx &ctx, GlobalSinkState &gstate) {
 		(void) ctx; (void) gstate;
 		return SinkFinalizeType::READY;
 	}
+	/* Operators own their stage partitioning and memory-concurrency policy.
+	 * The scheduler expands this plan into freely claimable shared tasks. */
+	virtual SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const {
+		(void) ctx;
+		return {run_tasks, run_tasks, false};
+	}
+	virtual SinkTaskPlan GetFinalizeTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const {
+		(void) ctx; (void) run_tasks;
+		return {1, 1, false};
+	}
+
 	virtual bool CombineIsTrivial() const { return false; }
-	virtual bool FinalizeIsTrivial() const { return false; }
 
 	/* Worker count hint for the scheduler. Single-threaded ops return 1. */
 	virtual int MaxThreads(ExecCtx &ctx) const {

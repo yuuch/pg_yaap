@@ -7,3 +7,8 @@
 *.o
 *.so
 *.swp
+.omx/
+
+# Local profiling runs and Python bytecode
+/artifacts/
+__pycache__/

@@ -1,5 +1,6 @@
 #include "parallel/pipeline/physical_seq_scan.hpp"
-#include "parallel/pipeline/pipeline_profile.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
 
 extern "C" {
 #include "access/heapam.h"
@@ -7,6 +8,7 @@ extern "C" {
 #include "access/tableam.h"
 #include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
+#include "executor/instrument.h"
 #include "fmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
@@ -58,6 +60,15 @@ SeqScanTraceEnabled(const ExecCtx &ctx)
 {
 	return ctx.control != nullptr &&
 		pg_atomic_read_u32(&ctx.control->trace_execution_path) != 0;
+}
+
+static inline bool
+SeqScanJitDeformEnabled(const ExecCtx &ctx)
+{
+	/* The session GUC is not propagated to PostgreSQL bgworker processes. */
+	return ctx.control != nullptr
+		? ctx.control->jit_deform != 0
+		: pg_yaap_jit_deform;
 }
 
 static void
@@ -172,13 +183,13 @@ ResolveFilterSteps(dsa_area *dsa, dsa_pointer dp)
 }
 
 static uint32
-ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
+ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared, const ExecCtx &ctx)
 {
 	if (shared == nullptr || shared->total_blocks == 0)
 		return 1;
 
 	uint32 want = (uint32) std::min<uint64>(shared->total_blocks, (uint64) UINT32_MAX);
-	return (uint32) std::max(1, std::min(pg_yaap_parallel_max_workers, (int) want));
+	return (uint32) std::max(1, std::min(static_cast<int>(ExecutionWorkerCount(ctx)), (int) want));
 }
 
 /*
@@ -764,7 +775,7 @@ ReleaseSeqScanPage(SeqScanLocalState &local)
 }
 
 static bool
-LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
+LoadNextSeqScanPage(SeqScanLocalState& local, ExecCtx& ctx)
 {
 	Assert(local.scan_desc != nullptr);
 	Assert(local.read_stream != nullptr);
@@ -774,20 +785,7 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 		return false;
 	local.scan_desc->rs_dir = ForwardScanDirection;
 
-	const bool profile_on = PipelineProfileEnabled(ctx);
-	instr_time load_start;
-	if (profile_on)
-		INSTR_TIME_SET_CURRENT(load_start);
 	local.scan_desc->rs_cbuf = read_stream_next_buffer(local.read_stream, NULL);
-	if (profile_on)
-	{
-		instr_time load_end;
-		INSTR_TIME_SET_CURRENT(load_end);
-		PipelineProfileAddDiff(ctx,
-			PipelineProfileStage::SCAN_LOAD_PAGE,
-			load_end,
-			load_start);
-	}
 
 	if (!BufferIsValid(local.scan_desc->rs_cbuf))
 	{
@@ -799,9 +797,6 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 
 	local.scan_desc->rs_cblock = BufferGetBlockNumber(local.scan_desc->rs_cbuf);
 
-	instr_time prepare_start;
-	if (profile_on)
-		INSTR_TIME_SET_CURRENT(prepare_start);
 	{
 		HeapScanDesc scan = local.scan_desc;
 		Buffer buffer = scan->rs_cbuf;
@@ -858,16 +853,6 @@ LoadNextSeqScanPage(SeqScanLocalState &local, ExecCtx &ctx)
 																 lines);
 		}
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	}
-	if (profile_on)
-	{
-		instr_time prepare_end;
-		INSTR_TIME_SET_CURRENT(prepare_end);
-		PipelineProfileAddDiff(ctx,
-			PipelineProfileStage::SCAN_PREPARE_PAGE,
-			prepare_end,
-			prepare_start,
-			local.scan_desc->rs_ntuples);
 	}
 	local.page_visible_index = 0;
 	return true;
@@ -933,22 +918,12 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 	state->dsa = ctx.dsa;
 	state->desc = desc_;
 
-	/*
-	 * Bug B fix — mirror HashAgg pattern (physical_hash_aggregate.cpp:94-129).
-	 *
-	 * SeqScan ctor receives shared_payload_dp = InvalidDsaPointer from the
-	 * translator. The leader must self-allocate the SeqScanSharedPayload in
-	 * DSA (one per relation, contains the morsel cursor) and publish it back
-	 * through StoreSharedPayloadOnDescriptor so worker pipelines can resolve
-	 * it via LoadSharedPayloadFromDescriptor. PipelineRunEvent::Schedule
-	 * pre-invokes this on the leader before EnqueueTasks (DuckDB-faithful
-	 * Pipeline::ResetSource), so when workers later call this method the
-	 * descriptor is already populated.
-	 */
+	/* Activation publishes the shared block cursor before any RUN task
+	 * attaches its own scan and stream state. */
 	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_) ? shared_payload_dp_ :
 		LoadSharedPayloadFromDescriptor(this);
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		Relation rel = relation_open(relid_, AccessShareLock);
 		BlockNumber total = RelationGetNumberOfBlocks(rel);
@@ -963,7 +938,9 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 	}
 
 	state->shared = ResolveSeqScanPayload(ctx, state->shared_payload_dp);
-	state->max_threads = ComputeMaxThreadsFromPayload(state->shared);
+	if (state->shared == nullptr)
+		elog(ERROR, "pg_yaap: seq scan shared payload not initialized");
+	state->max_threads = ComputeMaxThreadsFromPayload(state->shared, ctx);
 	return state;
 }
 
@@ -973,8 +950,6 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 	auto &global = static_cast<SeqScanGlobalState &>(gstate);
 	std::unique_ptr<SeqScanLocalState> local = std::make_unique<SeqScanLocalState>();
 
-	(void) ctx;
-
 	local->rel = relation_open(relid_, AccessShareLock);
 	local->scan_tupdesc = RelationGetDescr(local->rel);
 	local->scan_desc = (HeapScanDesc) heap_beginscan(local->rel,
@@ -982,13 +957,11 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		0,
 		nullptr,
 		global.shared != nullptr ? (ParallelTableScanDesc) &global.shared->pbscan : nullptr,
-		SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_PAGEMODE);
+		SO_TYPE_SEQSCAN | SO_ALLOW_PAGEMODE | SO_ALLOW_STRAT);
 	if (local->scan_desc->rs_base.rs_parallel != nullptr)
-		InstallAggressiveParallelSeqScanReadStream(local->scan_desc,
-		                                           local->rel,
-		                                           local->read_stream_state,
-		                                           ctx.worker_index,
-		                                           SeqScanTraceEnabled(ctx));
+		InstallParallelSeqScanReadStream(local->scan_desc, local->rel,
+			local->read_stream_state, ctx.worker_index,
+			ExecutionWorkerCount(ctx), SeqScanTraceEnabled(ctx));
 	local->read_stream = local->scan_desc->rs_read_stream;
 	if (local->read_stream == nullptr)
 		elog(ERROR, "pg_yaap: SeqScan failed to initialize read stream");
@@ -1046,8 +1019,52 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			                   n_filter_steps_,
 			                   &local.simple_filter_step_cache);
 		}
+		local.n_active_runtime_filters = 0;
+		local.runtime_filter_empty_shortcircuit = false;
+		for (uint8_t rfi = 0; rfi < n_runtime_filters_ && rfi < MAX_SEQ_SCAN_RUNTIME_FILTERS; ++rfi)
+		{
+			const auto &rf_desc = runtime_filters_[rfi];
+			if (!DsaPointerIsValid(rf_desc.filter_dp))
+				continue;
+			const auto *rf = static_cast<const HashJoinRuntimeFilter *>(
+				dsa_get_address(global.dsa, rf_desc.filter_dp));
+			if (rf == nullptr || pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&rf->ready)) == 0)
+				continue;
+			pg_read_barrier();
+			if (rf->empty_build != 0)
+			{
+				local.runtime_filter_empty_shortcircuit = true;
+				local.exhausted = true;
+				break;
+			}
+			if (rf->bloom_usable == 0 && rf->has_minmax == 0)
+				continue;
+			if (rf_desc.attno < 1 || rf_desc.attno > local.scan_tupdesc->natts)
+				continue;
+			Form_pg_attribute attr = TupleDescAttr(local.scan_tupdesc, rf_desc.attno - 1);
+			if (attr->attisdropped)
+				continue;
+			CompactAttribute *cattr = TupleDescCompactAttr(local.scan_tupdesc, rf_desc.attno - 1);
+			auto &af = local.active_runtime_filters[local.n_active_runtime_filters++];
+			af.attno = rf_desc.attno;
+			af.is_int64 = (rf_desc.decode_kind == ColumnDecodeKind::INT64_INT8);
+			const int16 expected_len = af.is_int64 ? 8 : 4;
+			af.attcacheoff = (cattr->attbyval && cattr->attlen == expected_len && cattr->attcacheoff >= 0)
+				? cattr->attcacheoff
+				: -1;
+			af.min_val = rf->min_val;
+			af.max_val = rf->max_val;
+			af.has_minmax = (rf->has_minmax != 0);
+			af.bloom_usable = (rf->bloom_usable != 0 && DsaPointerIsValid(rf->words_dp));
+			af.words = af.bloom_usable
+				? static_cast<const pg_atomic_uint64 *>(dsa_get_address(global.dsa, rf->words_dp))
+				: nullptr;
+			af.word_mask = rf->word_mask;
+		}
 		local.descriptor_cache_ready = true;
 	}
+	if (local.runtime_filter_empty_shortcircuit)
+		return SourceResultType::FINISHED;
 
 	SchemaDescriptor *out_schema = local.out_schema_cache;
 	FilterInputDesc *filter_inputs = local.filter_inputs_cache;
@@ -1081,7 +1098,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			const bool allow_proj_worker_jit =
 				!pg_yaap_disable_jit_for_parallel_worker ||
 				ctx.worker_index == LEADER_WORKER_INDEX;
-			if (pg_yaap_jit_deform && allow_proj_worker_jit)
+			if (SeqScanJitDeformEnabled(ctx) && allow_proj_worker_jit)
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1103,7 +1120,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 						(err != nullptr && err[0] != '\0') ?
 						err : "compile returned false without failure reason";
 			}
-			else if (!pg_yaap_jit_deform)
+			else if (!SeqScanJitDeformEnabled(ctx))
 				proj_jit_reason = "disabled by pg_yaap.jit_deform";
 			else
 				proj_jit_reason = "disabled for parallel worker";
@@ -1143,7 +1160,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			const bool allow_filter_worker_jit =
 				!pg_yaap_disable_jit_for_parallel_worker ||
 				ctx.worker_index == LEADER_WORKER_INDEX;
-			if (pg_yaap_jit_deform && allow_filter_worker_jit)
+			if (SeqScanJitDeformEnabled(ctx) && allow_filter_worker_jit)
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1165,7 +1182,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 						(err != nullptr && err[0] != '\0') ?
 						err : "compile returned false without failure reason";
 			}
-			else if (!pg_yaap_jit_deform)
+			else if (!SeqScanJitDeformEnabled(ctx))
 				filter_jit_reason = "disabled by pg_yaap.jit_deform";
 			else
 				filter_jit_reason = "disabled for parallel worker";
@@ -1190,7 +1207,6 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	DeformBindings proj_bindings;
 	BuildDeformBindings(out_schema, out, proj_bindings);
 	const bool use_simple_filter = has_filter && simple_filter_step != nullptr;
-	const bool profile_on = PipelineProfileEnabled(ctx);
 
 	uint32_t tuple_checks = 0;
 	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
@@ -1206,10 +1222,6 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			break;
 		}
 
-		instr_time tuple_iter_start;
-		if (profile_on)
-			INSTR_TIME_SET_CURRENT(tuple_iter_start);
-
 		OffsetNumber offnum = local.scan_desc->rs_vistuples[local.page_visible_index++];
 		Page page = BufferGetPage(local.scan_desc->rs_cbuf);
 		ItemId lpp = PageGetItemId(page, offnum);
@@ -1219,19 +1231,67 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		tuple.t_tableOid = RelationGetRelid(local.scan_desc->rs_base.rs_rd);
 		ItemPointerSet(&(tuple.t_self), local.scan_desc->rs_cblock, offnum);
 
-		if (profile_on)
-		{
-			instr_time tuple_iter_end;
-			INSTR_TIME_SET_CURRENT(tuple_iter_end);
-			PipelineProfileAddDiff(ctx,
-				PipelineProfileStage::SCAN_VISIBLE_TUPLE,
-				tuple_iter_end,
-				tuple_iter_start,
-				1);
-		}
-
 		if (tuple.t_data == nullptr)
 			continue;
+
+		/* Runtime HashJoin Bloom + Min/Max filter pushdown: reject non-matching
+		 * probe keys using a single fixed-offset tuple read before running
+		 * filter_deformer, proj_deformer, or downstream hash-join probes. */
+		if (local.n_active_runtime_filters > 0)
+		{
+			const bool has_nulls = (tuple.t_data->t_infomask & HEAP_HASNULL) != 0;
+			const uint32_t tup_natts = HeapTupleHeaderGetNatts(tuple.t_data);
+			const char *tup_base = reinterpret_cast<const char *>(tuple.t_data) + tuple.t_data->t_hoff;
+			bool rf_pass = true;
+			for (uint8_t rfi = 0; rfi < local.n_active_runtime_filters; ++rfi)
+			{
+				const auto &af = local.active_runtime_filters[rfi];
+				int64_t key_val = 0;
+				if (likely(!has_nulls && af.attcacheoff >= 0 && af.attno <= tup_natts))
+				{
+					if (af.is_int64)
+					{
+						std::memcpy(&key_val, tup_base + af.attcacheoff, sizeof(int64_t));
+					}
+					else
+					{
+						int32_t v32;
+						std::memcpy(&v32, tup_base + af.attcacheoff, sizeof(int32_t));
+						key_val = static_cast<int64_t>(v32);
+					}
+				}
+				else
+				{
+					bool isnull = false;
+					Datum d = heap_getattr(&tuple, af.attno, local.scan_tupdesc, &isnull);
+					if (isnull)
+					{
+						rf_pass = false;
+						break;
+					}
+					key_val = af.is_int64 ? DatumGetInt64(d) : static_cast<int64_t>(DatumGetInt32(d));
+				}
+				if (af.has_minmax && (key_val < af.min_val || key_val > af.max_val))
+				{
+					rf_pass = false;
+					break;
+				}
+				if (af.bloom_usable)
+				{
+					const uint64_t h = RuntimeFilterHashKey(key_val);
+					const uint32_t idx = static_cast<uint32_t>(h >> 32) & af.word_mask;
+					const uint64_t mask = RuntimeFilterWordMask(h);
+					const uint64_t word = *reinterpret_cast<const uint64_t *>(&af.words[idx]);
+					if ((word & mask) != mask)
+					{
+						rf_pass = false;
+						break;
+					}
+				}
+			}
+			if (!rf_pass)
+				continue;
+		}
 
 		/* B.1 Option C: deform filter cols first (1-row scratch at row 0),
 		 * evaluate predicate inline; only on survival do we deform the
@@ -1240,26 +1300,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		 * vast majority of tuples. */
 		if (has_filter)
 		{
-			instr_time qual_deform_start;
-			if (profile_on)
-				INSTR_TIME_SET_CURRENT(qual_deform_start);
 			if (local.filter_uses_string_arena)
 				local.filter_chunk->string_arena.clear();
 			local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
-			if (profile_on)
-			{
-				instr_time qual_deform_end;
-				INSTR_TIME_SET_CURRENT(qual_deform_end);
-				PipelineProfileAddDiff(ctx,
-					PipelineProfileStage::SCAN_QUAL_DEFORM,
-					qual_deform_end,
-					qual_deform_start,
-					1);
-			}
 
-			instr_time filter_start;
-			if (profile_on)
-				INSTR_TIME_SET_CURRENT(filter_start);
 			bool pass;
 			if (use_simple_filter)
 			{
@@ -1291,33 +1335,10 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 					}
 				}
 			}
-			if (profile_on)
-			{
-				instr_time filter_end;
-				INSTR_TIME_SET_CURRENT(filter_end);
-				PipelineProfileAddDiff(ctx,
-					PipelineProfileStage::SCAN_FILTER,
-					filter_end,
-					filter_start,
-					1);
-			}
 			if (!pass)
 				continue;
 		}
-		instr_time proj_start;
-		if (profile_on)
-			INSTR_TIME_SET_CURRENT(proj_start);
 		AppendProjectedTupleViaDeformer(out, &tuple, proj_bindings, local);
-		if (profile_on)
-		{
-			instr_time proj_end;
-			INSTR_TIME_SET_CURRENT(proj_end);
-			PipelineProfileAddDiff(ctx,
-				PipelineProfileStage::SCAN_PROJ_DEFORM,
-				proj_end,
-				proj_start,
-				1);
-		}
 	}
 
 	if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)
@@ -1361,7 +1382,7 @@ PhysicalSeqScan::MaxThreads(ExecCtx &ctx) const
 		? shared_payload_dp_
 		: LoadSharedPayloadFromDescriptor(this);
 	SeqScanSharedPayload *shared = ResolveSeqScanPayload(ctx, dp);
-	return (int) ComputeMaxThreadsFromPayload(shared);
+	return (int) ComputeMaxThreadsFromPayload(shared, ctx);
 }
 
 }  /* namespace pipeline */

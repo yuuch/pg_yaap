@@ -6,18 +6,18 @@ This directory is a **container only**. The greenfield rewrite (commits `53ac06a
 
 - `pipeline/` — DuckDB-style `PhysicalOperator` IR + `MetaPipeline` runtime over PostgreSQL DSM/DSA + parallel bgworkers. **The only runtime in the codebase.** See `pipeline/AGENTS.md`.
 
-No source files live at this level. No design docs, no headers, no `.cpp/.hpp`. All built sources are under `pipeline/`.
+No source files live at this level. No design docs, no headers, no `.cpp/.hpp`. All built sources are under `pipeline/`. The current execution and communication contract is documented in `docs/pipeline_runtime.md` at the extension root.
 
 ## WHERE TO LOOK
 
 | Task | Location |
 |------|----------|
 | Add a new operator / source / sink / event / task | `pipeline/` (see `pipeline/AGENTS.md`) |
-| Bridge entry into the runtime | `bridge/execute.cpp` will call `pipeline::PgYaapPipelineRun(...)` (currently a stub returning `false`) |
-| Plan → `PhysicalOperator` translation | `pipeline/translator.cpp` (currently returns `nullptr` for every nodeTag) |
+| Bridge entry into the runtime | `bridge/execute.cpp` calls `pipeline::PgYaapPipelineRun(...)` |
+| Plan → `PhysicalOperator` translation | `pipeline/yaap_pipeline_init.cpp` and `yaap_opt_translator*` (supported optimizer-owned plan path); `pipeline/translator.cpp` is legacy |
 | DSM/DSA layout, control block, task queue keys | `pipeline/dsm_control.hpp` (`PIPELINE_DSM_KEY_*`, magic `PIPELINE_DSM_MAGIC = 0x56505043`) |
 | Cross-process descriptor IR | `pipeline/pipeline_descriptor.{hpp,cpp}` (Store/LoadSharedPayload, Leader serialize, Worker reconstruct) |
-| Worker bgworker `main` | `pipeline/pipeline_worker_main.cpp` (currently `elog(ERROR)` stub) |
+| Worker bgworker `main` | `pipeline/pipeline_worker_main.cpp` (DSM/DSA attach, snapshot restore, claiming whole tasks from the global ready queue) |
 
 ## CONVENTIONS
 

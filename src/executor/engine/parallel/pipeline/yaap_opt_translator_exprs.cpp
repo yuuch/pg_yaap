@@ -1,5 +1,12 @@
 #include "parallel/pipeline/yaap_pipeline_init_internal.hpp"
 
+extern "C" {
+#include "storage/dsm.h"
+#include "storage/shm_toc.h"
+}
+
+#include "parallel/pipeline/dsm_control.hpp"
+
 #include <cerrno>
 #include <cstdlib>
 
@@ -136,7 +143,8 @@ LowerOptimizerExpr(const Expression *expr,
 				   const std::vector<ColumnSchema> &schema,
 				   const std::vector<MaterializedOptExpr> *cache,
 				   int8_t &out_scale,
-				   uint8_t &out_slot);
+				   uint8_t &out_slot,
+				   bool require_int64_slot);
 
 static const BoundColumnRefExpression *
 UnwrapPrefixBaseColumn(const Expression *expr)
@@ -430,8 +438,8 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 		int8_t rhs_scale = 0;
 		uint8_t lhs_slot = 0;
 		uint8_t rhs_slot = 0;
-		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot) ||
-			!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot))
+		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot, true) ||
+			!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot, true))
 			return false;
 		int64_t factor = 0;
 		out_scale = (lhs_const != nullptr || rhs_const != nullptr)
@@ -454,7 +462,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 			const auto *const_expr = lhs_const != nullptr ? lhs_const : rhs_const;
 			int8_t var_scale = 0;
 			uint8_t var_slot = 0;
-			if (!LowerOptimizerExpr(var_expr, steps, next_int64_slot, cols, schema, cache, var_scale, var_slot))
+			if (!LowerOptimizerExpr(var_expr, steps, next_int64_slot, cols, schema, cache, var_scale, var_slot, true))
 				return false;
 			int8_t const_scale = 0;
 			int64_t const_value = 0;
@@ -469,8 +477,8 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 		int8_t rhs_scale = 0;
 		uint8_t lhs_slot = 0;
 		uint8_t rhs_slot = 0;
-		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot) ||
-			!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot) ||
+		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot, true) ||
+			!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot, true) ||
 			next_int64_slot >= 16)
 			return false;
 		out_slot = next_int64_slot++;
@@ -485,7 +493,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 	{
 		int8_t rhs_scale = 0;
 		uint8_t rhs_slot = 0;
-		if (!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot))
+		if (!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot, true))
 			return false;
 		int8_t lhs_scale = 0;
 		int64_t lhs_value = 0;
@@ -507,7 +515,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 	{
 		int8_t lhs_scale = 0;
 		uint8_t lhs_slot = 0;
-		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot))
+		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot, true))
 			return false;
 		int8_t rhs_scale = 0;
 		int64_t rhs_value = 0;
@@ -532,8 +540,8 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 	int8_t rhs_scale = 0;
 	uint8_t lhs_slot = 0;
 	uint8_t rhs_slot = 0;
-	if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot) ||
-		!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot))
+	if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot, true) ||
+		!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot, true))
 		return false;
 	out_scale = static_cast<int8_t>(Max(lhs_scale, rhs_scale));
 	uint8_t lhs_aligned = lhs_slot;
@@ -572,7 +580,7 @@ LowerCaseExpr(const BoundFunctionExpression *func,
 		return false;
 	int8_t then_scale = 0;
 	uint8_t then_slot = 0;
-	if (!LowerOptimizerExpr(when_func->children[1].get(), steps, next_int64_slot, cols, schema, cache, then_scale, then_slot))
+	if (!LowerOptimizerExpr(when_func->children[1].get(), steps, next_int64_slot, cols, schema, cache, then_scale, then_slot, true))
 		return false;
 	const Expression *else_expr = func->children.back().get();
 	const auto *else_const = dynamic_cast<const BoundConstantExpression *>(else_expr);
@@ -593,7 +601,7 @@ LowerCaseExpr(const BoundFunctionExpression *func,
 	}
 	int8_t else_scale = 0;
 	uint8_t else_slot = 0;
-	if (!LowerOptimizerExpr(else_expr, steps, next_int64_slot, cols, schema, cache, else_scale, else_slot))
+	if (!LowerOptimizerExpr(else_expr, steps, next_int64_slot, cols, schema, cache, else_scale, else_slot, true))
 		return false;
 	out_scale = static_cast<int8_t>(Max(then_scale, else_scale));
 	uint8_t aligned_then = then_slot;
@@ -620,7 +628,8 @@ LowerOptimizerExpr(const Expression *expr,
 				   const std::vector<ColumnSchema> &schema,
 				   const std::vector<MaterializedOptExpr> *cache,
 				   int8_t &out_scale,
-				   uint8_t &out_slot)
+				   uint8_t &out_slot,
+				   bool require_int64_slot)
 {
 	if (expr == nullptr)
 		return false;
@@ -635,6 +644,14 @@ LowerOptimizerExpr(const Expression *expr,
 		const auto *bound = static_cast<const BoundColumnRefExpression *>(expr);
 		if (!LookupBindingColumn(bound->binding, cols, schema, ref, col) || col == nullptr || !ColumnNumericScale(*col, out_scale))
 			return false;
+		if (require_int64_slot && col->decode_kind == ColumnDecodeKind::INT32_INT4)
+		{
+			if (next_int64_slot >= 16)
+				return false;
+			out_slot = next_int64_slot++;
+			steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, col->chunk_slot, 0, out_slot, 0});
+			return true;
+		}
 		out_slot = col->chunk_slot;
 		return true;
 	}
@@ -642,7 +659,11 @@ LowerOptimizerExpr(const Expression *expr,
 		return false;
 	const auto *func = static_cast<const BoundFunctionExpression *>(expr);
 	if (func->children.size() == 1 && IsTransparentCastFunctionName(func->function_name))
-		return LowerOptimizerExpr(func->children[0].get(), steps, next_int64_slot, cols, schema, cache, out_scale, out_slot);
+	{
+		const bool cast_to_int64 = require_int64_slot ||
+			func->function_name == "int8" || func->function_name == "numeric";
+		return LowerOptimizerExpr(func->children[0].get(), steps, next_int64_slot, cols, schema, cache, out_scale, out_slot, cast_to_int64);
+	}
 	if (LowerExtractYearExpr(func, steps, next_int64_slot, cols, schema, out_scale, out_slot) ||
 		LowerCaseExpr(func, steps, next_int64_slot, cols, schema, cache, out_scale, out_slot) ||
 		LowerNumericBinaryExpr(func, steps, next_int64_slot, cols, schema, cache, out_scale, out_slot))
@@ -1309,6 +1330,23 @@ CollectJoinKeys(const Expression *expr,
 	return true;
 }
 
+static bool
+HasOuterHashJoin(const PipelineOperator *op)
+{
+	if (op == nullptr)
+		return false;
+	if (op->type() == pg_yaap::pipeline::PhysicalOperatorType::HASH_JOIN) {
+		const auto *join = static_cast<const PipelineHashJoin *>(op);
+		if (join->join_mode() == pg_yaap::pipeline::HashJoinMatchMode::LEFT ||
+			join->join_mode() == pg_yaap::pipeline::HashJoinMatchMode::RIGHT)
+			return true;
+	}
+	for (const auto &child : op->children())
+		if (HasOuterHashJoin(child.get()))
+			return true;
+	return false;
+}
+
 std::unique_ptr<PipelineOperator>
 BuildOutputContract(OptimizerNodeTranslation &node,
 					QueryDesc *queryDesc,
@@ -1319,6 +1357,8 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	TupleDataLayout output_layout;
 	if (!BuildColumnOnlyLayout(node.schema, output_layout))
 		return nullptr;
+	if (HasOuterHashJoin(node.op.get()))
+		TupleDataLayoutEnableValidity(&output_layout);
 	dsa_pointer output_schema_dp = BuildSchemaDescriptorFromColumns(node.schema, state->runtime_dsa);
 	dsa_pointer output_layout_dp = SerializeTupleDataLayout(output_layout, state->runtime_dsa);
 	if (!DsaPointerIsValid(output_schema_dp) || !DsaPointerIsValid(output_layout_dp))
@@ -1329,7 +1369,32 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	uint32_t row_capacity = EstimateInitialResultRows(queryDesc, node.estimated_groups);
 	if (topn_output)
 		row_capacity = static_cast<uint32_t>(std::max<uint64_t>(1, std::min<uint64_t>(row_capacity, node.limit_count)));
-	const dsa_pointer output_payload_dp = BuildOutputTdc(state->runtime_dsa, output_layout_dp, output_layout, row_capacity);
+	dsa_pointer segment_arena_dp = InvalidDsaPointer;
+	dsa_pointer buffer_state_dp = InvalidDsaPointer;
+	if (state->runtime_dsm != nullptr)
+	{
+		shm_toc *toc = shm_toc_attach(pipeline::PIPELINE_DSM_MAGIC,
+			dsm_segment_address(state->runtime_dsm));
+		if (toc != nullptr)
+		{
+			auto *control = static_cast<pipeline::PipelineSharedControl *>(
+				shm_toc_lookup(toc, pipeline::PIPELINE_DSM_KEY_CONTROL, true));
+			if (control != nullptr)
+			{
+				segment_arena_dp = control->shared_segment_arena_root;
+				buffer_state_dp = control->buffer_state_root;
+			}
+		}
+	}
+	/* Small Top-N retains a bounded replacement table; larger ordered output
+	 * streams segments into PostgreSQL external sort on the leader. */
+	if (topn_output && node.limit_count <= 4096)
+	{
+		segment_arena_dp = InvalidDsaPointer;
+		buffer_state_dp = InvalidDsaPointer;
+	}
+	const dsa_pointer output_payload_dp = BuildOutputTdc(state->runtime_dsa,
+		output_layout_dp, output_layout, row_capacity, segment_arena_dp, buffer_state_dp);
 	if (!DsaPointerIsValid(output_payload_dp))
 		return nullptr;
 	const dsa_pointer final_sort_keys_dp = BuildFilterArray(state->runtime_dsa,
@@ -1349,7 +1414,6 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 		static_cast<uint16_t>(node.final_sort_keys.size()),
 		output_payload_dp,
 		row_capacity,
-		node.final_sort_keys,
 		node.limit_count,
 		nullptr);
 	output_op->AddChild(std::move(node.op));

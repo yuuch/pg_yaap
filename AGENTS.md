@@ -164,7 +164,7 @@ The parallel executor is structured as a DAG of pipelines connected at pipeline-
 
 **Operator implementations:**
 - `PhysicalSeqScan` — Parallel table scan with atomic block pool. Workers claim blocks via atomic counter, read through PG's `ReadStream` API.
-- `PhysicalHashJoin` — Radix-partitioned (256-way) parallel hash join with bloom filter pre-filtering and linear-probe hash table.
+- `PhysicalHashJoin` — Adaptive radix-partitioned parallel hash join (8–32 partitions), with worker-local spillable build segments, one shared hash table per resident batch, and partition-aware parallel probe with bounded file prefetch.
 - `PhysicalHashAggregate` — Hash-based aggregation with `AggregateHashTable`.
 - `PhysicalPerfectHashAggregate` — Optimized path when group count is small enough to fit in a direct-mapped array.
 - `PhysicalOrder` — Parallel sort using PG's `tuplesort` via `TuplesortInstrumentation`.
@@ -197,9 +197,13 @@ All defined in `pg_yaap.c::_PG_init`. All are `PGC_USERSET`.
 | `pg_yaap.parallel` | bool | `on` | **Must be on** for pipeline execution. Off → `initialize_plan` returns false. |
 | `pg_yaap.parallel_max_workers` | int | 4 (0–1024) | Max bgworkers per query. |
 | `pg_yaap.parallel_min_relation_blocks` | int | 1024 (0–INT_MAX) | Min relation size before parallel lowering. |
-| `pg_yaap.parallel_leader_participation` | bool | `on` | Leader runs pipeline tasks alongside workers. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | bool | `off` | Legacy GUC — registered but has no effect. |
-| `pg_yaap.profile` | bool | `off` | Emit per-stage pipeline timing after each query. |
+| `pg_yaap.trace_enabled` | bool | `off` | Enable lightweight per-process Execution Trace recording (see `docs/execution_trace.md`). |
+| `pg_yaap.trace_buffer_mb` | int, MB | `1MB` | Per-process Execution Trace buffer size (1–16 MB, leader and each worker). |
+| `pg_yaap.trace_output_dir` | string | `""` | `PGC_SUSET` absolute directory for exported Perfetto Chrome Trace JSON files. |
+| `pg_yaap.memory_limit` | int | `256MB` | Hard budget for shared breaker payloads; DSA has bounded headroom (up to 50%, capped at 4GB) for directories and allocator metadata. |
+| `pg_yaap.memory_soft_limit` | int | `-1` | Spill threshold; `-1` uses 75% of `memory_limit`. |
+| `pg_yaap.dsa_memory_limit` | int, MB | `-1` | Exact query DSA segment-capacity ceiling; `-1` preserves automatic metadata headroom. Not a whole-query RSS limit. |
 
 ---
 
@@ -286,10 +290,6 @@ pg_yaap/
 │           ├── task.cpp
 │           ├── pipeline_worker_main.cpp     # BG worker entry point
 │           ├── pipeline_descriptor.hpp/.cpp
-│           ├── pipeline_run_event.hpp/.cpp
-│           ├── pipeline_combine_event.hpp/.cpp
-│           ├── pipeline_finalize_event.hpp/.cpp
-│           ├── event.hpp/.cpp
 │           ├── meta_pipeline.hpp/.cpp
 │           ├── operator.hpp / source.hpp / sink.hpp
 │           ├── types.hpp / cancel.hpp
@@ -309,7 +309,7 @@ pg_yaap/
 │           ├── tuple_data_layout.hpp/.cpp
 │           ├── tuple_data_collection.hpp/.cpp
 │           ├── tuple_data_ops.hpp/.cpp
-│           ├── pipeline_profile.hpp/.cpp
+│           ├── execution_trace.hpp/.cpp
 │           └── AGENTS.md
 ```
 

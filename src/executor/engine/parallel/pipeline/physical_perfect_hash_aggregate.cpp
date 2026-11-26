@@ -11,7 +11,11 @@ extern int pg_yaap_parallel_max_workers;
 #include <cstring>
 
 #include "core/data_chunk.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
+#include "buffer_manager/yaap_shared_segment_arena.hpp"
+#include "buffer_manager/yaap_spill_store.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -92,6 +96,50 @@ ResolveGlobalIndex(dsa_area *dsa, PerfectHashAggSharedPayload *payload)
 	return static_cast<uint32_t *>(dsa_get_address(dsa, payload->global_index_dp));
 }
 
+static buffer::YaapBufferSharedState *
+ResolveBufferState(const ExecCtx &ctx)
+{
+	if (ctx.control == nullptr || !DsaPointerIsValid(ctx.control->buffer_state_root))
+		return nullptr;
+	return static_cast<buffer::YaapBufferSharedState *>(
+		dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
+}
+
+static void
+ReloadPerfectHashSegment(ExecCtx &ctx, PerfectHashAggSharedPayload *payload)
+{
+	if (payload == nullptr || !payload->segment_backed ||
+		DsaPointerIsValid(payload->global_tdc_dp))
+		return;
+	auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa, payload->segment_arena_dp,
+		buffer::YaapSegmentHandle{1, payload->segment_id, payload->segment_generation});
+	if (segment == nullptr || ctx.control == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: perfect hash spilled segment missing")));
+	buffer::YaapSpillStore spill(ctx.mcxt);
+	spill.AttachSharedFileSet(&ctx.control->spill_fileset, segment->spill_extent.file_name);
+	const buffer::YaapSegmentHandle handle{1, payload->segment_id, payload->segment_generation};
+	if (!buffer::YaapSharedSegmentReload(ctx.dsa, ResolveBufferState(ctx), handle,
+		payload->segment_arena_dp, &spill, segment->spill_extent))
+	{
+		for (uint32_t retry = 0; retry < 1000; ++retry)
+		{
+			const uint32_t state = pg_atomic_read_u32(&segment->state);
+			if (state == static_cast<uint32_t>(buffer::YaapSharedSegmentState::PUBLISHED))
+				break;
+			if (state != static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL))
+				ereport(ERROR, (errmsg("pg_yaap: perfect hash segment reload entered invalid state")));
+			pg_usleep(100L);
+		}
+	}
+	if (pg_atomic_read_u32(&segment->state) ==
+		static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL))
+	{
+		buffer::YaapSharedSegmentSeal(segment);
+		buffer::YaapSharedSegmentPublish(segment);
+	}
+	payload->global_tdc_dp = segment->payload_dp;
+}
+
 static inline bool
 EncodePerfectHashKey(const TupleDataLayout *layout,
                      const PipelineChunk &chunk,
@@ -156,6 +204,7 @@ GrowLocalTdc(ExecCtx &ctx, PerfectHashAggLocalSinkState &local)
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
 		CopyTdcRow(local.layout, old_tdc, src, new_tdc, dst);
 	}
+	dsa_free(ctx.dsa, local.local_tdc_dp);
 	local.local_tdc_dp = new_tdc_dp;
 	local.local_tdc = new_tdc;
 }
@@ -163,6 +212,9 @@ GrowLocalTdc(ExecCtx &ctx, PerfectHashAggLocalSinkState &local)
 static void
 GrowGlobalTdc(ExecCtx &ctx, PerfectHashAggGlobalSinkState &global)
 {
+	if (global.payload != nullptr && global.payload->segment_backed)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("pg_yaap: perfect hash segment capacity exceeded")));
 	TupleDataCollection *old_tdc = global.global_tdc;
 	if (old_tdc == nullptr)
 		elog(ERROR, "pg_yaap: perfect hash global TDC missing");
@@ -248,6 +300,16 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 
 }  /* namespace */
 
+SinkTaskPlan
+PhysicalPerfectHashAggregate::GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const
+{
+	(void) ctx; (void) run_tasks;
+	if (!DsaPointerIsValid(LoadSharedPayloadFromDescriptor(this)))
+		elog(ERROR, "pg_yaap: perfect hash aggregate payload missing during COMBINE scheduling");
+	/* One owner merges every producer's shared perfect-hash partial. */
+	return {1, 1, false};
+}
+
 std::unique_ptr<GlobalSinkState>
 PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 {
@@ -258,12 +320,12 @@ PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 	state->layout = ResolveLayout(ctx.dsa, state->layout_dp);
 	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp()) ? shared_payload_dp() : SharedPayloadDpFromDescriptor();
 	state->max_groups = MaxGroupsFromDescriptor();
-	state->local_state_slot_count = static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
+	state->local_state_slot_count = ExecutionWorkerCount(ctx);
 
 	if (state->layout == nullptr)
 		elog(ERROR, "pg_yaap: perfect hash aggregate missing TupleDataLayout");
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		const uint32_t perfect_capacity = PerfectHashCapacityFromDescriptor();
 		if (perfect_capacity == 0)
@@ -279,15 +341,41 @@ PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			static_cast<size_t>(perfect_capacity) * sizeof(uint32_t));
 		state->payload->local_partitions_registry_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(state->local_state_slot_count) * sizeof(dsa_pointer));
-		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
-			state->max_groups);
-		state->payload->global_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
-			state->max_groups,
-			state->layout->row_width,
-			heap_capacity);
+		const uint32_t row_capacity = std::min<uint32_t>(state->max_groups, 16384u);
+		uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
+			row_capacity);
+		auto *buffer_state = ResolveBufferState(ctx);
+		auto *arena = buffer_state != nullptr && ctx.control != nullptr
+			? buffer::YaapSharedSegmentArenaResolve(ctx.dsa,
+				ctx.control->shared_segment_arena_root) : nullptr;
+		const uint64_t required = offsetof(TupleDataCollection, rows) +
+			static_cast<uint64_t>(row_capacity) * state->layout->row_width + heap_capacity;
+		if (buffer_state != nullptr && arena != nullptr && required <= arena->segment_size)
+		{
+			const auto handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa,
+				buffer_state, ctx.control->shared_segment_arena_root,
+				ExecutionTaskSlot(ctx));
+			auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
+				ctx.control->shared_segment_arena_root, handle);
+			if (segment == nullptr)
+				ereport(ERROR, (errmsg("pg_yaap: perfect hash segment allocation failed")));
+			state->payload->global_tdc_dp = segment->payload_dp;
+			state->payload->segment_arena_dp = ctx.control->shared_segment_arena_root;
+			state->payload->segment_desc_dp = segment->self_dp;
+			state->payload->segment_id = handle.segment_id;
+			state->payload->segment_generation = handle.generation;
+			state->payload->segment_backed = true;
+		}
+		else
+		{
+			state->payload->global_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
+				state->max_groups, state->layout->row_width,
+				TupleDataCollectionDefaultHeapCapacity(state->layout, state->max_groups));
+			heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout, state->max_groups);
+		}
 		state->global_tdc = ResolveTdc(ctx.dsa, state->payload->global_tdc_dp);
 		TupleDataCollectionInit(state->global_tdc,
-			state->max_groups,
+			state->payload->segment_backed ? row_capacity : state->max_groups,
 			state->layout->row_width,
 			state->layout_dp,
 			heap_capacity);
@@ -339,12 +427,11 @@ PhysicalPerfectHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &g
 		state->layout_dp,
 		heap_capacity);
 
-	if (ctx.worker_index >= 0)
 	{
 		auto *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
-		if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: perfect hash local registry missing");
-		registry[ctx.worker_index] = state->local_tdc_dp;
+		registry[ExecutionTaskSlot(ctx)] = state->local_tdc_dp;
 	}
 
 	return state;
@@ -354,7 +441,16 @@ SinkResultType
 PhysicalPerfectHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
 	auto &local = static_cast<PerfectHashAggLocalSinkState &>(input.local_state);
+	const dsa_pointer before = local.local_tdc_dp;
 	SinkChunkPerfectHash(ctx, local, in);
+	if (local.local_tdc_dp != before)
+	{
+		auto &global = static_cast<PerfectHashAggGlobalSinkState &>(input.global_state);
+		auto *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
+			elog(ERROR, "pg_yaap: perfect hash local registry missing after grow");
+		registry[ExecutionTaskSlot(ctx)] = local.local_tdc_dp;
+	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -365,40 +461,10 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 	if (input.partition_id != UINT32_MAX)
 		return SinkCombineResultType::FINISHED;
 
-	if (input.local_state != nullptr)
-	{
-		auto &local = static_cast<PerfectHashAggLocalSinkState &>(*input.local_state);
-		const uint32_t local_row_count = pg_atomic_read_u32(&local.local_tdc->row_count);
-		for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
-		{
-			const uint8_t *src_row = TupleDataCollectionGetRowConst(local.local_tdc, row_idx);
-			uint32_t key = 0;
-			if (!EncodePerfectHashRowKey(global.layout, src_row, &key) ||
-				key >= global.payload->perfect_hash_capacity)
-			{
-				elog(ERROR, "pg_yaap: perfect hash combine row key out of domain");
-			}
-
-			uint32_t canonical_idx = global.global_index[key];
-			if (canonical_idx == TDC_INVALID_ROW_INDEX)
-			{
-				while (pg_atomic_read_u32(&global.global_tdc->row_count) >= global.global_tdc->row_capacity)
-					GrowGlobalTdc(ctx, global);
-				uint8_t *dst_row = nullptr;
-				canonical_idx = TupleDataCollectionAppendRow(global.global_tdc, &dst_row);
-				if (canonical_idx == TDC_INVALID_ROW_INDEX)
-					elog(ERROR, "pg_yaap: perfect hash global row capacity exceeded");
-				std::memcpy(dst_row, src_row, global.layout->row_width);
-				global.global_index[key] = canonical_idx;
-			}
-			else
-			{
-				uint8_t *dst_row = TupleDataCollectionGetRow(global.global_tdc, canonical_idx);
-				CombineAggregates(global.layout, dst_row, src_row);
-			}
-		}
-		return SinkCombineResultType::FINISHED;
-	}
+	/* This stage has one owner. Every producer has already completed RUN
+	 * and published its DSA partial, including the optional leader slot.
+	 * input.local_state is only this owner's private wrapper; merging it
+	 * alone would discard every other process's contribution. */
 
 	dsa_pointer *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
 	if (registry == nullptr)
@@ -407,9 +473,10 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 	{
 		if (!DsaPointerIsValid(registry[slot]))
 			continue;
-		auto *local_tdc = ResolveTdc(ctx.dsa, registry[slot]);
+		const dsa_pointer local_dp = registry[slot];
+		auto *local_tdc = ResolveTdc(ctx.dsa, local_dp);
 		if (local_tdc == nullptr)
-			continue;
+			elog(ERROR, "pg_yaap: perfect hash registered local TDC missing");
 		const uint32_t local_row_count = pg_atomic_read_u32(&local_tdc->row_count);
 		for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
 		{
@@ -439,6 +506,16 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 				CombineAggregates(global.layout, dst_row, src_row);
 			}
 		}
+		/* RUN is behind the event barrier and no producer may touch these
+		 * rows again. Its private state owns only a non-owning DSA pointer. */
+		dsa_free(ctx.dsa, local_dp);
+		registry[slot] = InvalidDsaPointer;
+	}
+	if (input.local_state != nullptr)
+	{
+		auto &local = static_cast<PerfectHashAggLocalSinkState &>(*input.local_state);
+		local.local_tdc = nullptr;
+		local.local_tdc_dp = InvalidDsaPointer;
 	}
 
 	return SinkCombineResultType::FINISHED;
@@ -447,10 +524,39 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 SinkFinalizeType
 PhysicalPerfectHashAggregate::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
-	(void) ctx;
 	auto &global = static_cast<PerfectHashAggGlobalSinkState &>(gstate);
 	if (global.global_tdc != nullptr)
 		global.global_tdc->finalized = true;
+	if (global.payload != nullptr && global.payload->segment_backed)
+	{
+		auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
+			global.payload->segment_arena_dp,
+			buffer::YaapSegmentHandle{1, global.payload->segment_id,
+				global.payload->segment_generation});
+		if (segment == nullptr)
+			ereport(ERROR, (errmsg("pg_yaap: perfect hash segment missing during finalize")));
+		const uint64_t used = offsetof(TupleDataCollection, rows) +
+			static_cast<uint64_t>(pg_atomic_read_u32(&global.global_tdc->row_count)) *
+			global.global_tdc->row_width + pg_atomic_read_u32(&global.global_tdc->heap_used);
+		buffer::YaapSharedSegmentSetUsed(segment, static_cast<uint32_t>(used));
+		buffer::YaapSharedSegmentSeal(segment);
+		buffer::YaapSharedSegmentPublish(segment);
+		auto *buffer_state = ResolveBufferState(ctx);
+		if (buffer_state != nullptr && buffer::YaapBufferOverSoftLimit(buffer_state))
+		{
+			if (ctx.control == nullptr)
+				ereport(ERROR, (errmsg("pg_yaap: perfect hash spill control missing")));
+			buffer::YaapSpillStore spill(ctx.mcxt);
+			spill.AttachSharedFileSet(&ctx.control->spill_fileset, "pg_yaap_perfect_hash");
+			if (!buffer::YaapSharedSegmentSpill(ctx.dsa, buffer_state,
+				buffer::YaapSegmentHandle{1, global.payload->segment_id,
+					global.payload->segment_generation}, global.payload->segment_arena_dp,
+				&spill, &segment->spill_extent))
+				ereport(ERROR, (errmsg("pg_yaap: perfect hash segment spill failed")));
+			global.payload->global_tdc_dp = InvalidDsaPointer;
+			global.global_tdc = nullptr;
+		}
+	}
 	global.payload->finalized = true;
 	global.finalized = true;
 	return SinkFinalizeType::READY;
@@ -465,6 +571,7 @@ PhysicalPerfectHashAggregate::GetGlobalSourceState(ExecCtx &ctx)
 	state->payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (state->payload == nullptr)
 		elog(ERROR, "pg_yaap: perfect hash source payload not initialized");
+	ReloadPerfectHashSegment(ctx, state->payload);
 	state->global_tdc = ResolveTdc(ctx.dsa, state->payload->global_tdc_dp);
 	if (state->global_tdc == nullptr)
 		elog(ERROR, "pg_yaap: perfect hash source TDC missing");
@@ -503,6 +610,16 @@ PhysicalPerfectHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, Operator
 		++out.count;
 	}
 
+	if (out.count == 0 && global.payload->segment_backed && !global.segment_retired)
+	{
+		auto *state = ResolveBufferState(ctx);
+		const buffer::YaapSegmentHandle handle{1, global.payload->segment_id,
+			global.payload->segment_generation};
+		if (state == nullptr || !buffer::YaapSharedSegmentRetire(ctx.dsa, state,
+			global.payload->segment_arena_dp, handle))
+			ereport(ERROR, (errmsg("pg_yaap: perfect hash segment retire failed")));
+		global.segment_retired = true;
+	}
 	return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
 }
 

@@ -12,6 +12,7 @@ pg_yaap_sources += files(
   'logical/logical_utils.cpp',
   'logical/mark_join_normalization.cpp',
   'optimizer/filter_pushdown.cpp',
+  'optimizer/common_subplan_elimination.cpp',
   'optimizer/join_predicate_extraction.cpp',
   'optimizer/optimizer_core.cpp',
   'optimizer/join_order_cost_model.cpp',

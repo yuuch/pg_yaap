@@ -1,7 +1,9 @@
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/physical_top_n.hpp"
 
 extern "C" {
 #include "postgres.h"
+#include "storage/lwlock.h"
 #include "utils/dsa.h"
 #include "utils/elog.h"
 #include "utils/palloc.h"
@@ -12,6 +14,7 @@ extern int pg_yaap_parallel_max_workers;
 #include <algorithm>
 #include <cstring>
 
+#include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 
@@ -36,18 +39,6 @@ ResolveLayout(dsa_area *dsa, dsa_pointer layout_dp)
 		: nullptr;
 }
 
-static TupleDataCollection *
-AllocateLocalTdc(const TupleDataLayout *layout,
-                 dsa_pointer layout_dp,
-                 uint32_t max_rows)
-{
-	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, max_rows);
-	const size_t alloc_bytes = TupleDataCollectionCheckedAllocSize(max_rows, layout->row_width, heap_capacity);
-	auto *tdc = static_cast<TupleDataCollection *>(palloc0(alloc_bytes));
-	TupleDataCollectionInit(tdc, max_rows, layout->row_width, layout_dp, heap_capacity);
-	return tdc;
-}
-
 static int
 CompareStoredRows(const TupleDataLayout *layout,
                   const SortKeyDesc *sort_keys,
@@ -61,6 +52,12 @@ CompareStoredRows(const TupleDataLayout *layout,
 	{
 		const SortKeyDesc &key = sort_keys[key_idx];
 		if (key.col_idx >= layout->column_count)
+			continue;
+		const bool lhs_null = TupleDataLayoutColumnIsNull(layout, lhs_row, key.col_idx);
+		const bool rhs_null = TupleDataLayoutColumnIsNull(layout, rhs_row, key.col_idx);
+		if (lhs_null != rhs_null)
+			return lhs_null == key.nulls_first ? -1 : 1;
+		if (lhs_null)
 			continue;
 		const TdcColumnDesc &col = layout->columns[key.col_idx];
 		int cmp = 0;
@@ -135,6 +132,15 @@ CompareChunkRowToStoredRow(const SchemaDescriptor *input_schema,
 			continue;
 		const ColumnSchema &schema_col = input_schema->columns[key.col_idx];
 		const TdcColumnDesc &col = layout->columns[key.col_idx];
+		if (layout->validity_width > 0)
+		{
+			const bool lhs_null = chunk.nulls[schema_col.chunk_slot][row_idx] != 0;
+			const bool rhs_null = TupleDataLayoutColumnIsNull(layout, stored_row, key.col_idx);
+			if (lhs_null != rhs_null)
+				return lhs_null == key.nulls_first ? -1 : 1;
+			if (lhs_null)
+				continue;
+		}
 		int cmp = 0;
 		switch (col.kind)
 		{
@@ -193,9 +199,20 @@ CopyStoredRow(const TupleDataLayout *layout,
               TupleDataCollection *dst_tdc,
               uint8_t *dst_row)
 {
+	if (layout->validity_width > 0)
+	{
+		const uint16_t validity_off = TupleDataLayoutValidityOffset(layout);
+		const uint16_t validity_bytes = TupleDataLayoutValidityStorageWidth(layout);
+		std::memcpy(dst_row + validity_off, src_row + validity_off, validity_bytes);
+	}
 	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
 	{
 		const TdcColumnDesc &col = layout->columns[col_idx];
+		if (TupleDataLayoutColumnIsNull(layout, src_row, col_idx))
+		{
+			std::memset(dst_row + col.offset, 0, col.width);
+			continue;
+		}
 		if (col.kind != TdcColumnKind::STRING_REF)
 		{
 			std::memcpy(dst_row + col.offset, src_row + col.offset, col.width);
@@ -214,15 +231,25 @@ CopyStoredRow(const TupleDataLayout *layout,
 }
 
 static TupleDataCollection *
+AllocateLocalTdc(const TupleDataLayout *layout,
+                 dsa_pointer layout_dp,
+                 uint32_t max_rows)
+{
+	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, max_rows);
+	const size_t alloc_bytes = TupleDataCollectionCheckedAllocSize(max_rows, layout->row_width, heap_capacity);
+	auto *tdc = static_cast<TupleDataCollection *>(palloc0(alloc_bytes));
+	TupleDataCollectionInit(tdc, max_rows, layout->row_width, layout_dp, heap_capacity);
+	return tdc;
+}
+
+static TupleDataCollection *
 RebuildLocalTdc(const TupleDataLayout *layout,
                 dsa_pointer layout_dp,
                 uint32_t max_rows,
                 const TupleDataCollection *old_tdc,
                 const PipelineChunk *append_chunk,
                 uint16_t append_row_idx,
-                uint32_t replace_row_idx,
-                const TupleDataCollection *append_tdc,
-                const uint8_t *append_row_ptr)
+                uint32_t replace_row_idx)
 {
 	uint64_t heap_needed = 0;
 	const uint32_t row_count = old_tdc != nullptr ? pg_atomic_read_u32(
@@ -237,8 +264,6 @@ RebuildLocalTdc(const TupleDataLayout *layout,
 	}
 	if (append_chunk != nullptr)
 		heap_needed += TupleDataCollectionRequiredHeapBytesForChunkRow(layout, *append_chunk, append_row_idx);
-	else if (append_tdc != nullptr && append_row_ptr != nullptr)
-		heap_needed += TupleDataCollectionRequiredHeapBytesForRow(layout, append_tdc, append_row_ptr);
 
 	uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, max_rows);
 	if (heap_needed > heap_capacity)
@@ -254,19 +279,12 @@ RebuildLocalTdc(const TupleDataLayout *layout,
 		uint8_t *dst = nullptr;
 		if (TupleDataCollectionAppendRow(new_tdc, &dst) == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_yaap: local top-N rebuild overflow");
-		CopyStoredRow(layout,
-			old_tdc,
-			TupleDataCollectionGetRowConst(old_tdc, row_idx),
-			new_tdc,
-			dst);
+		CopyStoredRow(layout, old_tdc, TupleDataCollectionGetRowConst(old_tdc, row_idx), new_tdc, dst);
 	}
 	uint8_t *dst = nullptr;
 	if (TupleDataCollectionAppendRow(new_tdc, &dst) == TDC_INVALID_ROW_INDEX)
 		elog(ERROR, "pg_yaap: local top-N append overflow");
-	if (append_chunk != nullptr)
-		Scatter(layout, new_tdc, dst, *append_chunk, append_row_idx);
-	else
-		CopyStoredRow(layout, append_tdc, append_row_ptr, new_tdc, dst);
+	Scatter(layout, new_tdc, dst, *append_chunk, append_row_idx);
 	return new_tdc;
 }
 
@@ -362,8 +380,7 @@ FindWorstStoredRowIndex(const TupleDataLayout *layout,
 int
 PhysicalTopN::MaxThreads(ExecCtx &ctx) const
 {
-	(void) ctx;
-	return std::max(1, pg_yaap_parallel_max_workers);
+	return static_cast<int>(ExecutionWorkerCount(ctx));
 }
 
 std::unique_ptr<GlobalSinkState>
@@ -408,47 +425,129 @@ std::unique_ptr<LocalSinkState>
 PhysicalTopN::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	(void) ctx;
-	(void) gstate;
-	return std::make_unique<TopNLocalSinkState>();
+	auto &global = static_cast<TopNGlobalState &>(gstate);
+	auto local = std::make_unique<TopNLocalSinkState>();
+	local->use_local = (global.max_rows > 0 && global.max_rows <= 4096);
+	return local;
 }
 
 SinkResultType
 PhysicalTopN::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
-	(void) ctx;
 	auto &global = static_cast<TopNGlobalState &>(input.global_state);
-	(void) input.local_state;
+	auto &local = static_cast<TopNLocalSinkState &>(input.local_state);
+	if (local.use_local)
+	{
+		if (local.local_tdc == nullptr)
+			local.local_tdc = AllocateLocalTdc(global.layout, global.layout_dp, global.max_rows);
+		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+		{
+			if (PipelineCancelRequestedEvery(ctx, row_idx))
+				return SinkResultType::FINISHED;
+			const uint32_t row_count = pg_atomic_read_u32(&local.local_tdc->row_count);
+			if (row_count >= global.max_rows)
+			{
+				if (local.worst_idx == UINT32_MAX)
+					local.worst_idx = FindWorstStoredRowIndex(global.layout,
+						global.sort_keys, global.n_sort_keys, local.local_tdc);
+				const uint8_t *worst_row = TupleDataCollectionGetRowConst(local.local_tdc, local.worst_idx);
+				if (CompareChunkRowToStoredRow(global.input_schema,
+					global.layout,
+					global.sort_keys,
+					global.n_sort_keys,
+					in,
+					row_idx,
+					local.local_tdc,
+					worst_row) < 0)
+				{
+					TupleDataCollection *old_tdc = local.local_tdc;
+					local.local_tdc = RebuildLocalTdc(global.layout,
+						global.layout_dp,
+						global.max_rows,
+						old_tdc,
+						&in,
+						row_idx,
+						local.worst_idx);
+					pfree(old_tdc);
+					local.worst_idx = UINT32_MAX;
+				}
+				continue;
+			}
+			if (!TupleDataCollectionHasSpaceForAppend(local.local_tdc,
+				TupleDataCollectionRequiredHeapBytesForChunkRow(global.layout, in, row_idx)))
+			{
+				TupleDataCollection *old_tdc = local.local_tdc;
+				local.local_tdc = RebuildLocalTdc(global.layout,
+					global.layout_dp,
+					global.max_rows,
+					old_tdc,
+					&in,
+					row_idx,
+					UINT32_MAX);
+				pfree(old_tdc);
+				continue;
+			}
+			uint8_t *dst = nullptr;
+			if (TupleDataCollectionAppendRow(local.local_tdc, &dst) == TDC_INVALID_ROW_INDEX)
+				elog(ERROR, "pg_yaap: local top-N row capacity exceeded");
+			Scatter(global.layout, local.local_tdc, dst, in, row_idx);
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
 	{
-		SpinLockAcquire(&global.payload->mutex);
-		global.global_tdc = DsaPointerIsValid(global.payload->tdc_dp)
-			? static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, global.payload->tdc_dp))
-			: nullptr;
-		if (global.global_tdc == nullptr)
-			elog(ERROR, "pg_yaap: top-N sink missing global TDC");
-		const uint32_t row_count = pg_atomic_read_u32(&global.global_tdc->row_count);
-		if (row_count >= global.max_rows)
+		if (PipelineCancelRequestedEvery(ctx, row_idx))
+			return SinkResultType::FINISHED;
+		/* DSA allocation/free and ERROR are legal under LWLock, never under a
+		 * spinlock. Release the lock on any PG error path via PG_CATCH. */
+		LWLockAcquire(&global.payload->mutex, LW_EXCLUSIVE);
+		PG_TRY();
 		{
-			const uint32_t worst_idx = FindWorstStoredRowIndex(global.layout,
-				global.sort_keys,
-				global.n_sort_keys,
-				global.global_tdc);
-			const uint8_t *worst_row = TupleDataCollectionGetRowConst(global.global_tdc, worst_idx);
-			if (CompareChunkRowToStoredRow(global.input_schema,
-				global.layout,
-				global.sort_keys,
-				global.n_sort_keys,
-				in,
-				row_idx,
-				global.global_tdc,
-				worst_row) < 0)
+			global.global_tdc = DsaPointerIsValid(global.payload->tdc_dp)
+				? static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, global.payload->tdc_dp))
+				: nullptr;
+			if (global.global_tdc == nullptr)
+				elog(ERROR, "pg_yaap: top-N sink missing global TDC");
+			const uint32_t row_count = pg_atomic_read_u32(&global.global_tdc->row_count);
+			if (row_count >= global.max_rows)
+			{
+				const uint32_t worst_idx = FindWorstStoredRowIndex(global.layout,
+					global.sort_keys,
+					global.n_sort_keys,
+					global.global_tdc);
+				const uint8_t *worst_row = TupleDataCollectionGetRowConst(global.global_tdc, worst_idx);
+				if (CompareChunkRowToStoredRow(global.input_schema,
+					global.layout,
+					global.sort_keys,
+					global.n_sort_keys,
+					in,
+					row_idx,
+					global.global_tdc,
+					worst_row) < 0)
+				{
+					dsa_pointer old_tdc_dp = global.payload->tdc_dp;
+					dsa_pointer new_tdc_dp = RebuildGlobalTdc(ctx,
+						global,
+						&in,
+						row_idx,
+						worst_idx,
+						nullptr,
+						nullptr);
+					global.payload->tdc_dp = new_tdc_dp;
+					global.global_tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, new_tdc_dp));
+					if (DsaPointerIsValid(old_tdc_dp))
+						dsa_free(ctx.dsa, old_tdc_dp);
+				}
+			}
+			else if (!TupleDataCollectionHasSpaceForAppend(global.global_tdc,
+				TupleDataCollectionRequiredHeapBytesForChunkRow(global.layout, in, row_idx)))
 			{
 				dsa_pointer old_tdc_dp = global.payload->tdc_dp;
 				dsa_pointer new_tdc_dp = RebuildGlobalTdc(ctx,
 					global,
 					&in,
 					row_idx,
-					worst_idx,
+					UINT32_MAX,
 					nullptr,
 					nullptr);
 				global.payload->tdc_dp = new_tdc_dp;
@@ -456,34 +555,122 @@ PhysicalTopN::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &inpu
 				if (DsaPointerIsValid(old_tdc_dp))
 					dsa_free(ctx.dsa, old_tdc_dp);
 			}
-			SpinLockRelease(&global.payload->mutex);
-			continue;
+			else
+			{
+				uint8_t *dst = nullptr;
+				if (TupleDataCollectionAppendRow(global.global_tdc, &dst) == TDC_INVALID_ROW_INDEX)
+					elog(ERROR, "pg_yaap: global top-N row capacity exceeded");
+				Scatter(global.layout, global.global_tdc, dst, in, row_idx);
+			}
 		}
-		if (!TupleDataCollectionHasSpaceForAppend(global.global_tdc,
-			TupleDataCollectionRequiredHeapBytesForChunkRow(global.layout, in, row_idx)))
+		PG_CATCH();
 		{
-			dsa_pointer old_tdc_dp = global.payload->tdc_dp;
-			dsa_pointer new_tdc_dp = RebuildGlobalTdc(ctx,
-				global,
-				&in,
-				row_idx,
-				UINT32_MAX,
-				nullptr,
-				nullptr);
-			global.payload->tdc_dp = new_tdc_dp;
-			global.global_tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, new_tdc_dp));
-			if (DsaPointerIsValid(old_tdc_dp))
-				dsa_free(ctx.dsa, old_tdc_dp);
-			SpinLockRelease(&global.payload->mutex);
-			continue;
+			LWLockRelease(&global.payload->mutex);
+			PG_RE_THROW();
 		}
-		uint8_t *dst = nullptr;
-		if (TupleDataCollectionAppendRow(global.global_tdc, &dst) == TDC_INVALID_ROW_INDEX)
-			elog(ERROR, "pg_yaap: global top-N row capacity exceeded");
-		Scatter(global.layout, global.global_tdc, dst, in, row_idx);
-		SpinLockRelease(&global.payload->mutex);
+		PG_END_TRY();
+		LWLockRelease(&global.payload->mutex);
 	}
 	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkCombineResultType
+PhysicalTopN::FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input)
+{
+	if (input.local_state == nullptr)
+		return SinkCombineResultType::FINISHED;
+	auto &global = static_cast<TopNGlobalState &>(input.global_state);
+	auto &local = static_cast<TopNLocalSinkState &>(*input.local_state);
+	if (!local.use_local || local.local_tdc == nullptr)
+		return SinkCombineResultType::FINISHED;
+
+	const uint32_t local_count = pg_atomic_read_u32(&local.local_tdc->row_count);
+	if (local_count == 0)
+	{
+		pfree(local.local_tdc);
+		local.local_tdc = nullptr;
+		return SinkCombineResultType::FINISHED;
+	}
+
+	/* Merge at most max_rows local candidates into the shared TopN TDC once. */
+	LWLockAcquire(&global.payload->mutex, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		global.global_tdc = DsaPointerIsValid(global.payload->tdc_dp)
+			? static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, global.payload->tdc_dp))
+			: nullptr;
+		if (global.global_tdc == nullptr)
+			elog(ERROR, "pg_yaap: top-N finish missing global TDC");
+		uint32_t worst_idx = UINT32_MAX;
+		for (uint32_t i = 0; i < local_count; ++i)
+		{
+			const uint8_t *src_row = TupleDataCollectionGetRowConst(local.local_tdc, i);
+			const uint32_t row_count = pg_atomic_read_u32(&global.global_tdc->row_count);
+			if (row_count >= global.max_rows)
+			{
+				if (worst_idx == UINT32_MAX)
+					worst_idx = FindWorstStoredRowIndex(global.layout,
+						global.sort_keys, global.n_sort_keys, global.global_tdc);
+				const uint8_t *worst_row = TupleDataCollectionGetRowConst(global.global_tdc, worst_idx);
+				if (CompareStoredRows(global.layout,
+					global.sort_keys,
+					global.n_sort_keys,
+					local.local_tdc,
+					src_row,
+					global.global_tdc,
+					worst_row) < 0)
+				{
+					dsa_pointer old_tdc_dp = global.payload->tdc_dp;
+					dsa_pointer new_tdc_dp = RebuildGlobalTdc(ctx,
+						global,
+						nullptr,
+						0,
+						worst_idx,
+						local.local_tdc,
+						src_row);
+					global.payload->tdc_dp = new_tdc_dp;
+					global.global_tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, new_tdc_dp));
+					if (DsaPointerIsValid(old_tdc_dp))
+						dsa_free(ctx.dsa, old_tdc_dp);
+					worst_idx = UINT32_MAX;
+				}
+			}
+			else if (!TupleDataCollectionHasSpaceForAppend(global.global_tdc,
+				TupleDataCollectionRequiredHeapBytesForRow(global.layout, local.local_tdc, src_row)))
+			{
+				dsa_pointer old_tdc_dp = global.payload->tdc_dp;
+				dsa_pointer new_tdc_dp = RebuildGlobalTdc(ctx,
+					global,
+					nullptr,
+					0,
+					UINT32_MAX,
+					local.local_tdc,
+					src_row);
+				global.payload->tdc_dp = new_tdc_dp;
+				global.global_tdc = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa, new_tdc_dp));
+				if (DsaPointerIsValid(old_tdc_dp))
+					dsa_free(ctx.dsa, old_tdc_dp);
+			}
+			else
+			{
+				uint8_t *dst = nullptr;
+				if (TupleDataCollectionAppendRow(global.global_tdc, &dst) == TDC_INVALID_ROW_INDEX)
+					elog(ERROR, "pg_yaap: global top-N row capacity exceeded");
+				CopyStoredRow(global.layout, local.local_tdc, src_row, global.global_tdc, dst);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		LWLockRelease(&global.payload->mutex);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockRelease(&global.payload->mutex);
+
+	pfree(local.local_tdc);
+	local.local_tdc = nullptr;
+	return SinkCombineResultType::FINISHED;
 }
 
 SinkCombineResultType

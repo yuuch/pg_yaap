@@ -8,6 +8,9 @@ extern "C" {
 #include <cstring>
 
 #include "core/data_chunk.hpp"
+#include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
+#include "buffer_manager/yaap_buffer_shared.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
@@ -250,7 +253,8 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 			? ComputeHashTableCapacity(static_cast<uint32_t>(total_rows))
 			: 0u;
 
-		SpinLockAcquire(&payload->mutex);
+		/* combine_prepare_state elects exactly one preparer; followers wait
+		 * for state 2 below. No allocation needs the payload spinlock. */
 		EnsureEmptyJoinGlobalCapacity(ctx,
 			global.build_key_layout,
 			global.build_key_layout_dp,
@@ -274,6 +278,15 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 		}
 		if (static_cast<uint32_t>(total_rows) > 0)
 		{
+			const uint64_t directory_bytes = static_cast<uint64_t>(payload->hash_table_capacity) *
+				sizeof(uint32_t) + total_rows * (2 * sizeof(uint32_t) + sizeof(uint16_t));
+			auto *buffer_state = ctx.control != nullptr &&
+				DsaPointerIsValid(ctx.control->buffer_state_root)
+				? static_cast<buffer::YaapBufferSharedState *>(
+					dsa_get_address(ctx.dsa, ctx.control->buffer_state_root)) : nullptr;
+			buffer::YaapBufferChargeExternalBytes(buffer_state, directory_bytes,
+				"hash join combine directory");
+			payload->directory_charged_bytes += directory_bytes;
 			payload->hash_table_dp = dsa_allocate(ctx.dsa,
 				static_cast<size_t>(payload->hash_table_capacity) * sizeof(uint32_t));
 			payload->hash_buckets_dp = dsa_allocate(ctx.dsa,
@@ -286,18 +299,17 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 				0xFF,
 				static_cast<size_t>(payload->hash_table_capacity) * sizeof(uint32_t));
 		}
-		SpinLockRelease(&payload->mutex);
 
 		payload->combined_row_count = static_cast<uint32_t>(total_rows);
 		payload->combined_key_heap_used = static_cast<uint32_t>(total_key_heap);
 		payload->combined_row_heap_used = payload->build_rows_use_keys
 			? static_cast<uint32_t>(total_key_heap)
 			: static_cast<uint32_t>(total_row_heap);
-		pg_atomic_write_u32(&payload->combine_prepare_state, 2u);
+		pg_atomic_write_membarrier_u32(&payload->combine_prepare_state, 2u);
 	}
 	else
 	{
-		while (pg_atomic_read_u32(&payload->combine_prepare_state) != 2u)
+		while (pg_atomic_read_membarrier_u32(&payload->combine_prepare_state) != 2u)
 		{
 			CHECK_FOR_INTERRUPTS();
 			pg_usleep(1000L);
@@ -390,15 +402,13 @@ ExecuteHashJoinCombine(ExecCtx &ctx,
 {
 	if (local.build_keys == nullptr || local.build_rows == nullptr)
 		elog(ERROR, "pg_yaap: hash join combine local build rows missing");
-	if (ctx.worker_index < 0)
-		elog(ERROR, "pg_yaap: hash join combine requires worker-local slot");
 
 	PrepareHashJoinCombine(ctx, global);
 
 	HashJoinLocalBuildRegistryEntry *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
-	if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+	if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 		elog(ERROR, "pg_yaap: hash join combine registry slot missing");
-	HashJoinLocalBuildRegistryEntry &entry = registry[ctx.worker_index];
+	HashJoinLocalBuildRegistryEntry &entry = registry[ExecutionTaskSlot(ctx)];
 
 	CopyLocalTdcIntoGlobal(global.build_key_layout,
 		local.build_keys,
@@ -431,15 +441,13 @@ ExecuteHashJoinSharedPayloadCombine(ExecCtx &ctx,
 {
 	if (local.build_keys == nullptr || local.build_rows == nullptr)
 		elog(ERROR, "pg_yaap: hash join shared-payload combine local build rows missing");
-	if (ctx.worker_index < 0)
-		elog(ERROR, "pg_yaap: hash join shared-payload combine requires worker-local slot");
 
 	PrepareHashJoinCombine(ctx, global);
 
 	HashJoinLocalBuildRegistryEntry *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
-	if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+	if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 		elog(ERROR, "pg_yaap: hash join shared-payload combine registry slot missing");
-	HashJoinLocalBuildRegistryEntry &entry = registry[ctx.worker_index];
+	HashJoinLocalBuildRegistryEntry &entry = registry[ExecutionTaskSlot(ctx)];
 
 	CopyLocalTdcIntoGlobal(global.build_key_layout,
 		local.build_keys,
@@ -468,7 +476,7 @@ ExecuteHashJoinSharedPayloadCombine(ExecCtx &ctx,
 	for (uint32_t row_idx = 0; row_idx < entry.row_count; ++row_idx)
 	{
 		const uint32_t global_row_idx = entry.global_row_offset + row_idx;
-		slots[global_row_idx] = static_cast<uint32_t>(ctx.worker_index);
+		slots[global_row_idx] = ExecutionTaskSlot(ctx);
 		local_idxs[global_row_idx] = row_idx;
 	}
 	return SinkCombineResultType::FINISHED;
@@ -478,7 +486,7 @@ void
 PublishHashJoinCombinedRows(HashJoinGlobalSinkState &global)
 {
 	if (global.payload == nullptr ||
-		pg_atomic_read_u32(&global.payload->combine_prepare_state) != 2u)
+		pg_atomic_read_membarrier_u32(&global.payload->combine_prepare_state) != 2u)
 		return;
 
 	global.build_keys = ResolveTdc(global.dsa, global.payload->build_keys_dp);

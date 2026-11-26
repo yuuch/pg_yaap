@@ -17,6 +17,8 @@ enum class PhysicalOperatorType {
     WINDOW,
     HASH_JOIN,
     DELIM_SCAN,
+    MATERIALIZED_CTE,
+    CTE_SCAN,
     CROSS_PRODUCT,
     HASH_GROUP_BY,
     ORDER_BY
@@ -162,6 +164,8 @@ public:
     int join_type;
     bool dependent = false;
     bool delim_join = false;
+    bool build_left = false;
+    bool build_output = false;
     TableIndex mark_index{static_cast<size_t>(-1)};
     bool has_mark_index = false;
     bool invert_result = false;
@@ -183,6 +187,36 @@ public:
 
     PhysicalDelimScan(TableIndex table_index, size_t estimated_cardinality)
         : PhysicalOperator(PhysicalOperatorType::DELIM_SCAN, estimated_cardinality), table_index(table_index) {}
+};
+
+class PhysicalMaterializedCTE : public PhysicalOperator {
+public:
+    TableIndex table_index;
+    std::string cte_name;
+    std::vector<ColumnBinding> output_bindings;
+
+    PhysicalMaterializedCTE(TableIndex table_index, std::string cte_name,
+                            std::vector<ColumnBinding> output_bindings,
+                            size_t estimated_cardinality)
+        : PhysicalOperator(PhysicalOperatorType::MATERIALIZED_CTE, estimated_cardinality),
+          table_index(table_index),
+          cte_name(std::move(cte_name)),
+          output_bindings(std::move(output_bindings)) {}
+};
+
+class PhysicalCTEScan : public PhysicalOperator {
+public:
+    TableIndex table_index;
+    TableIndex cte_index;
+    std::string cte_name;
+    std::vector<std::string> output_names;
+
+    PhysicalCTEScan(TableIndex table_index, TableIndex cte_index, std::string cte_name,
+                    size_t estimated_cardinality)
+        : PhysicalOperator(PhysicalOperatorType::CTE_SCAN, estimated_cardinality),
+          table_index(table_index),
+          cte_index(cte_index),
+          cte_name(std::move(cte_name)) {}
 };
 
 class PhysicalHashAggregate : public PhysicalOperator {

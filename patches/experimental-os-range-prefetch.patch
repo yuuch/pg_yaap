@@ -1,0 +1,626 @@
+--- a/src/bridge/pg_yaap.c
++++ b/src/bridge/pg_yaap.c
+@@ -55,11 +55,13 @@
+ extern int pg_yaap_scan_prefetch_buffers;
+ extern int pg_yaap_scan_prefetch_requests;
+ extern int pg_yaap_scan_prefetch_batch_pages;
++extern int pg_yaap_scan_os_prefetch_pages;
+ extern int pg_yaap_profile_scan_blocks;
+ int pg_yaap_scan_read_stream = 0;
+ int pg_yaap_scan_prefetch_buffers = 1024;
+ int pg_yaap_scan_prefetch_requests = 1;
+ int pg_yaap_scan_prefetch_batch_pages = 0;
++int pg_yaap_scan_os_prefetch_pages = 0;
+ int pg_yaap_profile_scan_blocks = 0;
+ static const struct config_enum_entry pg_yaap_scan_read_stream_options[] = {
+ 	{"pg", 0, false},
+@@ -450,6 +452,11 @@
+                              NULL, &pg_yaap_scan_prefetch_batch_pages, 0, 0, 128,
+                              PGC_USERSET, 0, NULL, NULL, NULL);
+ 
++    DefineCustomIntVariable("pg_yaap.scan_os_prefetch_pages",
++                            "Experimental OS advisory prefetch window within owned YAAP scan ranges (0 disables).",
++                            NULL, &pg_yaap_scan_os_prefetch_pages, 0, 0, 16384,
++                            PGC_USERSET, 0, NULL, NULL, NULL);
++
+ 	DefineCustomIntVariable("pg_yaap.profile_scan_blocks",
+                              "Bounded block diagnostic events per YAAP scan source (0 disables).",
+                              NULL, &pg_yaap_profile_scan_blocks, 0, 0, 65536,
+--- a/src/executor/engine/parallel/pipeline/dsm_control.hpp
++++ b/src/executor/engine/parallel/pipeline/dsm_control.hpp
+@@ -111,6 +111,7 @@
+ 	uint32           scan_prefetch_buffers;
+ 	uint32           scan_prefetch_requests;
+ 	uint32           scan_prefetch_batch_pages;
++	uint32           scan_os_prefetch_pages;
+ 	uint32           profile_scan_blocks;
+ 
+ 	/*
+--- a/src/executor/engine/parallel/pipeline/runtime_dsm.cpp
++++ b/src/executor/engine/parallel/pipeline/runtime_dsm.cpp
+@@ -28,6 +28,7 @@
+ extern int pg_yaap_scan_prefetch_buffers;
+ extern int pg_yaap_scan_prefetch_requests;
+ extern int pg_yaap_scan_prefetch_batch_pages;
++extern int pg_yaap_scan_os_prefetch_pages;
+ extern int pg_yaap_profile_scan_blocks;
+ extern bool pg_yaap_trace_execution_path;
+ extern int pg_yaap_runtime_dsa_tranche_id(void);
+@@ -129,6 +130,7 @@
+ 	control->scan_prefetch_buffers = pg_yaap_scan_prefetch_buffers;
+ 	control->scan_prefetch_requests = pg_yaap_scan_prefetch_requests;
+ 	control->scan_prefetch_batch_pages = pg_yaap_scan_prefetch_batch_pages;
++	control->scan_os_prefetch_pages = pg_yaap_scan_os_prefetch_pages;
+ 	control->profile_scan_blocks = pg_yaap_profile_scan_blocks;
+ 	pg_atomic_init_u32(&control->profile_enabled, 0);
+ 	pg_atomic_init_u32(&control->trace_execution_path, 0);
+--- a/src/executor/engine/parallel/pipeline/physical_seq_scan_read_stream.hpp
++++ b/src/executor/engine/parallel/pipeline/physical_seq_scan_read_stream.hpp
+@@ -20,10 +20,17 @@
+ 	bool yaap_queue = false;
+ 	uint32_t actual_window_pages = 0;
+     uint32_t initial_chunk_pages = 0;
++    // Advisory OS-cache window; this does not own Buffer pins or prove readiness.
++    uint32_t os_prefetch_pages = 0;
++    bool os_prefetch_enabled = false;
++    uint64_t os_prefetch_calls = 0, os_prefetch_pages_hinted = 0;
++    uint64_t os_prefetch_ns = 0, os_prefetch_failed_calls = 0, os_prefetch_chunks = 0;
++    uint64_t os_prefetch_chunk_end = 0, os_prefetch_next = 0, os_prefetch_trigger = 0;
+ };
+ 
+ struct YaapReadStream;
+ void YaapReadStreamEnableBlockTrace(YaapReadStream *, uint32_t capacity);
++void YaapReadStreamSetOSPrefetch(YaapReadStream *, uint32_t pages);
+ struct ScanIOStats;
+ void YaapReadStreamEnableIOProfile(YaapReadStream *, bool detail, uint32_t requested,
+  uint32_t query_cap, uint32_t backend_cap);
+--- a/src/executor/engine/parallel/pipeline/physical_seq_scan_read_stream.cpp
++++ b/src/executor/engine/parallel/pipeline/physical_seq_scan_read_stream.cpp
+@@ -10,6 +10,8 @@
+ #include "utils/memutils.h"
+ #include "port/pg_bitutils.h"
+ #include "storage/bufmgr.h"
++#include "storage/fd.h"
++#include "storage/smgr.h"
+ #include "storage/io_worker.h"
+ #include "storage/aio.h"
+ #include "utils/elog.h"
+@@ -150,6 +152,51 @@
+ 	     last_block,
+ 	     chunk_len,
+ 	     wrapped ? 1 : 0);
++}
++
++/* The allocator cursor can be ahead of consumption. Hints are confined to
++ * this worker's current logical ownership range, with no duplicated ranges. */
++static void
++PrefetchOwnedRange(SeqScanReadStreamState &state, ParallelBlockTableScanDesc pbscan,
++                   ParallelBlockTableScanWorker worker, bool new_chunk, BlockNumber page)
++{
++    if (!state.os_prefetch_enabled || page == InvalidBlockNumber)
++        return;
++
++    const uint64_t logical = worker->phsw_nallocated;
++    const uint64_t nblocks = pbscan->phs_nblocks;
++    if (new_chunk) {
++        state.os_prefetch_chunk_end = std::min<uint64_t>(nblocks, logical + worker->phsw_chunk_size);
++        state.os_prefetch_next = logical;
++        state.os_prefetch_trigger = logical;
++        ++state.os_prefetch_chunks;
++    }
++    if (logical < state.os_prefetch_trigger || state.os_prefetch_next >= state.os_prefetch_chunk_end)
++        return;
++
++    const uint64_t target = std::min<uint64_t>(state.os_prefetch_chunk_end,
++                                             logical + state.os_prefetch_pages);
++    uint64_t next = state.os_prefetch_next;
++    while (next < target) {
++        const BlockNumber first = static_cast<BlockNumber>((next + pbscan->phs_startblock) % nblocks);
++        const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(target - next, nblocks - first));
++        const uint64_t begin = BlockTraceClock();
++        // smgr splits file-segment boundaries; relation wrap is split here.
++        const bool advised = smgrprefetch(RelationGetSmgr(state.scan->rs_base.rs_rd),
++                                         MAIN_FORKNUM, first, static_cast<int>(count));
++        const uint64_t end = BlockTraceClock();
++        ++state.os_prefetch_calls;
++        state.os_prefetch_pages_hinted += count;
++        state.os_prefetch_ns += end - begin;
++        if (!advised) ++state.os_prefetch_failed_calls;
++        BlockTraceRecord(state.block_trace, "OS_PREFETCH", begin, end, 0, first,
++                         count, count, -1, InvalidBuffer);
++        next += count;
++    }
++    state.os_prefetch_next = next;
++    const uint64_t step = std::max<uint32_t>(1, state.os_prefetch_pages / 2);
++    state.os_prefetch_trigger = next >= state.os_prefetch_chunk_end
++        ? state.os_prefetch_chunk_end : next - std::min(next, step);
+ }
+ 
+ static BlockNumber
+@@ -214,6 +261,7 @@
+         }
+ 	}
+ 
++    PrefetchOwnedRange(*state, pbscan, pbscanwork, starting_new_chunk, scan->rs_prefetch_block);
+ 	return scan->rs_prefetch_block;
+ }
+ 
+@@ -411,10 +459,12 @@
+ 				allowance = 1;
+ 			}
+ 			const uint64_t assign_begin = QueueClock(s->io_stats && s->io_stats->detail);
++            const uint64_t os_before = s->state->os_prefetch_ns;
+ 			BlockNumber first = QueueNextBlock(s);
+ 			if (first == InvalidBlockNumber) {
+                 if (s->io_stats && s->io_stats->detail)
+-                    s->io_stats->block_assignment_ns += QueueClock(true) - assign_begin;
++                    s->io_stats->block_assignment_ns +=
++                        QueueClock(true) - assign_begin - (s->state->os_prefetch_ns - os_before);
+ 				s->eof = true;
+ 				break;
+ 			}
+@@ -436,7 +486,8 @@
+ 				++b.count;
+ 			}
+ 			if (s->io_stats && s->io_stats->detail)
+-                s->io_stats->block_assignment_ns += QueueClock(true) - assign_begin;
++                s->io_stats->block_assignment_ns +=
++                        QueueClock(true) - assign_begin - (s->state->os_prefetch_ns - os_before);
+             /* Publish ownership before calls which can ERROR. Request storage lives
+ 			 * until transaction cleanup even if the query's C++ destructors are skipped. */
+ 			++s->used;
+@@ -874,6 +925,17 @@
+ 			}
+ 		}
+ 	}
++    if (s->state->os_prefetch_pages) {
++        const auto &os = *s->state;
++        elog(LOG, "pg_yaap[os-prefetch] pid=%d worker=%d rel=%u requested_pages=%u "
++             "enabled=%d calls=%llu pages_hinted=%llu elapsed_ns=%llu failed_calls=%llu chunks=%llu "
++             "semantics=ADVISORY_ATTEMPTS_NOT_COMPLETION_OR_OS_ACCEPTANCE",
++             MyProcPid, os.worker_index, RelationGetRelid(s->scan->rs_base.rs_rd),
++             os.os_prefetch_pages, os.os_prefetch_enabled,
++             (unsigned long long)os.os_prefetch_calls, (unsigned long long)os.os_prefetch_pages_hinted,
++             (unsigned long long)os.os_prefetch_ns, (unsigned long long)os.os_prefetch_failed_calls,
++             (unsigned long long)os.os_prefetch_chunks);
++    }
+ 	BlockTraceDump(s->state->block_trace);
+ 	/* Keep every request and its buffer pins alive until all outstanding
+ 	 * requests have completed, including when LIMIT abandons most of a queue. */
+@@ -933,8 +995,38 @@
+     }
+     MemoryContextSwitchTo(old);
+ }
+-const ScanIOStats *YaapReadStreamGetIOStats(const YaapReadStream *s) { return s->io_stats; }
++const ScanIOStats *YaapReadStreamGetIOStats(const YaapReadStream *s) {
++    if (s->io_stats) {
++        auto &io = *s->io_stats;
++        const auto &os = *s->state;
++        io.os_prefetch_requested_pages = os.os_prefetch_pages;
++        io.os_prefetch_enabled = os.os_prefetch_enabled;
++        io.os_prefetch_calls = os.os_prefetch_calls;
++        io.os_prefetch_pages_hinted = os.os_prefetch_pages_hinted;
++        io.os_prefetch_ns = os.os_prefetch_ns;
++        io.os_prefetch_failed_calls = os.os_prefetch_failed_calls;
++        io.os_prefetch_chunks = os.os_prefetch_chunks;
++    }
++    return s->io_stats;
++}
+ const YaapReadStreamStats &YaapReadStreamGetStats(const YaapReadStream *s) { return s->stats; }
++
++void YaapReadStreamSetOSPrefetch(YaapReadStream *s, uint32_t pages) {
++    Assert(!s->stats.calls && pages <= 16384);
++    auto &state = *s->state;
++    state.os_prefetch_pages = pages;
++    state.os_prefetch_calls = state.os_prefetch_pages_hinted = state.os_prefetch_ns = 0;
++    state.os_prefetch_failed_calls = state.os_prefetch_chunks = 0;
++    state.os_prefetch_chunk_end = state.os_prefetch_next = state.os_prefetch_trigger = 0;
++#ifdef USE_PREFETCH
++    state.os_prefetch_enabled = pages > 0 && state.yaap_queue &&
++        s->scan->rs_base.rs_parallel &&
++        s->scan->rs_base.rs_rd->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
++        !(io_direct_flags & IO_DIRECT_DATA);
++#else
++    state.os_prefetch_enabled = false;
++#endif
++}
+ 
+ void YaapReadStreamEnableBlockTrace(YaapReadStream *s, uint32_t capacity) {
+     if (!capacity || s->state->block_trace) return;
+--- a/src/executor/engine/parallel/pipeline/physical_seq_scan.cpp
++++ b/src/executor/engine/parallel/pipeline/physical_seq_scan.cpp
+@@ -1170,6 +1170,7 @@
+         local->yaap_read_stream = YaapReadStreamBegin(local->scan_desc, local->read_stream_state,
+             ctx.worker_index, ctx.control->num_workers, SeqScanTraceEnabled(ctx), window,
+             scan_profile || PipelineProfileEnabled(ctx), ctx.control->scan_prefetch_requests, ctx.control->scan_prefetch_batch_pages);
++        YaapReadStreamSetOSPrefetch(local->yaap_read_stream, ctx.control->scan_os_prefetch_pages);
+         if (ctx.control->profile_scan_blocks)
+             YaapReadStreamEnableBlockTrace(local->yaap_read_stream, ctx.control->profile_scan_blocks);
+         if (ScanIOProfileMode(ctx)) {
+--- a/src/executor/engine/parallel/pipeline/scan_io_metrics.hpp
++++ b/src/executor/engine/parallel/pipeline/scan_io_metrics.hpp
+@@ -140,6 +140,8 @@
+     X(kernel_shared_complete_ns) X(kernel_enqueue_to_shared_ns) X(kernel_timed_read_requests) \
+     X(kernel_failed_requests) X(kernel_unclassified_requests) \
+     X(page_consumer_gap_ns) X(page_consumer_gap_count) \
++    X(os_prefetch_calls) X(os_prefetch_pages_hinted) X(os_prefetch_ns) \
++    X(os_prefetch_failed_calls) X(os_prefetch_chunks) \
+     YAAP_SCAN_BUFFER_COUNTERS(X)
+ #define YAAP_SCAN_IO_HISTOGRAMS(X)                                                                 \
+ 	X(api_return_to_need_ns)                                                                       \
+@@ -162,6 +164,7 @@
+ 	uint32_t io_workers = 0, effective_io_concurrency = 0, io_combine_limit = 0,
+ 			 io_max_concurrency = 0;
+ 	uint64_t shared_buffers_pages = 0;
++    uint32_t os_prefetch_requested_pages = 0, os_prefetch_enabled = 0;
+     uint32_t kernel_feature_supported = 0;
+     uint32_t buffer_feature_supported = 0;
+ 	bool mixed_config = false;
+--- a/src/executor/engine/parallel/pipeline/scan_io_profile.cpp
++++ b/src/executor/engine/parallel/pipeline/scan_io_profile.cpp
+@@ -41,6 +41,8 @@
+ 		 a.io_method != b.io_method || a.batch_pages != b.batch_pages ||
+          a.kernel_feature_supported != b.kernel_feature_supported ||
+          a.buffer_feature_supported != b.buffer_feature_supported ||
++         a.os_prefetch_requested_pages != b.os_prefetch_requested_pages ||
++         a.os_prefetch_enabled != b.os_prefetch_enabled ||
+ 		 a.io_workers != b.io_workers || a.effective_io_concurrency != b.effective_io_concurrency ||
+ 		 a.io_combine_limit != b.io_combine_limit || a.io_max_concurrency != b.io_max_concurrency ||
+ 		 (a.allocation_chunk_pages && b.allocation_chunk_pages &&
+@@ -67,6 +69,8 @@
+ 	COPY(shared_buffers_pages);
+     COPY(kernel_feature_supported);
+     COPY(buffer_feature_supported);
++    COPY(os_prefetch_requested_pages);
++    COPY(os_prefetch_enabled);
+ 	if (b.allocation_chunk_pages)
+ 		a.allocation_chunk_pages = b.allocation_chunk_pages;
+ 	if (mixed)
+@@ -230,6 +234,14 @@
+ 		 (unsigned long long)s.readiness_unknown_pages, ready_lb, pg_rate, r.source_ns / 1e6,
+ 		 s.next_total_ns / 1e6, r.wait_api_ns / 1e6, api_ratio,
+ 		 (unsigned long long)s.request_not_submitted_at_need_pages);
++    if (s.os_prefetch_requested_pages || detail)
++        elog(NOTICE, "pg_yaap[scan-io-os-prefetch] %s pipeline=%u worker=%d requested_pages=%u "
++             "enabled=%u calls=%llu pages_hinted=%llu call_ms=%.3f returned_false=%llu chunks=%llu "
++             "semantics=ADVISORY_OS_CACHE_HINT_NOT_IO_COMPLETION",
++             scope, pipeline, worker, s.os_prefetch_requested_pages, s.os_prefetch_enabled,
++             (unsigned long long)s.os_prefetch_calls, (unsigned long long)s.os_prefetch_pages_hinted,
++             s.os_prefetch_ns/1e6, (unsigned long long)s.os_prefetch_failed_calls,
++             (unsigned long long)s.os_prefetch_chunks);
+     const bool pg_start_available = complete && s.api_start_calls &&
+         s.pg_start_timed_calls == s.api_start_calls;
+     const bool pg_wait_available = complete && s.wait_validation_calls &&
+@@ -708,14 +720,14 @@
+ 		"pages\":%u,\"granted_pages\":%u,\"query_share_cap\":%u,\"backend_share_cap\":%u,\"pg_pin_"
+ 		"cap\":%u,\"ring_capacity\":%u,\"request_cap\":%u,\"batch_pages\":%u,\"block_size\":%u,"
+ 		"\"io_method\":%u,\"io_workers\":%u,\"shared_buffers_pages\":%llu,\"effective_io_"
+-		"concurrency\":%u,\"io_combine_limit\":%u,\"io_max_concurrency\":%u,\"kernel_feature_supported\":%u,\"buffer_feature_supported\":%u},\"histograms\":{",
++		"concurrency\":%u,\"io_combine_limit\":%u,\"io_max_concurrency\":%u,\"kernel_feature_supported\":%u,\"buffer_feature_supported\":%u,\"os_prefetch_requested_pages\":%u,\"os_prefetch_enabled\":%u},\"histograms\":{",
+ 		(unsigned long long)r->source_ns, (unsigned long long)r->submit_api_ns,
+ 		(unsigned long long)r->wait_api_ns, (unsigned long long)r->refill_exclusive_ns,
+ 		(unsigned long long)r->shared_hits, (unsigned long long)r->shared_reads,
+ 		s.mixed_config ? "true" : "false", s.requested_pages, s.granted_pages, s.query_share_cap,
+ 		s.backend_share_cap, s.pg_pin_cap, s.ring_capacity, s.request_cap, s.batch_pages,
+ 		s.block_size, s.io_method, s.io_workers, (unsigned long long)s.shared_buffers_pages,
+-		s.effective_io_concurrency, s.io_combine_limit, s.io_max_concurrency, s.kernel_feature_supported, s.buffer_feature_supported);
++		s.effective_io_concurrency, s.io_combine_limit, s.io_max_concurrency, s.kernel_feature_supported, s.buffer_feature_supported, s.os_prefetch_requested_pages, s.os_prefetch_enabled);
+ #define HIST(n) HistogramJson(out, #n, s.n);
+ 	YAAP_SCAN_IO_HISTOGRAMS(HIST)
+ #undef HIST
+--- a/tests/scan_io_profile.py
++++ b/tests/scan_io_profile.py
+@@ -18,6 +18,7 @@
+  'next_total_ns','wait_validation_calls','api_start_calls','api_accepted_pages',
+  'start_ready_pages','start_need_wait_pages','pin_binding_events','request_binding_events',
+  'window_full_events','slot_binding_events','validation_observations',
++ 'os_prefetch_calls','os_prefetch_pages_hinted','os_prefetch_ns','os_prefetch_failed_calls','os_prefetch_chunks',
+  'block_assignment_ns','pin_budget_check_ns','submit_cpu_samples','submit_sample_wall_ns',
+  'submit_sample_cpu_ns','wait_cpu_samples','wait_sample_wall_ns','wait_sample_cpu_ns','cpu_clock_failures',
+  'pg_start_read_ns','pg_wait_read_ns','pg_wait_new_read_pages','pg_start_timed_calls','pg_wait_timed_calls',
+--- a/tests/scan_block_trace.py
++++ b/tests/scan_block_trace.py
+@@ -51,7 +51,7 @@
+         needs = []
+         for event in events:
+             phase = event['event']
+-            assert phase in ('ASSIGN', 'START', 'NEED', 'WAIT', 'CLEANUP_WAIT'), event
++            assert phase in ('ASSIGN', 'START', 'NEED', 'WAIT', 'CLEANUP_WAIT', 'OS_PREFETCH'), event
+             assert int(event['time_ns']) > 0
+             assert int(event['end_ns']) >= int(event['time_ns']), event
+             assert int(event['pages']) >= 1
+@@ -65,6 +65,11 @@
+             elif phase == 'ASSIGN':
+                 assert int(event['last_block']) == (block + int(event['pages']) - 1) % pages
+                 assigns.append(event)
++            elif phase == 'OS_PREFETCH':
++                assert int(event['request']) == 0
++                assert int(event['need_wait']) == -1
++                assert int(event['pages']) <= int(event['requested'])
++                assert block + int(event['pages']) <= pages, 'wrap must be split'
+             elif phase == 'NEED':
+                 assert int(event['pages']) == 1
+                 assert int(event['need_wait']) in (-1, 0, 1)
+--- /dev/null
++++ b/tests/scan_os_prefetch.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++"""Check bounded OS hints against actual parallel scan ownership and results."""
++import argparse
++import json
++import os
++from pathlib import Path
++import time
++
++import memory_runtime as runtime
++import scan_block_trace as trace
++import scan_io_profile as io_profile
++
++OUT = runtime.OUT
++SCHEMA = f'yaap_os_prefetch_{os.getpid()}'
++CAPACITY = 65536
++
++
++def hint_pages(assigns, hints, pages, distance):
++    """Validate one source's physical hint ranges, including wrapped ownership."""
++    seen = set()
++    for event in hints:
++        first, count = int(event['block']), int(event['pages'])
++        assert 0 < count <= distance, event
++        assert 0 <= first < pages and first + count <= pages, event
++        assert int(event['last_block']) == first + count - 1, event
++        assert int(event['request']) == 0 and int(event['need_wait']) == -1
++        assert int(event['end_ns']) >= int(event['time_ns']) > 0
++        blocks = set(range(first, first + count))
++        assert not seen.intersection(blocks), ('repeated hint', event)
++        assert any(all((block - int(owner['block'])) % pages < int(owner['pages'])
++                       for block in blocks) for owner in assigns), ('hint outside ownership', event)
++        seen.update(blocks)
++    return seen
++
++
++def self_test():
++    def hint(block, count):
++        return dict(block=block, pages=count, last_block=block+count-1,
++                    request=0, need_wait=-1, time_ns=1, end_ns=2)
++    owners = [dict(block=7, pages=5)]
++    assert hint_pages(owners, [hint(7, 3), hint(0, 2)], 10, 4) == {7, 8, 9, 0, 1}
++    for bad in ([hint(9, 2)], [hint(2, 1)], [hint(7, 2), hint(8, 2)], [hint(7, 5)]):
++        try:
++            hint_pages(owners, bad, 10, 4)
++        except AssertionError:
++            pass
++        else:
++            raise AssertionError(('bad range accepted', bad))
++    print('5 OS hint range checks passed')
++
++
++def server_delta(log, offset):
++    time.sleep(.1)
++    assert log.stat().st_size >= offset, 'server log rotated during test'
++    with log.open('rb') as source:
++        source.seek(offset)
++        return source.read().decode(errors='replace')
++
++
++def main():
++    if not trace.LOG:
++        raise SystemExit('Set YAAP_BLOCK_TRACE_LOG to a dedicated nonrotating PG server log')
++    OUT.mkdir(parents=True, exist_ok=True)
++    table = f'{SCHEMA}.a'
++    runtime.ddl(f'CREATE SCHEMA {SCHEMA}; CREATE TABLE {table} AS SELECT '
++                "i::bigint AS id,(i%17)::int AS k,repeat('x',96)::text AS padding "
++                'FROM generate_series(1,60000) i; '
++                f'CREATE TABLE {SCHEMA}.empty AS SELECT * FROM {table} WHERE false; '
++                f'ANALYZE {table}; ANALYZE {SCHEMA}.empty;')
++    results = []
++    try:
++        pages = int(runtime.checked(f"SELECT pg_relation_size('{table}')/current_setting('block_size')::bigint;"))
++        checksum = f'SELECT count(*),sum(id),sum(id*id) FROM {table};'
++        cases = [
++            ('off', checksum, 1, 0, 128, 'yaap', True),
++            ('single-32', checksum, 1, 32, 128, 'yaap', True),
++            ('multi-32', checksum, 4, 32, 128, 'yaap', True),
++            ('multi-256', checksum, 4, 256, 128, 'yaap', True),
++            ('single-1024', checksum, 1, 1024, 128, 'yaap', True),
++            ('small-pin-window', checksum, 4, 256, 17, 'yaap', True),
++            ('reject', f'SELECT id FROM {table} WHERE id<0;', 4, 32, 128, 'yaap', True),
++            ('empty', f'SELECT id FROM {SCHEMA}.empty;', 4, 1024, 128, 'yaap', True),
++            ('limit', f'SELECT 1 FROM {table} LIMIT 7;', 4, 1024, 128, 'yaap', False),
++            ('native', checksum, 4, 1024, 128, 'pg', True),
++        ]
++        for name, sql, workers, distance, window, stream, full_scan in cases:
++            expected = runtime.checked('SET pg_yaap.enabled=off;' + sql)
++            prefix = OUT/f'{name}-{time.time_ns()}'
++            setup = runtime.setup(workers, '512MB') + (
++                'SET pg_yaap.parallel_leader_participation=off; '
++                'SET io_combine_limit=16; SET pg_yaap.scan_prefetch_batch_pages=16; '
++                f'SET pg_yaap.scan_read_stream={stream}; '
++                'SET pg_yaap.scan_prefetch_requests=1; '
++                f'SET pg_yaap.scan_prefetch_buffers={window}; '
++                f'SET pg_yaap.scan_os_prefetch_pages={distance}; '
++                'SET pg_yaap.profile=off; SET pg_yaap.profile_scan=off; '
++                'SET pg_yaap.profile_scan_io=detail; SET pg_yaap.profile_timeline=trace; '
++                f"SET pg_yaap.profile_trace_file='{prefix}'; "
++                f'SET pg_yaap.profile_scan_blocks={CAPACITY}; ')
++            offset = trace.LOG.stat().st_size
++            result = runtime.run(setup + sql)
++            delta = server_delta(trace.LOG, offset)
++            (OUT/f'{name}.out').write_text(result.stdout)
++            (OUT/f'{name}.err').write_text(result.stderr)
++            (OUT/f'{name}.blocks.log').write_text(delta)
++            assert result.returncode == 0, (name, result.stderr)
++            assert result.stdout.splitlines() == expected.splitlines(), name
++            files = list(OUT.glob(prefix.name+'.*.json'))
++            assert len(files) == 1, (name, files)
++            data = json.loads(files[0].read_text())
++            scans = io_profile.validate_io(data)
++            if stream == 'pg':
++                assert 'event=OS_PREFETCH' not in delta
++                results.append({'case': name, 'pass': True})
++            else:
++                relation_pages = 0 if name == 'empty' else pages
++                streams, summaries, needs = trace.validate_trace(delta, CAPACITY, relation_pages, True)
++                hinted = set()
++                call_count = 0
++                for events in streams.values():
++                    assigns = [e for e in events if e['event'] == 'ASSIGN']
++                    hints = [e for e in events if e['event'] == 'OS_PREFETCH']
++                    if distance == 0:
++                        assert not hints
++                        continue
++                    owned_hints = hint_pages(assigns, hints, relation_pages, distance)
++                    assert not hinted.intersection(owned_hints), 'workers hinted the same table block'
++                    hinted.update(owned_hints)
++                    call_count += len(hints)
++                observed = [s['observed'] for s in scans]
++                assert sum(s['os_prefetch_calls'] for s in observed) == call_count, name
++                assert sum(s['os_prefetch_pages_hinted'] for s in observed) == len(hinted), name
++                if name == 'empty':
++                    assert not needs and not hinted
++                elif full_scan:
++                    assert len(needs) == pages
++                    assert sorted(int(e['block']) for e in needs) == list(range(pages)), name
++                    if distance:
++                        assert hinted == set(range(pages)), (name, len(hinted), pages)
++                # LIMIT may hint pages that it never consumes; that is expected.
++                if distance == 0:
++                    assert sum(s['os_prefetch_ns'] for s in observed) == 0
++                results.append({'case': name, 'pass': True, 'hint_calls': call_count,
++                                'hinted_pages': len(hinted), 'consumed_pages': len(needs)})
++            (OUT/'summary.json').write_text(json.dumps(results, indent=2)+'\n')
++            print(json.dumps(results[-1]), flush=True)
++    finally:
++        runtime.ddl(f'DROP SCHEMA {SCHEMA} CASCADE;')
++        (OUT/'summary.json').write_text(json.dumps(results, indent=2)+'\n')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--self-test', action='store_true')
++    args = parser.parse_args()
++    self_test()
++    if not args.self_test:
++        main()
+--- /dev/null
++++ b/docs/scan_os_prefetch.md
+@@ -0,0 +1,99 @@
++# Experimental OS range prefetch
++
++`pg_yaap.scan_os_prefetch_pages` requests advisory readahead for a range owned by
++one YAAP parallel Scan Source. It is experimental and defaults to **0 (off)**;
++valid values are 0–16384 pages. With 8KiB pages, 1024/4096/12800 pages correspond
++to 8/32/100MiB. The existing request batch and pending-request quota remain
++separate: this hint does not create a 100MiB PG Buffer read operation.
++
++```sql
++SET pg_yaap.scan_read_stream=yaap;
++SET pg_yaap.scan_prefetch_requests=1;
++SET pg_yaap.scan_os_prefetch_pages=4096;
++-- Optional observations:
++SET pg_yaap.profile_scan_io=detail;
++SET pg_yaap.profile_scan_blocks=65536;
++```
++
++The feature applies to buffered, shared, parallel YAAP heap scans. It does not
++change PG's native ReadStream mode. Unsupported paths such as direct data I/O,
++local/temp relations or a nonparallel scan do not issue hints. A disabled or
++unsupported path must not be interpreted as successful prefetch.
++
++Each worker still claims disjoint ranges using the existing PG parallel Block
++allocator. The initial hint covers up to the configured distance within its
++owned chunk. As the Block generator advances, later nonoverlapping hints extend
++the lead, without extending past the owned chunk. Relation-end wrap is split
++into physical ranges; PG's storage manager handles relation segment boundaries.
++The generator is ahead of actual tuple consumption, so this is generator-based
++lookahead rather than a timestamp of when the page is needed.
++
++The path uses PostgreSQL `smgrprefetch`/`FilePrefetch`. On this macOS build that
++ultimately invokes `F_RDADVISE`; other builds may use their own supported PG
++prefetch implementation. These are **advisory requests to the OS**, not confirmed
++completion or cache residency. The `smgrprefetch` return value also does not
++provide a per-page completion result; a zero failed-call count is not a guarantee
++that the OS performed all requested readahead.
++
++No extra Buffer pins are taken. The data continues through PG Buffer Manager,
++page validation and normal heap visibility before YAAP consumes it. No private
++raw-file buffer, independent physical I/O workers, or MVCC bypass is introduced.
++A SQL LIMIT can leave hinted pages unused, which is normal speculative work.
++
++## Bounded observations
++
++The existing Scan I/O profile reports per-source and aggregate
++`os_prefetch_calls`, `os_prefetch_pages_hinted`, `os_prefetch_ns`,
++`os_prefetch_failed_calls` and `os_prefetch_chunks`, together with requested page
++distance and effective enablement metadata. Elapsed time covers the hint API,
++not the storage completion latency. The counter is for calls to PG's advisory
++API, not physical device requests or bytes read from SSD.
++
++The optional bounded Block log adds `OS_PREFETCH` events with a physical Block
++range and API entry/return timestamps. It is written to the PG server log at
++normal Source teardown. Events remain subject to that trace's per-source cap
++and dropped count. Use it with `ASSIGN` events to verify ownership; request ID0
++means an advisory range, not a normal `StartReadBuffers` operation.
++
++## Resource tradeoff and benchmark criteria
++
++A large per-source distance multiplies across sources: twelve sources requesting
++100MiB ahead nominally cover about 1.2GiB. This is not reserved private memory,
++but it can increase OS cache pressure, speculative reads, and interference with
++other queries. The OS can coalesce, delay or ignore hints. Bigger is not assumed
++better. Keep the default off unless a representative, repeated end-to-end query
++comparison shows a benefit. A shorter subsequent `preadv` duration alone may
++only move waiting or I/O work earlier.
++
++Measure query wall time, device throughput and the existing PG read/wait counters
++with and without hints. Separate detailed profiling from performance baselines,
++keep request size/quota and worker counts fixed, and state cache conditions.
++
++## Integration test
++
++Use a dedicated instance with a rebuilt library and readable, nonrotating server
++log, without concurrent YAAP queries:
++
++```sh
++PGHOST=/tmp PGPORT=55432 PGUSER=postgres PGDATABASE=tpch \
++YAAP_TEST_OUTPUT=artifacts/scan-os-prefetch-regression \
++YAAP_BLOCK_TRACE_LOG=/absolute/path/to/postgresql-server.log \
++python3 tests/scan_os_prefetch.py
++```
++
++The test reuses existing fixture/DDL and trace/profile validators. It checks
++native-result equivalence, off/native mode, one and four workers, 32/256/1024-page
++settings, a small queue/pin window, rejected rows, empty input and LIMIT. It
++checks every hint is inside an assigned range, split at physical relation end,
++bounded by distance and not duplicated. Complete scans hint/consume each table
++page once; LIMIT is allowed to hint more than it consumes. Test-only PG combine
++limit16 makes the small fixture exercise multiple ownership chunks; production
++benchmark request size is unchanged.
++
++```sh
++python3 tests/scan_os_prefetch.py --self-test
++```
++
++The standalone range checks include wrapped ownership and reject out-of-owner,
++cross-EOF, overlapping and oversized hints. The live small fixture is generally
++hot; it verifies bounds/correctness, not cold-cache performance or OS completion.
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -205,6 +205,7 @@
+ | `pg_yaap.scan_read_stream` | enum | `pg` | `pg`/`yaap`: select PG ReadStream or the bounded plugin queue; see docs/yaap_read_stream.md. |
+ | `pg_yaap.scan_prefetch_buffers` | int, pages | `1024` | Requested YAAP prefetch window (16–8192); runtime pin budgets can reduce it. |
+ | `pg_yaap.scan_prefetch_requests` | int | `1` | Maximum unconsumed YAAP read operations per source (0–64); 0 retains window-only submission. |
++| `pg_yaap.scan_os_prefetch_pages` | int | `0` | Experimental OS-cache prefetch window within owned scan chunks (0–16384 pages); 0 disables. |
+ | `pg_yaap.memory_limit` | int | `256MB` | Hard budget for shared breaker payloads; DSA has bounded headroom (up to 50%, capped at 4GB) for directories and allocator metadata. |
+ | `pg_yaap.memory_soft_limit` | int | `-1` | Spill threshold; `-1` uses 75% of `memory_limit`. |
+ | `pg_yaap.dsa_memory_limit` | int, MB | `-1` | Exact query DSA segment-capacity ceiling; `-1` preserves automatic metadata headroom. Not a whole-query RSS limit. |
+--- a/src/bridge/AGENTS.md
++++ b/src/bridge/AGENTS.md
+@@ -66,6 +66,7 @@
+ | `pg_yaap.scan_read_stream` | `pg` | enum: pg/yaap | Select native ReadStream or plugin queue; workers use DSM snapshot. |
+ | `pg_yaap.scan_prefetch_buffers` | `1024` | 16–8192 pages | Requested plugin window, limited by pin budgets. |
+ | `pg_yaap.scan_prefetch_requests` | `1` | 0–64 | Per-source read-request cap; 0 retains the old window-only policy. |
++| `pg_yaap.scan_os_prefetch_pages` | `0` | 0–16384 | Experimental OS-cache hint window inside worker-owned chunks. |
+ | `pg_yaap.hash_join_partition_probe` | `true` | bool | Stream rows for the resident Build batch directly; partition and spill deferred Probe rows for matching later batches. Only equality-key joins use this path. Off retains the non-hybrid YAAP path for controlled comparisons. |
+ | `pg_yaap.memory_limit` | `256MB` | 64MB–`INT_MAX` bytes | Hard shared breaker-payload budget; DSA can reserve up to 50% (capped at 4GB) additional metadata/allocator space. |
+ | `pg_yaap.memory_soft_limit` | `-1` | -1–`INT_MAX` bytes | Spill threshold; `-1` uses 75% of `memory_limit`. |

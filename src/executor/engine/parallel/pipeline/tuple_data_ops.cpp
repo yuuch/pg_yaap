@@ -395,6 +395,14 @@ ScatterGroupColumns(const TupleDataLayout *layout,
 				}
 			}
 	}
+	if (layout->validity_width > 0)
+	{
+		auto *bitmap = row_ptr + TupleDataLayoutValidityOffset(layout);
+		std::memset(bitmap, 0, layout->validity_width);
+		for (uint16_t i = 0; i < layout->column_count; ++i)
+			if (chunk.nulls[layout->columns[i].src_col_idx][row_idx] != 0)
+				bitmap[i >> 3] |= static_cast<uint8_t>(1u << (i & 7u));
+	}
 }
 
 void
@@ -457,7 +465,7 @@ Gather(const TupleDataLayout *layout,
        uint16_t row_idx)
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
-	Assert(layout->column_count + layout->aggregate_count <= 16);
+	Assert(layout->aggregate_count == 0 || layout->column_count + layout->aggregate_count <= 16);
 
 	/* Group/payload columns: chunk col i = row col i. */
 	for (uint16_t i = 0; i < layout->column_count; ++i)
@@ -501,6 +509,9 @@ Gather(const TupleDataLayout *layout,
 					break;
 				}
 			}
+			if (layout->validity_width > 0)
+				chunk.nulls[col.src_col_idx][row_idx] =
+					TupleDataLayoutColumnIsNull(layout, row_ptr, i) ? 1 : 0;
 	}
 
 	/* Aggregate state columns: chunk col N+a = aggregate a (always int64). */
@@ -1155,6 +1166,63 @@ UpdateAggregatesGather(const TupleDataLayout *layout,
 	Assert(canonical_row_indices != nullptr && row_indices != nullptr);
 	Assert(row_width == layout->row_width);
 	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
+	if (count == 0 || layout->aggregate_count == 0)
+		return;
+
+	/* Partitioned HashAggregate calls UpdateAggregatesGather once per partition
+	 * per chunk (typically 32-64 rows). Avoid zeroing the 8 KB delta hash table
+	 * for small batches by updating worker-local canonical rows directly. */
+	if (count <= 128)
+	{
+		if (layout->aggregate_count == 1)
+		{
+			const TdcAggregateDesc &agg = layout->aggregates[0];
+			const uint16_t agg_off = agg.offset;
+			switch (agg.kind)
+			{
+				case TdcAggKind::SUM_INT64:
+				case TdcAggKind::SUM_NUMERIC:
+				{
+					const int64_t *src = chunk.int64_columns[agg.src_col_idx];
+					for (uint16_t i = 0; i < count; ++i)
+						AddInt64At(tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+						           agg_off,
+						           src[row_indices[i]]);
+					return;
+				}
+				case TdcAggKind::COUNT_STAR:
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						AddInt64At(tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+						           agg_off,
+						           1);
+					return;
+				}
+				case TdcAggKind::COUNT_NONNULL:
+				case TdcAggKind::COUNT_DISTINCT_NONNULL:
+				{
+					const uint8_t *nulls = chunk.nulls[agg.src_col_idx];
+					for (uint16_t i = 0; i < count; ++i)
+					{
+						if (nulls[row_indices[i]] == 0)
+							AddInt64At(tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+							           agg_off,
+							           1);
+					}
+					return;
+				}
+				default:
+					break;
+			}
+		}
+		for (uint16_t i = 0; i < count; ++i)
+			UpdateAggregates(layout,
+			                 tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+			                 chunk,
+			                 row_indices[i]);
+		return;
+	}
+
 	UpdateAggregatesGatherGroupedGeneric(layout,
 		tdc_base,
 		row_width,

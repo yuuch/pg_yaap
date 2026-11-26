@@ -28,6 +28,9 @@ public:
 	uint32_t            source_cursor = 0;
 	uint32_t            row_count = 0;
 	TupleDataCollection *tdc = nullptr;
+	dsa_pointer         segment_desc_dp = InvalidDsaPointer;
+	uint32_t            segment_row_cursor = 0;
+	bool                segment_backed = false;
 };
 
 class PhysicalDelimScan final : public PhysicalOperator {
@@ -68,3 +71,40 @@ private:
 
 }  /* namespace pipeline */
 }  /* namespace pg_yaap */
+
+namespace pg_yaap::pipeline {
+/* Immutable, budgeted query-lifetime spool. Each source has an independent reader. */
+struct MaterializeShared {
+ pg_atomic_uint64 chains_head;
+ pg_atomic_uint32 remaining_consumers;
+ uint32_t _pad0;
+ dsa_pointer arena_dp;
+};
+struct MaterializeScanShared { pg_atomic_uint32 next_chain; };
+dsa_pointer CreateMaterializeShared(dsa_area *dsa);
+dsa_pointer CreateMaterializeScan(dsa_area *dsa);
+class PhysicalMaterialize final : public PhysicalOperator {
+public:
+ PhysicalMaterialize(dsa_pointer layout, dsa_pointer payload,
+                     PhysicalMaterialize *producer = nullptr,
+                     dsa_pointer scan = InvalidDsaPointer)
+ : PhysicalOperator(PhysicalOperatorType::MATERIALIZE), layout_dp(layout), payload_dp(payload), scan_dp(scan), producer(producer) {}
+ bool IsSource() const override { return true; }
+ bool IsSink() const override { return producer == nullptr; }
+ bool ParallelSource() const override { return true; }
+ int MaxThreads(ExecCtx &) const override { return 0; }
+ bool CombineIsTrivial() const override { return true; }
+ void BuildPipelines(Pipeline &, MetaPipeline &) override;
+ std::unique_ptr<GlobalSinkState> GetGlobalSinkState(ExecCtx &) override;
+ std::unique_ptr<LocalSinkState> GetLocalSinkState(ExecCtx &, GlobalSinkState &) override;
+ SinkResultType SinkChunk(ExecCtx &, PipelineChunk &, OperatorSinkInput &) override;
+ SinkCombineResultType FinishLocalSink(ExecCtx &, OperatorSinkCombineInput &) override;
+ std::unique_ptr<GlobalSourceState> GetGlobalSourceState(ExecCtx &) override;
+ std::unique_ptr<LocalSourceState> GetLocalSourceState(ExecCtx &, GlobalSourceState &) override;
+ SourceResultType GetData(ExecCtx &, PipelineChunk &, OperatorSourceInput &) override;
+ void ReleaseAfterConsumerRun(ExecCtx &ctx);
+ dsa_pointer layout_dp, payload_dp, scan_dp;
+ PhysicalMaterialize *producer;
+ Pipeline *producer_pipeline = nullptr;
+};
+}

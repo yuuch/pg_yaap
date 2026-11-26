@@ -864,15 +864,19 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 		[&](const std::vector<ColumnRef> *required_ptr) -> bool
 	{
 		OptimizerNodeTranslation candidate;
-		if (!TranslateOptimizerNode(*scan.delim_outer_child,
-				queryDesc,
-				state,
-				required_ptr,
-				candidate) ||
-			candidate.op == nullptr ||
-			candidate.cols.empty() ||
-			candidate.cols.size() != candidate.schema.size())
-			return false;
+
+        auto *context=DelimMaterializeContext::current;
+        while(context && (context->outer != scan.delim_outer_child || !context->producer)) context=context->previous;
+        if (!context) elog(ERROR,"pg_yaap: DELIM_SCAN has no materialized outer input");
+        candidate.cols=context->translation->cols;
+        candidate.schema=context->translation->schema;
+        candidate.outputs=context->translation->outputs;
+        candidate.estimated_groups=context->translation->estimated_groups;
+        candidate.op=std::make_unique<pipeline::PhysicalMaterialize>(context->producer->layout_dp,
+                         context->producer->payload_dp,context->producer,
+                         pipeline::CreateMaterializeScan(state->runtime_dsa));
+        if(candidate.cols.empty() || candidate.cols.size()!=candidate.schema.size()) return false;
+
 		std::vector<ColumnRef> candidate_cols;
 		std::vector<ColumnSchema> candidate_schema;
 		std::vector<yaap::PhysicalOperator::OutputColumn> candidate_outputs;
@@ -1010,6 +1014,136 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 	out.final_sort_keys.clear();
 	out.limit_count = 0;
 	out.estimated_groups = 0;
+	return true;
+}
+
+bool
+TranslateMaterializedCteNode(const PhysicalMaterializedCTE &cte,
+							 QueryDesc *queryDesc,
+							 PgYaapQueryState *state,
+							 const std::vector<ColumnRef> *required_output_cols,
+							 OptimizerNodeTranslation &out)
+{
+	if (cte.children.size() != 2 || cte.children[0] == nullptr || cte.children[1] == nullptr ||
+		state == nullptr || state->runtime_dsa == nullptr || cte.output_bindings.empty())
+		return false;
+
+	std::vector<ColumnRef> producer_required;
+	producer_required.reserve(cte.output_bindings.size());
+	for (const auto &binding : cte.output_bindings)
+		AppendUniqueColumnRef(BindingToColumnRef(binding), producer_required);
+
+	OptimizerNodeTranslation producer_out;
+	if (!TranslateOptimizerNode(*cte.children[0], queryDesc, state,
+								producer_required.empty() ? nullptr : &producer_required,
+								producer_out) ||
+		!producer_out.op)
+		return false;
+
+	std::vector<ColumnRef> materialize_cols;
+	std::vector<ColumnSchema> cte_output_schema;
+	materialize_cols.reserve(cte.output_bindings.size());
+	cte_output_schema.reserve(cte.output_bindings.size());
+
+	for (const auto &binding : cte.output_bindings)
+	{
+		BoundColumnRefExpression bound_expr(binding, std::string{}, std::string{});
+		ColumnRef src_ref{};
+		const ColumnSchema *src_col = nullptr;
+		if (!LookupNamedExprInputColumn(&bound_expr,
+										&producer_out.outputs,
+										producer_out.cols,
+										producer_out.schema,
+										src_ref,
+										src_col) ||
+			src_col == nullptr)
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG, "pg_yaap: MATERIALIZED_CTE failed to resolve output binding (%zu,%zu)",
+					 binding.table_index.index, binding.column_index.index);
+			return false;
+		}
+		cte_output_schema.push_back(*src_col);
+		AppendUniqueColumnRef(src_ref, materialize_cols);
+	}
+
+	TupleDataLayout layout{};
+	if (!BuildHashGroupLayout(materialize_cols,
+							  producer_out.cols,
+							  producer_out.schema,
+							  {}, {}, {},
+							  layout))
+		return false;
+	pipeline::TupleDataLayoutEnableValidity(&layout);
+	const dsa_pointer layout_dp = SerializeTupleDataLayout(layout, state->runtime_dsa);
+	const dsa_pointer payload_dp = pipeline::CreateMaterializeShared(state->runtime_dsa);
+	const dsa_pointer first_scan_dp = pipeline::CreateMaterializeScan(state->runtime_dsa);
+	if (!DsaPointerIsValid(layout_dp) || !DsaPointerIsValid(payload_dp) || !DsaPointerIsValid(first_scan_dp))
+		return false;
+
+	auto spool = std::make_unique<pipeline::PhysicalMaterialize>(
+		layout_dp, payload_dp, nullptr, first_scan_dp);
+	spool->AddChild(std::move(producer_out.op));
+
+	CteMaterializeContext cte_ctx(
+		cte.table_index.index,
+		std::move(cte_output_schema),
+		producer_out.estimated_groups,
+		std::move(spool));
+
+	if (!TranslateOptimizerNode(*cte.children[1], queryDesc, state, required_output_cols, out) || !out.op)
+		return false;
+
+	return true;
+}
+
+bool
+TranslateCteScanNode(const PhysicalCTEScan &scan,
+					 PgYaapQueryState *state,
+					 OptimizerNodeTranslation &out)
+{
+	if (state == nullptr || state->runtime_dsa == nullptr)
+		return false;
+
+	auto *context = CteMaterializeContext::current;
+	while (context != nullptr && context->cte_index != scan.cte_index.index)
+		context = context->previous;
+	if (context == nullptr || context->producer_raw == nullptr)
+		elog(ERROR, "pg_yaap: CTE_SCAN '%s' has no materialized producer", scan.cte_name.c_str());
+
+	if (context->output_schema.size() != scan.outputs.size())
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG, "pg_yaap: CTE_SCAN '%s' schema size mismatch (%zu vs %zu)",
+				 scan.cte_name.c_str(), context->output_schema.size(), scan.outputs.size());
+		return false;
+	}
+
+	if (context->producer_owner != nullptr)
+	{
+		out.op = std::move(context->producer_owner);
+	}
+	else
+	{
+		const dsa_pointer scan_dp = pipeline::CreateMaterializeScan(state->runtime_dsa);
+		if (!DsaPointerIsValid(scan_dp))
+			return false;
+		out.op = std::make_unique<pipeline::PhysicalMaterialize>(
+			context->producer_raw->layout_dp,
+			context->producer_raw->payload_dp,
+			context->producer_raw,
+			scan_dp);
+	}
+
+	out.cols.clear();
+	out.cols.reserve(scan.outputs.size());
+	for (const auto &output : scan.outputs)
+		out.cols.push_back(BindingToColumnRef(output.binding));
+	out.schema = context->output_schema;
+	out.outputs = scan.outputs;
+	out.final_sort_keys.clear();
+	out.limit_count = 0;
+	out.estimated_groups = context->estimated_groups;
 	return true;
 }
 

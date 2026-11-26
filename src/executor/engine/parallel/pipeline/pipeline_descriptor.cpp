@@ -36,6 +36,7 @@ extern "C" {
 #include "parallel/pipeline/physical_filter.hpp"
 #include "parallel/pipeline/physical_hash_aggregate.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
+#include "parallel/pipeline/physical_hash_join_probe.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/physical_order.hpp"
 #include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
@@ -49,18 +50,6 @@ namespace pg_yaap {
 namespace pipeline {
 
 namespace {
-
-static uint64
-DependencyMask(const Pipeline &pipeline)
-{
-	uint64 mask = 0;
-	for (PipelineId dep : pipeline.depends_on)
-	{
-		Assert(dep < 64);
-		mask |= (UINT64_C(1) << dep);
-	}
-	return mask;
-}
 
 static void
 SerializeUInt16Vector(const PgVector<uint16_t> &values,
@@ -225,6 +214,19 @@ EmitSeqScan(const PhysicalSeqScan &op, OpDescriptor &out)
 	out.body.seq_scan.n_filter_steps = op.n_filter_steps();
 	out.body.seq_scan.filter_bool_regs = op.filter_bool_regs();
 	out.body.seq_scan.filter_string_const_bytes = op.filter_string_const_bytes();
+	out.body.seq_scan.n_runtime_filters = op.n_runtime_filters();
+	for (uint8_t i = 0; i < MAX_SEQ_SCAN_RUNTIME_FILTERS; ++i)
+		out.body.seq_scan.runtime_filters[i] = op.runtime_filter(i);
+}
+
+static void
+EmitMaterialize(const PhysicalMaterialize &op, OpDescriptor &out)
+{
+ out.kind = OpKind::MATERIALIZE;
+ out.n_children = 0;
+ out.body.materialize.layout = op.layout_dp;
+ out.body.materialize.shared_payload = op.payload_dp;
+ out.body.materialize.scan = op.scan_dp;
 }
 
 static void
@@ -352,6 +354,7 @@ EmitHashJoin(const PhysicalHashJoin &op, OpDescriptor &out)
 	out.body.hash_join.filter_steps = op.filter_steps_dp();
 	out.body.hash_join.filter_string_consts = op.filter_string_consts_dp();
 	out.body.hash_join.shared_payload = op.shared_payload_dp();
+	out.body.hash_join.runtime_filter = op.runtime_filter_dp();
 	out.body.hash_join.n_left_keys = op.n_left_keys();
 	out.body.hash_join.n_right_keys = op.n_right_keys();
 	out.body.hash_join.output_column_count = op.output_column_count();
@@ -363,6 +366,14 @@ EmitHashJoin(const PhysicalHashJoin &op, OpDescriptor &out)
 	out.body.hash_join._pad0[0] = 0;
 	out.body.hash_join.filter_string_const_bytes = op.filter_string_const_bytes();
 	out.body.hash_join.max_rows = op.max_rows();
+}
+
+static void
+EmitHashJoinProbe(const PhysicalHashJoinProbe &op, OpDescriptor &out)
+{
+	EmitHashJoin(op.join(), out);
+	out.kind = OpKind::HASH_JOIN_PROBE;
+	out.body.hash_join.probe_shared_payload = InvalidDsaPointer;
 }
 
 static void
@@ -388,7 +399,8 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 	switch (op.kind)
 	{
 		case OpKind::SEQ_SCAN:
-			return std::make_unique<PhysicalSeqScan>(
+		{
+			auto scan = std::make_unique<PhysicalSeqScan>(
 				op.body.seq_scan.relid,
 				op.body.seq_scan.input_schema,
 				op.body.seq_scan.output_schema,
@@ -403,8 +415,14 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.seq_scan.filter_string_const_bytes,
 				op.body.seq_scan.shared_payload,
 				const_cast<OpDescriptor *>(&op));
+			for (uint8_t i = 0; i < op.body.seq_scan.n_runtime_filters && i < MAX_SEQ_SCAN_RUNTIME_FILTERS; ++i)
+				scan->AttachRuntimeFilter(op.body.seq_scan.runtime_filters[i]);
+			return scan;
+		}
 
-		case OpKind::DELIM_SCAN:
+		case OpKind::MATERIALIZE:
+            return std::make_unique<PhysicalMaterialize>(op.body.materialize.layout, op.body.materialize.shared_payload, nullptr, op.body.materialize.scan);
+        case OpKind::DELIM_SCAN:
 			return std::make_unique<PhysicalDelimScan>(
 				op.body.delim_scan.input_schema,
 				op.body.delim_scan.shared_payload,
@@ -552,7 +570,9 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 		}
 
 		case OpKind::HASH_JOIN:
-			return std::make_unique<PhysicalHashJoin>(
+		case OpKind::HASH_JOIN_PROBE:
+		{
+			auto join = std::make_unique<PhysicalHashJoin>(
 				op.body.hash_join.left_input_schema,
 				op.body.hash_join.right_input_schema,
 				op.body.hash_join.output_schema,
@@ -577,6 +597,12 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				op.body.hash_join.n_right_keys,
 				op.body.hash_join.max_rows,
 				const_cast<OpDescriptor *>(&op));
+			join->SetRuntimeFilter(op.body.hash_join.runtime_filter);
+			if (op.kind == OpKind::HASH_JOIN_PROBE)
+				return std::make_unique<PhysicalHashJoinProbe>(
+					std::move(join), const_cast<OpDescriptor *>(&op));
+			return join;
+		}
 
 		case OpKind::CROSS_PRODUCT:
 			return std::make_unique<PhysicalCrossProduct>(
@@ -593,6 +619,66 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 
 	elog(ERROR, "pg_yaap: unknown OpKind %u during reconstruction", (unsigned) op.kind);
 	return nullptr;
+}
+
+using DescriptorAliases = PgUnorderedMap<uint32_t, PgVector<OpDescriptor *>>;
+
+template <typename Operator>
+static void
+AttachDescriptorAliases(Operator &op, OpDescriptor &primary,
+                        const PgVector<OpDescriptor *> &aliases)
+{
+	for (auto *desc : aliases)
+		if (desc != &primary)
+			op.AttachDescriptor(desc);
+	op.AttachDescriptor(&primary);
+}
+
+static std::unique_ptr<PhysicalOperator>
+ReconstructWithAliases(OpDescriptor &desc, ExecCtx &ctx, const DescriptorAliases &aliases)
+{
+	auto op = ReconstructOp(desc, ctx);
+	const auto &group = aliases.at(desc.operator_id);
+	switch (desc.kind)
+	{
+		case OpKind::SEQ_SCAN:
+			AttachDescriptorAliases(static_cast<PhysicalSeqScan &>(*op), desc, group);
+			break;
+		case OpKind::DELIM_SCAN:
+			AttachDescriptorAliases(static_cast<PhysicalDelimScan &>(*op), desc, group);
+			break;
+		case OpKind::HASH_AGGREGATE:
+		case OpKind::PERFECT_HASH_AGGREGATE:
+			AttachDescriptorAliases(static_cast<PhysicalHashAggregate &>(*op), desc, group);
+			break;
+		case OpKind::ORDER:
+			AttachDescriptorAliases(static_cast<PhysicalOrder &>(*op), desc, group);
+			break;
+		case OpKind::TOP_N:
+			AttachDescriptorAliases(static_cast<PhysicalTopN &>(*op), desc, group);
+			break;
+		case OpKind::OUTPUT:
+			AttachDescriptorAliases(static_cast<OutputSink &>(*op), desc, group);
+			break;
+		case OpKind::HASH_JOIN:
+			AttachDescriptorAliases(static_cast<PhysicalHashJoin &>(*op), desc, group);
+			break;
+		case OpKind::HASH_JOIN_PROBE:
+		{
+			auto &probe = static_cast<PhysicalHashJoinProbe &>(*op);
+			AttachDescriptorAliases(probe, desc, group);
+			AttachDescriptorAliases(probe.join(), desc, aliases.at(desc.build_operator_id));
+			break;
+		}
+		case OpKind::CROSS_PRODUCT:
+			AttachDescriptorAliases(static_cast<PhysicalCrossProduct &>(*op), desc, group);
+			break;
+		case OpKind::FILTER:
+		case OpKind::PROJECTION:
+		case OpKind::MATERIALIZE:
+			break;
+	}
+	return op;
 }
 
 }  /* namespace */
@@ -615,13 +701,22 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 	dsa_pointer root_dp = dsa_allocate0(dsa, sizeof(PipelineDescriptor) * pipeline_count);
 	auto *root = static_cast<PipelineDescriptor *>(dsa_get_address(dsa, root_dp));
 
+	PgUnorderedMap<const PhysicalOperator *, uint32_t> operator_ids;
+	auto operator_id = [&](const PhysicalOperator *op) {
+		return operator_ids.emplace(op, static_cast<uint32_t>(operator_ids.size())).first->second;
+	};
+	auto set_operator_ids = [&](OpDescriptor &desc, const PhysicalOperator *op) {
+		desc.operator_id = operator_id(op);
+		if (op->type() == PhysicalOperatorType::HASH_JOIN_PROBE)
+			desc.build_operator_id = operator_id(&static_cast<const PhysicalHashJoinProbe *>(op)->join());
+	};
+
 	for (const auto &pipeline_uptr : bundle.pipelines)
 	{
 		const Pipeline &pipeline = *pipeline_uptr;
 		PipelineDescriptor &pd = root[pipeline.id];
 		pd.pipeline_id = pipeline.id;
 		pd.op_count = 2 + static_cast<int32>(pipeline.ops.size());
-		pd.dependency_mask = DependencyMask(pipeline);
 		pd.global_source_state = InvalidDsaPointer;
 		pd.global_sink_state = InvalidDsaPointer;
 		pg_atomic_init_u32(&pd.task_slot_next, 0);
@@ -629,9 +724,25 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 		pd.ops = dsa_allocate0(dsa, sizeof(OpDescriptor) * pd.op_count);
 		auto *ops = static_cast<OpDescriptor *>(dsa_get_address(dsa, pd.ops));
 
+		set_operator_ids(ops[0], pipeline.source);
+		for (size_t i = 0; i < pipeline.ops.size(); ++i)
+			set_operator_ids(ops[i + 1], pipeline.ops[i]);
+		set_operator_ids(ops[pd.op_count - 1], pipeline.sink);
+
 		int32 idx = 0;
 		switch (pipeline.source->type())
-		{
+        {
+            case PhysicalOperatorType::MATERIALIZE:
+            {
+                const auto &mat = static_cast<const PhysicalMaterialize &>(*pipeline.source);
+                EmitMaterialize(mat, ops[idx++]);
+                if (DsaPointerIsValid(mat.payload_dp)) {
+                    auto *shared = static_cast<MaterializeShared *>(
+                        dsa_get_address(dsa, mat.payload_dp));
+                    pg_atomic_fetch_add_u32(&shared->remaining_consumers, 1);
+                }
+                break;
+            }
 			case PhysicalOperatorType::SEQ_SCAN:
 				EmitSeqScan(static_cast<const PhysicalSeqScan &>(*pipeline.source), ops[idx]);
 				static_cast<PhysicalSeqScan &>(*pipeline.source).AttachDescriptor(&ops[idx]);
@@ -663,6 +774,11 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 				break;
 			case PhysicalOperatorType::PROJECTION:
 				EmitProjection(static_cast<const PhysicalProjection &>(*pipeline.source), ops[idx++], dsa);
+				break;
+			case PhysicalOperatorType::HASH_JOIN_PROBE:
+				EmitHashJoinProbe(static_cast<const PhysicalHashJoinProbe &>(*pipeline.source), ops[idx]);
+				static_cast<PhysicalHashJoinProbe &>(*pipeline.source).AttachDescriptor(&ops[idx]);
+				idx++;
 				break;
 			case PhysicalOperatorType::HASH_JOIN:
 				EmitHashJoin(static_cast<const PhysicalHashJoin &>(*pipeline.source), ops[idx]);
@@ -699,6 +815,11 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 					static_cast<PhysicalHashJoin *>(mid)->AttachDescriptor(&ops[idx]);
 					idx++;
 					break;
+				case PhysicalOperatorType::HASH_JOIN_PROBE:
+					EmitHashJoinProbe(static_cast<const PhysicalHashJoinProbe &>(*mid), ops[idx]);
+					static_cast<PhysicalHashJoinProbe *>(mid)->AttachDescriptor(&ops[idx]);
+					idx++;
+					break;
 				case PhysicalOperatorType::CROSS_PRODUCT:
 					EmitCrossProduct(static_cast<const PhysicalCrossProduct &>(*mid), ops[idx]);
 					static_cast<PhysicalCrossProduct *>(mid)->AttachDescriptor(&ops[idx]);
@@ -710,7 +831,10 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 		}
 
 		switch (pipeline.sink->type())
-		{
+        {
+            case PhysicalOperatorType::MATERIALIZE:
+                EmitMaterialize(static_cast<const PhysicalMaterialize &>(*pipeline.sink), ops[idx]);
+                break;
 			case PhysicalOperatorType::HASH_AGGREGATE:
 			case PhysicalOperatorType::PERFECT_HASH_AGGREGATE:
 				EmitHashAgg(static_cast<const PhysicalHashAggregate &>(*pipeline.sink), ops[idx], dsa);
@@ -727,6 +851,10 @@ LeaderSerializePipelines(MetaPipelineBundle &bundle, dsa_area *dsa)
 			case PhysicalOperatorType::OUTPUT:
 				EmitOutput(static_cast<const OutputSink &>(*pipeline.sink), ops[idx]);
 				static_cast<OutputSink &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
+				break;
+			case PhysicalOperatorType::HASH_JOIN_PROBE:
+				EmitHashJoinProbe(static_cast<const PhysicalHashJoinProbe &>(*pipeline.sink), ops[idx]);
+				static_cast<PhysicalHashJoinProbe &>(*pipeline.sink).AttachDescriptor(&ops[idx]);
 				break;
 			case PhysicalOperatorType::HASH_JOIN:
 				EmitHashJoin(static_cast<const PhysicalHashJoin &>(*pipeline.sink), ops[idx]);
@@ -753,6 +881,20 @@ WorkerReconstructPipelines(PipelineSharedControl *ctl,
 		return;
 
 	auto *root = static_cast<PipelineDescriptor *>(dsa_get_address(worker_ctx.dsa, ctl->pipelines_root));
+	DescriptorAliases aliases;
+	for (int32 idx = 0; idx < ctl->num_pipelines; ++idx)
+	{
+		const PipelineDescriptor &pd = root[idx];
+		auto *ops = static_cast<OpDescriptor *>(dsa_get_address(worker_ctx.dsa, pd.ops));
+		for (int32 op_idx = 0; op_idx < pd.op_count; ++op_idx)
+		{
+			auto &desc = ops[op_idx];
+			aliases[desc.operator_id].push_back(&desc);
+			if (desc.kind == OpKind::HASH_JOIN_PROBE)
+				aliases[desc.build_operator_id].push_back(&desc);
+		}
+	}
+
 	for (int32 idx = 0; idx < ctl->num_pipelines; ++idx)
 	{
 		PipelineDescriptor &pd = root[idx];
@@ -760,14 +902,10 @@ WorkerReconstructPipelines(PipelineSharedControl *ctl,
 		pipeline->id = static_cast<PipelineId>(pd.pipeline_id);
 
 		auto *ops = static_cast<OpDescriptor *>(dsa_get_address(worker_ctx.dsa, pd.ops));
-		pipeline->source = ReconstructOp(ops[0], worker_ctx).release();
+		pipeline->source = ReconstructWithAliases(ops[0], worker_ctx, aliases).release();
 		for (int32 op_idx = 1; op_idx < pd.op_count - 1; ++op_idx)
-			pipeline->ops.push_back(ReconstructOp(ops[op_idx], worker_ctx).release());
-		pipeline->sink = ReconstructOp(ops[pd.op_count - 1], worker_ctx).release();
-
-		for (PipelineId dep = 0; dep < 64; ++dep)
-			if (pd.dependency_mask & (UINT64_C(1) << dep))
-				pipeline->depends_on.push_back(dep);
+			pipeline->ops.push_back(ReconstructWithAliases(ops[op_idx], worker_ctx, aliases).release());
+		pipeline->sink = ReconstructWithAliases(ops[pd.op_count - 1], worker_ctx, aliases).release();
 
 		out.push_back(std::move(pipeline));
 	}
@@ -862,6 +1000,20 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 				output->desc()->body.output.shared_payload = payload_dp;
 			break;
 		}
+		case PhysicalOperatorType::HASH_JOIN_PROBE:
+		{
+			const auto *probe = static_cast<const PhysicalHashJoinProbe *>(op);
+			bool stored = false;
+			for (OpDescriptor *desc : probe->descs())
+				if (desc != nullptr)
+				{
+					desc->body.hash_join.probe_shared_payload = payload_dp;
+					stored = true;
+				}
+			if (!stored && probe->desc() != nullptr)
+				probe->desc()->body.hash_join.probe_shared_payload = payload_dp;
+			break;
+		}
 		case PhysicalOperatorType::HASH_JOIN:
 		{
 			const auto *join = static_cast<const PhysicalHashJoin *>(op);
@@ -892,6 +1044,7 @@ StoreSharedPayloadOnDescriptor(const PhysicalOperator *op, dsa_pointer payload_d
 		}
 		case PhysicalOperatorType::FILTER:
 		case PhysicalOperatorType::PROJECTION:
+		case PhysicalOperatorType::MATERIALIZE:
 			break;
 	}
 }
@@ -946,6 +1099,11 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 			OpDescriptor *desc = static_cast<const OutputSink *>(op)->desc();
 			return desc != nullptr ? desc->body.output.shared_payload : InvalidDsaPointer;
 		}
+		case PhysicalOperatorType::HASH_JOIN_PROBE:
+		{
+			OpDescriptor *desc = static_cast<const PhysicalHashJoinProbe *>(op)->desc();
+			return desc != nullptr ? desc->body.hash_join.probe_shared_payload : InvalidDsaPointer;
+		}
 		case PhysicalOperatorType::HASH_JOIN:
 		{
 			OpDescriptor *desc = static_cast<const PhysicalHashJoin *>(op)->desc();
@@ -958,6 +1116,7 @@ LoadSharedPayloadFromDescriptor(const PhysicalOperator *op)
 		}
 		case PhysicalOperatorType::FILTER:
 		case PhysicalOperatorType::PROJECTION:
+		case PhysicalOperatorType::MATERIALIZE:
 			return InvalidDsaPointer;
 	}
 

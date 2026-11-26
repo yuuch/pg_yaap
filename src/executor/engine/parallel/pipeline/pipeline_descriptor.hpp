@@ -28,6 +28,7 @@ extern "C" {
 #include "postgres.h"
 #include "access/relscan.h"
 #include "storage/block.h"
+#include "storage/lwlock.h"
 #include "port/atomics.h"
 #include "utils/dsa.h"
 }
@@ -69,6 +70,8 @@ enum class OpKind : uint8_t {
 	OUTPUT         = 8,
 	FILTER         = 9,
 	PROJECTION     = 10,
+	HASH_JOIN_PROBE = 11,
+ MATERIALIZE = 12,
 };
 
 /* -------------------------------------------------------------------------
@@ -310,6 +313,7 @@ struct ProjectOpBody {
 enum class HashJoinOutputSide : uint8_t {
 	LEFT = 0,
 	RIGHT = 1,
+	MARK = 2,
 };
 
 struct HashJoinFilterInputDesc {
@@ -332,6 +336,81 @@ enum class HashJoinMatchMode : uint8_t {
 	SEMI = 1,
 	ANTI = 2,
 	LEFT = 3,
+	RIGHT = 4,
+	BUILD_SEMI = 5,
+	BUILD_ANTI = 6,
+	MARK = 7,
+	MARK_FILTER_NOT = 8,
+};
+
+inline bool HashJoinTracksBuildMatches(HashJoinMatchMode mode) {
+	return mode == HashJoinMatchMode::RIGHT ||
+		mode == HashJoinMatchMode::BUILD_SEMI ||
+		mode == HashJoinMatchMode::BUILD_ANTI;
+}
+
+inline bool HashJoinScansBuildResults(HashJoinMatchMode mode) {
+	return HashJoinTracksBuildMatches(mode);
+}
+
+inline bool HashJoinEmitsBuildMatch(HashJoinMatchMode mode, bool matched) {
+	return mode == HashJoinMatchMode::BUILD_SEMI ? matched : !matched;
+}
+
+inline bool HashJoinNeedsUnmatchedBuildRows(HashJoinMatchMode mode) {
+	return mode == HashJoinMatchMode::RIGHT || mode == HashJoinMatchMode::BUILD_ANTI;
+}
+
+static constexpr uint32_t MAX_SEQ_SCAN_RUNTIME_FILTERS = 4;
+
+/*
+ * Runtime Bloom + Min/Max filter produced by a PhysicalHashJoin build pipeline
+ * and consumed by an upstream PhysicalSeqScan on the probe side.
+ * Populated during build SinkChunk/FinishLocalSink/Finalize; immutable during
+ * probe SeqScan.GetData because the event DAG guarantees build FINALIZE completes
+ * before the probe pipeline RUN event starts.
+ */
+struct HashJoinRuntimeFilter {
+	slock_t          mutex;
+	pg_atomic_uint32 ready;          /* 0 = building, 1 = finalized & readable */
+	uint8_t          empty_build;    /* 1 iff total_rows == 0 */
+	uint8_t          bloom_usable;   /* 1 iff words_dp valid & not saturated */
+	uint8_t          has_minmax;     /* 1 iff total_rows > 0 */
+	uint8_t          key_is_int64;   /* 0 = INT32 (int4/date), 1 = INT64 (int8) */
+	uint32_t         num_words;      /* power of 2, 0 if bloom disabled */
+	uint32_t         word_mask;      /* num_words - 1 */
+	uint64_t         estimated_rows; /* optimizer build cardinality hint */
+	uint64_t         total_rows;     /* non-null build keys inserted */
+	int64_t          min_val;
+	int64_t          max_val;
+	dsa_pointer      words_dp;       /* pg_atomic_uint64[num_words] */
+};
+
+static inline uint64_t
+RuntimeFilterHashKey(int64_t key)
+{
+	uint64_t x = static_cast<uint64_t>(key);
+	x ^= x >> 33;
+	x *= UINT64_C(0xff51afd7ed558ccd);
+	x ^= x >> 33;
+	x *= UINT64_C(0xc4ceb9fe1a85ec53);
+	x ^= x >> 33;
+	return x;
+}
+
+static inline uint64_t
+RuntimeFilterWordMask(uint64_t h)
+{
+	return (UINT64_C(1) << (h & 63u)) |
+	       (UINT64_C(1) << ((h >> 6) & 63u)) |
+	       (UINT64_C(1) << ((h >> 12) & 63u));
+}
+
+struct SeqScanRuntimeFilterDesc {
+	dsa_pointer      filter_dp;   /* HashJoinRuntimeFilter * in DSA */
+	uint16_t         attno;       /* 1-based PG attribute number */
+	ColumnDecodeKind decode_kind; /* INT32_INT4, INT32_DATE, or INT64_INT8 */
+	uint8_t          _pad0;
 };
 
 struct HashJoinOpBody {
@@ -348,6 +427,8 @@ struct HashJoinOpBody {
 	dsa_pointer filter_steps;  /* FilterStep[n_filter_steps] */
 	dsa_pointer filter_string_consts; /* char[filter_string_const_bytes] */
 	dsa_pointer shared_payload;
+	dsa_pointer probe_shared_payload;
+	dsa_pointer runtime_filter; /* optional HashJoinRuntimeFilter * */
 	uint16_t    n_left_keys;
 	uint16_t    n_right_keys;
 	uint16_t    output_column_count;
@@ -389,6 +470,11 @@ struct SeqScanSharedPayload {
 struct HashJoinLocalBuildRegistryEntry {
 	dsa_pointer build_keys_dp;
 	dsa_pointer build_rows_dp;
+	dsa_pointer build_key_segment_desc_dp;
+	dsa_pointer build_row_segment_desc_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	dsa_pointer partition_state_dp; /* HashJoinLocalPartitionState[build_partition_count] */
 	uint32_t    row_count;
 	uint32_t    key_heap_used;
 	uint32_t    row_heap_used;
@@ -397,8 +483,90 @@ struct HashJoinLocalBuildRegistryEntry {
 	uint32_t    global_row_heap_offset;
 };
 
+/* Per-worker partition metadata. Segment payloads are worker-owned and
+ * immutable after COMBINE; row-reference tables remain partition-local. */
+struct HashJoinLocalPartitionState {
+	dsa_pointer build_key_segment_desc_dp;
+	dsa_pointer build_row_segment_desc_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	uint32_t    row_count;
+	uint32_t    _pad;
+};
+
+/* A partition is exclusively combined by one COMBINE task.  All fields are
+ * DSA offsets so the same payload can be reconstructed in every backend. */
+struct HashJoinBatchRowRef {
+	uint32_t segment_index;
+	uint32_t row_offset; /* byte offset from the segment payload/TDC base */
+};
+
+struct HashJoinBatchSegment {
+	dsa_pointer descriptor_dp;
+	dsa_pointer payload_dp;
+	uint32_t arena_id;
+	uint32_t segment_id;
+	uint32_t generation;
+	uint32_t capacity;
+};
+
+/* One immutable hash directory shared by a resident batch of radix partitions.
+ * Segment payloads stay pinned until every batch probe worker has finished. */
+struct HashJoinBatch {
+	uint64_t partition_mask;
+	uint64_t charged_bytes;
+	uint32_t row_count;
+	uint32_t hash_capacity;
+	uint32_t segment_count;
+	uint32_t segment_map_count;
+	dsa_pointer segments_dp;
+	dsa_pointer segment_map_dp; /* uint32_t[segment_map_count], indexed by segment_id */
+	dsa_pointer hash_table_dp; /* pg_atomic_uint32[hash_capacity] */
+	dsa_pointer hash_links_dp;
+	dsa_pointer hash_salts_dp;
+	dsa_pointer key_refs_dp; /* HashJoinBatchRowRef[row_count] */
+	dsa_pointer row_refs_dp;
+	uint32_t partition_offsets[64];
+	/* One allocation/table, with disjoint bucket ranges per radix owner. */
+	uint32_t bucket_offsets[64];
+	uint32_t bucket_masks[64];
+	pg_atomic_uint32 next_pin;
+	pg_atomic_uint32 pinned_workers;
+	pg_atomic_uint32 directory_ready;
+	pg_atomic_uint32 next_partition;
+	pg_atomic_uint32 built_workers;
+	pg_atomic_uint32 probe_done;
+	pg_atomic_uint32 released_workers;
+	pg_atomic_uint32 cleanup_state;
+	dsa_pointer matched_bitmap_dp; /* pg_atomic_uint32[ceil(row_count / 32)] */
+	pg_atomic_uint32 unmatched_done;
+	pg_atomic_uint32 matched_build_rows;
+	uint8_t     is_subpartition;
+	uint8_t     _sub_pad[7];
+	dsa_pointer sub_build_key_first_dp;
+	dsa_pointer sub_build_row_first_dp;
+};
+
+struct HashJoinPartition {
+	dsa_pointer build_keys_dp;
+	dsa_pointer build_rows_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	dsa_pointer build_row_slots_dp;
+	dsa_pointer build_row_local_idxs_dp;
+	dsa_pointer hash_table_dp;
+	dsa_pointer hash_links_dp;
+	dsa_pointer hash_salts_dp;
+	dsa_pointer hash_key_values_dp; /* optional exact INT32/INT64 keys replacing salts */
+	uint64_t   directory_charged_bytes;
+	uint32_t    hash_table_capacity;
+	uint32_t    row_count;
+};
+
 struct HashJoinSharedPayload {
-	slock_t     mutex;
+	LWLock      mutex;
+	uint64_t    directory_charged_bytes; /* non-spillable heads/links/salts */
+	uint64_t    owner_tag;
 	uint32_t    local_state_slot_count;
 	uint32_t    build_partition_count;
 	uint32_t    hash_table_capacity;
@@ -407,8 +575,10 @@ struct HashJoinSharedPayload {
 	bool        build_rows_shared_local;
 	bool        build_rows_use_keys;
 	bool        finalized;
+	bool        partition_probe_mode;
 	uint8_t     _pad0[2];
 	pg_atomic_uint32 release_state;       /* 0=live, 1=releasing, 2=released */
+	pg_atomic_uint32 build_has_null_key;
 	pg_atomic_uint32 combine_prepare_state; /* 0=pending, 1=preparing, 2=ready */
 	uint32_t    combined_row_count;
 	uint32_t    combined_key_heap_used;
@@ -422,6 +592,21 @@ struct HashJoinSharedPayload {
 	dsa_pointer hash_buckets_dp;         /* uint32_t[build_rows.row_count] cached bucket indices */
 	dsa_pointer hash_links_dp;           /* uint32_t[build_rows.row_count] next indices */
 	dsa_pointer hash_salts_dp;           /* uint16_t[build_rows.row_count] high-hash salts */
+	dsa_pointer partitions_dp;           /* HashJoinPartition[build_partition_count] */
+	uint32_t    partition_mask;
+	uint32_t    partition_shift;
+	pg_atomic_uint32 combine_partitions_done;
+	pg_atomic_uint32 finalize_partitions_done;
+	/* Immutable segmented build representation, installed after hash finalize. */
+	dsa_pointer segment_arena_dp;
+	dsa_pointer build_key_segment_desc_dp;
+	dsa_pointer build_row_segment_desc_dp;
+	dsa_pointer build_key_refs_dp;
+	dsa_pointer build_row_refs_dp;
+	uint32_t    segmented_row_count;
+	bool        segmented_build;
+	bool        direct_segmented_build;
+	uint8_t     _segmented_pad[2];
 };
 
 struct CrossProductLocalBuildRegistryEntry {
@@ -430,7 +615,7 @@ struct CrossProductLocalBuildRegistryEntry {
 };
 
 struct CrossProductSharedPayload {
-	slock_t     mutex;
+	LWLock      mutex;
 	uint32_t    local_state_slot_count;
 	bool        finalized;
 	uint8_t     _pad0[3];
@@ -438,6 +623,28 @@ struct CrossProductSharedPayload {
 	uint32_t    combined_row_count;
 	dsa_pointer local_build_registry_dp; /* CrossProductLocalBuildRegistryEntry[local_state_slot_count] */
 	dsa_pointer build_rows_dp;           /* global build-side row store */
+	dsa_pointer segment_arena_dp;
+	dsa_pointer segment_first_desc_dp;
+	dsa_pointer segment_desc_dp;
+	uint32_t    segment_id;
+	uint32_t    segment_generation;
+	uint32_t    segment_row_count;
+	bool        segment_backed;
+	uint8_t     _segment_pad[3];
+};
+
+struct OutputSharedPayload {
+	dsa_pointer tdc_dp;
+	dsa_pointer sort_indices_dp;
+	dsa_pointer segment_arena_dp;
+	dsa_pointer segment_first_desc_dp;
+	dsa_pointer segment_desc_dp;
+	uint32_t segment_id;
+	uint32_t segment_generation;
+	uint32_t segment_row_count;
+	bool segment_backed;
+	bool finalized;
+	uint8_t _pad[2];
 };
 
 /*
@@ -491,6 +698,9 @@ struct SeqScanOpBody {
 	uint16_t    n_filter_steps;
 	uint16_t    filter_bool_regs;
 	uint32_t    filter_string_const_bytes;
+	SeqScanRuntimeFilterDesc runtime_filters[MAX_SEQ_SCAN_RUNTIME_FILTERS];
+	uint8_t     n_runtime_filters;
+	uint8_t     _rf_pad[7];
 };
 
 struct HashAggOpBody {
@@ -505,6 +715,8 @@ struct HashAggOpBody {
 	uint32_t    max_groups;
 	uint32_t    perfect_hash_capacity;
 };
+
+struct MaterializeOpBody { dsa_pointer layout; dsa_pointer shared_payload; dsa_pointer scan; };
 
 struct DelimScanOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
@@ -538,7 +750,7 @@ struct OutputOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer layout;              /* TupleDataLayout serialized from input_schema */
 	dsa_pointer sort_keys;           /* SortKeyDesc[n_sort_keys] for final top-N pruning */
-	dsa_pointer shared_payload;      /* TupleDataCollection; lazy-init on first GetGlobalSinkState */
+	dsa_pointer shared_payload;      /* OutputSharedPayload; lazy-init on first GetGlobalSinkState */
 	uint16_t    n_sort_keys;
 	uint16_t    _pad0;
 	uint32_t    tdc_max_rows;        /* row capacity bound (clamp(plan_rows*1.5, 1024, 1<<20)) */
@@ -561,10 +773,15 @@ struct OpDescriptor {
 	uint8_t  n_children;
 	uint16_t _pad0;
 	uint32_t child_indices[4];
+	/* One identity across all occurrences of an operator. Probe occurrences
+	 * also carry the identity of the build payload they consume. */
+	uint32_t operator_id;
+	uint32_t build_operator_id;
 
 	union OpBodyUnion {
 		SeqScanOpBody seq_scan;
 		DelimScanOpBody delim_scan;
+        MaterializeOpBody materialize;
 		HashAggOpBody hash_agg;
 		HashAggOpBody perfect_hash_agg;
 		HashJoinOpBody hash_join;
@@ -582,11 +799,8 @@ struct OpDescriptor {
  * bundle. `ops` is a dsa_pointer to OpDescriptor[op_count].
  *
  * `global_source_state` / `global_sink_state` start at InvalidDsaPointer at
- * serialize time; they are lazily populated by the leader's first
- * `Sink::GetGlobalSinkState(ExecCtx&)` / `Source::GetGlobalSourceState(...)`
- * call (the one branch where `worker_index == LEADER_WORKER_INDEX`) via
- * StoreSharedPayloadOnDescriptor(). Workers attach via
- * LoadSharedPayloadFromDescriptor().
+ * serialize time; operator payloads are published through the corresponding
+ * OpDescriptor aliases before dependent tasks are queued.
  *
  * `task_slot_next` is a per-pipeline atomic morsel cursor used by the
  * scheduler to hand out PipelineTask slots round-robin.
@@ -594,7 +808,6 @@ struct OpDescriptor {
 struct PipelineDescriptor {
 	int32              pipeline_id;
 	int32              op_count;
-	uint64             dependency_mask;     /* bit i set => depends on pipeline_id i */
 	dsa_pointer        ops;                  /* OpDescriptor[op_count] */
 	dsa_pointer        global_source_state;  /* lazy; set by leader on first Get */
 	dsa_pointer        global_sink_state;    /* lazy; set by leader on first Get */

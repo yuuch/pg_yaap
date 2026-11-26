@@ -47,12 +47,49 @@ bool pg_yaap_jit_deform = true;
 bool pg_yaap_parallel = true;
 int pg_yaap_parallel_max_workers = 4;
 int pg_yaap_parallel_min_relation_blocks = 1024;
-bool pg_yaap_parallel_leader_participation = true;
 bool pg_yaap_parallel_experimental_hash_pipeline = false;
 bool pg_yaap_disable_jit_for_parallel_worker = false;
-bool pg_yaap_profile = false;
+extern bool pg_yaap_trace_enabled;
+extern int pg_yaap_trace_buffer_mb;
+extern char *pg_yaap_trace_output_dir;
+bool pg_yaap_trace_enabled = false;
+int pg_yaap_trace_buffer_mb = 1;
+char *pg_yaap_trace_output_dir = NULL;
+extern bool pg_yaap_hash_join_partition_probe;
+bool pg_yaap_hash_join_partition_probe = true;
+/* GUC storage is in MB so an int-valued PostgreSQL GUC can express query
+ * budgets above 2GB; runtime_dsm converts these to 64-bit byte counts. */
+int pg_yaap_memory_limit_mb = 256;
+int pg_yaap_memory_soft_limit_mb = -1;
+extern int pg_yaap_dsa_memory_limit_mb;
+int pg_yaap_dsa_memory_limit_mb = -1;
 char pg_yaap_bgworker_library_path[MAXPGPATH] = "pg_yaap";
 static int pg_yaap_utility_nesting = 0;
+
+static bool
+pg_yaap_check_trace_output_dir(char **newval, void **extra, GucSource source)
+{
+	(void) extra;
+	(void) source;
+	if (**newval == '\0')
+		return true;
+	if (!is_absolute_path(*newval))
+	{
+		GUC_check_errdetail("Trace output directory must be an absolute path or empty.");
+		return false;
+	}
+	if (strstr(*newval, "..") != NULL)
+	{
+		GUC_check_errdetail("Trace output directory must not contain '..' path segments.");
+		return false;
+	}
+	if (strlen(*newval) + 96 >= MAXPGPATH)
+	{
+		GUC_check_errdetail("Trace output directory path is too long.");
+		return false;
+	}
+	return true;
+}
 
 #if PG_VERSION_NUM >= 190000
 static PlannedStmt *pg_yaap_planner_hook(Query *parse, const char *query_string,
@@ -315,17 +352,6 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomBoolVariable("pg_yaap.parallel_leader_participation",
-							 "Allow the leader to participate in experimental YAAP block-pool execution.",
-							 NULL,
-							 &pg_yaap_parallel_leader_participation,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
 	DefineCustomBoolVariable("pg_yaap.parallel_experimental_hash_pipeline",
 							 "Enable the experimental leader-only HashBuild->Finalize->Probe pipeline DAG path.",
 							 NULL,
@@ -337,16 +363,73 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomBoolVariable("pg_yaap.profile",
-							 "Emit YAAP per-stage pipeline timing after each offloaded query.",
+	DefineCustomBoolVariable("pg_yaap.trace_enabled",
+							 "Enable lightweight per-process Execution Trace recording.",
 							 NULL,
-							 &pg_yaap_profile,
+							 &pg_yaap_trace_enabled,
 							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,
 							 NULL,
 							 NULL);
+
+	DefineCustomIntVariable("pg_yaap.trace_buffer_mb",
+							"Per-process Execution Trace buffer size in MB (leader and each worker).",
+							NULL,
+							&pg_yaap_trace_buffer_mb,
+							1,
+							1,
+							16,
+							PGC_USERSET,
+							GUC_UNIT_MB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomStringVariable("pg_yaap.trace_output_dir",
+							   "Absolute server directory for exported Chrome Trace JSON files.",
+							   NULL,
+							   &pg_yaap_trace_output_dir,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   pg_yaap_check_trace_output_dir,
+							   NULL,
+							   NULL);
+	DefineCustomBoolVariable("pg_yaap.hash_join_partition_probe",
+							 "Stream probe rows against budgeted resident hash partitions and defer the remainder.",
+							 NULL, &pg_yaap_hash_join_partition_probe, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_yaap.memory_limit",
+										 "Maximum shared memory reserved by a YAAP query.",
+										 NULL,
+									 &pg_yaap_memory_limit_mb,
+									 256,
+									 64,
+											 INT_MAX / 1024,
+									 PGC_USERSET,
+									 GUC_UNIT_MB,
+										 NULL,
+							NULL,
+							NULL);
+	DefineCustomIntVariable("pg_yaap.memory_soft_limit",
+						 "Soft shared-memory threshold that triggers operator-aware spill (-1 uses 75%% of memory_limit).",
+						 NULL,
+								&pg_yaap_memory_soft_limit_mb,
+								-1,
+								-1,
+								INT_MAX / 1024,
+								PGC_USERSET,
+								GUC_UNIT_MB,
+						 NULL,
+						 NULL,
+						 NULL);
+
+	DefineCustomIntVariable("pg_yaap.dsa_memory_limit",
+						 "Maximum total YAAP DSA segment capacity (-1 uses the automatic payload plus metadata limit).",
+						 NULL, &pg_yaap_dsa_memory_limit_mb, -1, -1, INT_MAX / 1024,
+						 PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
 
 	pg_yaap_init_state_table();
 	before_shmem_exit(pg_yaap_proc_exit_release_jit_contexts, (Datum) 0);
@@ -430,7 +513,11 @@ pg_yaap_planner_hook(Query *parse, const char *query_string,
 #endif
 	}
 
-	if (pg_yaap_skip_optimizer_for_query_string(query_string))
+	if (pg_yaap_skip_optimizer_for_query_string(query_string) ||
+		(cursorOptions & (CURSOR_OPT_SCROLL | CURSOR_OPT_NO_SCROLL |
+						  CURSOR_OPT_INSENSITIVE | CURSOR_OPT_ASENSITIVE |
+						  CURSOR_OPT_HOLD | CURSOR_OPT_BINARY |
+						  CURSOR_OPT_FAST_PLAN)) != 0)
 	{
 		if (prev_planner_hook)
 #if PG_VERSION_NUM >= 190000
@@ -680,6 +767,15 @@ pg_yaap_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			 plan != NULL ? (int) nodeTag(plan) : -1);
 
 	if (IsParallelWorker())
+		return;
+
+	if (optimizer_only &&
+		(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_REWIND | EXEC_FLAG_MARK)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_yaap: backward scan, rewind, and mark/restore are not supported")));
+
+	if (optimizer_only && (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
 
 	state = pg_yaap_try_build_query_state(queryDesc, eflags);

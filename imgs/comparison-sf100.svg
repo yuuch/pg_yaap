@@ -1,0 +1,214 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1460" height="1450" viewBox="0 0 1460 1450">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f8fafc"/><stop offset="100%" stop-color="#eef2ff"/></linearGradient>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0f172a"/><stop offset="100%" stop-color="#1e293b"/></linearGradient>
+<pattern id="timeout" width="8" height="8" patternTransform="rotate(45)" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="#e5e7eb"/><rect width="3" height="8" fill="#9ca3af"/></pattern>
+</defs>
+<rect width="1460" height="1450" fill="url(#bg)"/>
+<rect x="36" y="28" width="1388" height="198" rx="24" fill="url(#hero)"/>
+<text x="72" y="75" font-family="Helvetica,Arial,sans-serif" font-size="30" font-weight="700" fill="#f8fafc">TPC-H SF100 — PostgreSQL vs pg_duckdb vs pg_yaap</text>
+<text x="72" y="108" font-family="Helvetica,Arial,sans-serif" font-size="15" fill="#cbd5e1">tpch100g · 125GB database · MacBook Pro M4 Pro / 24GB · one run per query</text>
+<text x="72" y="137" font-family="Helvetica,Arial,sans-serif" font-size="14" fill="#cbd5e1">YAAP: 12 workers, 4GB shared_buffers, 8GB memory_limit · pg_duckdb: default 4GiB memory · PG: native plan</text>
+<text x="72" y="164" font-family="Helvetica,Arial,sans-serif" font-size="14" fill="#cbd5e1">PG and pg_duckdb timeouts are counted as 600s in totals; their timeout bars are capped at 200s below.</text>
+<rect x="72" y="185" width="14" height="14" rx="4" fill="#336791"/>
+<text x="94" y="197" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#e2e8f0">PostgreSQL native</text>
+<rect x="292" y="185" width="14" height="14" rx="4" fill="#d9aa16"/>
+<text x="314" y="197" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#e2e8f0">pg_duckdb</text>
+<rect x="512" y="185" width="14" height="14" rx="4" fill="#c63d2f"/>
+<text x="534" y="197" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#e2e8f0">pg_yaap</text>
+<rect x="630" y="185" width="14" height="14" rx="4" fill="#d1d5db"/>
+<text x="652" y="197" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#e2e8f0">timeout (600s)</text>
+<rect x="36" y="248" width="440" height="100" rx="18" fill="#fff" stroke="#dbeafe"/>
+<rect x="36" y="248" width="8" height="100" rx="4" fill="#336791"/>
+<text x="64" y="278" font-family="Helvetica,Arial,sans-serif" font-size="14" font-weight="700" fill="#0f172a">PostgreSQL native</text>
+<text x="64" y="316" font-family="Helvetica,Arial,sans-serif" font-size="25" font-weight="700" fill="#0f172a">3,301.957s</text>
+<text x="286" y="314" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#475569">18/22 OK · 4 timeout</text>
+<rect x="502" y="248" width="440" height="100" rx="18" fill="#fff" stroke="#dbeafe"/>
+<rect x="502" y="248" width="8" height="100" rx="4" fill="#d9aa16"/>
+<text x="530" y="278" font-family="Helvetica,Arial,sans-serif" font-size="14" font-weight="700" fill="#0f172a">pg_duckdb</text>
+<text x="530" y="316" font-family="Helvetica,Arial,sans-serif" font-size="25" font-weight="700" fill="#0f172a">3,346.648s</text>
+<text x="752" y="314" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#475569">18/22 OK · 4 timeout</text>
+<rect x="968" y="248" width="440" height="100" rx="18" fill="#fff" stroke="#dbeafe"/>
+<rect x="968" y="248" width="8" height="100" rx="4" fill="#c63d2f"/>
+<text x="996" y="278" font-family="Helvetica,Arial,sans-serif" font-size="14" font-weight="700" fill="#0f172a">pg_yaap</text>
+<text x="996" y="316" font-family="Helvetica,Arial,sans-serif" font-size="25" font-weight="700" fill="#0f172a">414.523s</text>
+<text x="1218" y="314" font-family="Helvetica,Arial,sans-serif" font-size="13" fill="#475569">22/22 OK · 0 timeout</text>
+<rect x="36" y="370" width="1388" height="1000" rx="22" fill="#ffffff" stroke="#e2e8f0"/>
+<text x="72" y="405" font-family="Helvetica,Arial,sans-serif" font-size="15" font-weight="700" fill="#0f172a">Per-query runtime</text>
+<text x="242" y="405" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">0–200s scale · successful values show SQL time · timeout marker represents 600s</text>
+<line x1="225.0" y1="438" x2="225.0" y2="1280" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="225.0" y="1302" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">0s</text>
+<line x1="425.0" y1="438" x2="425.0" y2="1280" stroke="#e2e8f0" stroke-width="1"/>
+<text x="425.0" y="1302" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">50s</text>
+<line x1="625.0" y1="438" x2="625.0" y2="1280" stroke="#e2e8f0" stroke-width="1"/>
+<text x="625.0" y="1302" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">100s</text>
+<line x1="825.0" y1="438" x2="825.0" y2="1280" stroke="#e2e8f0" stroke-width="1"/>
+<text x="825.0" y="1302" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">150s</text>
+<line x1="1025.0" y1="438" x2="1025.0" y2="1280" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="1025.0" y="1302" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">200s</text>
+<text x="195" y="465" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q1*</text>
+<rect x="225" y="448.0" width="109.9" height="6" rx="3" fill="#336791"/>
+<text x="340.9" y="454.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">27.5s</text>
+<rect x="225" y="456.5" width="112.5" height="6" rx="3" fill="#d9aa16"/>
+<text x="343.5" y="462.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">28.1s</text>
+<rect x="225" y="465.0" width="61.7" height="6" rx="3" fill="#c63d2f"/>
+<text x="292.7" y="471.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">15.4s</text>
+<text x="195" y="502" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q2</text>
+<rect x="225" y="485.0" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 484.0 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="491.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="493.5" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 492.5 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="499.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="502.0" width="22.1" height="6" rx="3" fill="#c63d2f"/>
+<text x="253.1" y="508.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">5.5s</text>
+<text x="195" y="539" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q3</text>
+<rect x="225" y="522.0" width="170.3" height="6" rx="3" fill="#336791"/>
+<text x="401.3" y="528.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">42.6s</text>
+<rect x="225" y="530.5" width="169.5" height="6" rx="3" fill="#d9aa16"/>
+<text x="400.5" y="536.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">42.4s</text>
+<rect x="225" y="539.0" width="78.1" height="6" rx="3" fill="#c63d2f"/>
+<text x="309.1" y="545.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">19.5s</text>
+<text x="195" y="576" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q4</text>
+<rect x="225" y="559.0" width="207.6" height="6" rx="3" fill="#336791"/>
+<text x="438.6" y="565.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">51.9s</text>
+<rect x="225" y="567.5" width="206.8" height="6" rx="3" fill="#d9aa16"/>
+<text x="437.8" y="573.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">51.7s</text>
+<rect x="225" y="576.0" width="81.4" height="6" rx="3" fill="#c63d2f"/>
+<text x="312.4" y="582.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">20.4s</text>
+<text x="195" y="613" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q5</text>
+<rect x="225" y="596.0" width="173.0" height="6" rx="3" fill="#336791"/>
+<text x="404.0" y="602.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">43.3s</text>
+<rect x="225" y="604.5" width="174.0" height="6" rx="3" fill="#d9aa16"/>
+<text x="405.0" y="610.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">43.5s</text>
+<rect x="225" y="613.0" width="78.5" height="6" rx="3" fill="#c63d2f"/>
+<text x="309.5" y="619.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">19.6s</text>
+<text x="195" y="650" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q6</text>
+<rect x="225" y="633.0" width="77.3" height="6" rx="3" fill="#336791"/>
+<text x="308.3" y="639.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">19.3s</text>
+<rect x="225" y="641.5" width="77.6" height="6" rx="3" fill="#d9aa16"/>
+<text x="308.6" y="647.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">19.4s</text>
+<rect x="225" y="650.0" width="60.9" height="6" rx="3" fill="#c63d2f"/>
+<text x="291.9" y="656.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">15.2s</text>
+<text x="195" y="687" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q7</text>
+<rect x="225" y="670.0" width="140.9" height="6" rx="3" fill="#336791"/>
+<text x="371.9" y="676.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">35.2s</text>
+<rect x="225" y="678.5" width="149.4" height="6" rx="3" fill="#d9aa16"/>
+<text x="380.4" y="684.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">37.4s</text>
+<rect x="225" y="687.0" width="84.8" height="6" rx="3" fill="#c63d2f"/>
+<text x="315.8" y="693.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">21.2s</text>
+<text x="195" y="724" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q8</text>
+<rect x="225" y="707.0" width="159.4" height="6" rx="3" fill="#336791"/>
+<text x="390.4" y="713.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">39.9s</text>
+<rect x="225" y="715.5" width="137.7" height="6" rx="3" fill="#d9aa16"/>
+<text x="368.7" y="721.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">34.4s</text>
+<rect x="225" y="724.0" width="79.7" height="6" rx="3" fill="#c63d2f"/>
+<text x="310.7" y="730.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">19.9s</text>
+<text x="195" y="761" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q9</text>
+<rect x="225" y="744.0" width="692.3" height="6" rx="3" fill="#336791"/>
+<text x="923.3" y="750.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">173.1s</text>
+<rect x="225" y="752.5" width="756.5" height="6" rx="3" fill="#d9aa16"/>
+<text x="987.5" y="758.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">189.1s</text>
+<rect x="225" y="761.0" width="171.8" height="6" rx="3" fill="#c63d2f"/>
+<text x="402.8" y="767.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">42.9s</text>
+<text x="195" y="798" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q10</text>
+<rect x="225" y="781.0" width="165.1" height="6" rx="3" fill="#336791"/>
+<text x="396.1" y="787.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">41.3s</text>
+<rect x="225" y="789.5" width="165.6" height="6" rx="3" fill="#d9aa16"/>
+<text x="396.6" y="795.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">41.4s</text>
+<rect x="225" y="798.0" width="102.0" height="6" rx="3" fill="#c63d2f"/>
+<text x="333.0" y="804.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">25.5s</text>
+<text x="195" y="835" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q11</text>
+<rect x="225" y="818.0" width="29.6" height="6" rx="3" fill="#336791"/>
+<text x="260.6" y="824.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">7.4s</text>
+<rect x="225" y="826.5" width="29.3" height="6" rx="3" fill="#d9aa16"/>
+<text x="260.3" y="832.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">7.3s</text>
+<rect x="225" y="835.0" width="11.0" height="6" rx="3" fill="#c63d2f"/>
+<text x="242.0" y="841.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">2.7s</text>
+<text x="195" y="872" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q12</text>
+<rect x="225" y="855.0" width="162.0" height="6" rx="3" fill="#336791"/>
+<text x="393.0" y="861.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">40.5s</text>
+<rect x="225" y="863.5" width="243.9" height="6" rx="3" fill="#d9aa16"/>
+<text x="474.9" y="869.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">61.0s</text>
+<rect x="225" y="872.0" width="76.3" height="6" rx="3" fill="#c63d2f"/>
+<text x="307.3" y="878.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">19.1s</text>
+<text x="195" y="909" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q13</text>
+<rect x="225" y="892.0" width="217.7" height="6" rx="3" fill="#336791"/>
+<text x="448.7" y="898.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">54.4s</text>
+<rect x="225" y="900.5" width="229.5" height="6" rx="3" fill="#d9aa16"/>
+<text x="460.5" y="906.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">57.4s</text>
+<rect x="225" y="909.0" width="40.8" height="6" rx="3" fill="#c63d2f"/>
+<text x="271.8" y="915.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">10.2s</text>
+<text x="195" y="946" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q14</text>
+<rect x="225" y="929.0" width="93.3" height="6" rx="3" fill="#336791"/>
+<text x="324.3" y="935.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">23.3s</text>
+<rect x="225" y="937.5" width="91.8" height="6" rx="3" fill="#d9aa16"/>
+<text x="322.8" y="943.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">22.9s</text>
+<rect x="225" y="946.0" width="66.4" height="6" rx="3" fill="#c63d2f"/>
+<text x="297.4" y="952.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">16.6s</text>
+<text x="195" y="983" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q15</text>
+<rect x="225" y="966.0" width="232.4" height="6" rx="3" fill="#336791"/>
+<text x="463.4" y="972.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">58.1s</text>
+<rect x="225" y="974.5" width="233.4" height="6" rx="3" fill="#d9aa16"/>
+<text x="464.4" y="980.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">58.4s</text>
+<rect x="225" y="983.0" width="60.4" height="6" rx="3" fill="#c63d2f"/>
+<text x="291.4" y="989.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">15.1s</text>
+<text x="195" y="1020" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q16</text>
+<rect x="225" y="1003.0" width="112.9" height="6" rx="3" fill="#336791"/>
+<text x="343.9" y="1009.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">28.2s</text>
+<rect x="225" y="1011.5" width="117.9" height="6" rx="3" fill="#d9aa16"/>
+<text x="348.9" y="1017.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">29.5s</text>
+<rect x="225" y="1020.0" width="17.9" height="6" rx="3" fill="#c63d2f"/>
+<text x="248.9" y="1026.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">4.5s</text>
+<text x="195" y="1057" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q17</text>
+<rect x="225" y="1040.0" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 1039.0 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="1046.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="1048.5" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 1047.5 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="1054.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="1057.0" width="61.4" height="6" rx="3" fill="#c63d2f"/>
+<text x="292.4" y="1063.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">15.3s</text>
+<text x="195" y="1094" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q18</text>
+<rect x="225" y="1077.0" width="699.8" height="6" rx="3" fill="#336791"/>
+<text x="930.8" y="1083.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">175.0s</text>
+<rect x="225" y="1085.5" width="725.9" height="6" rx="3" fill="#d9aa16"/>
+<text x="956.9" y="1091.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">181.5s</text>
+<rect x="225" y="1094.0" width="97.0" height="6" rx="3" fill="#c63d2f"/>
+<text x="328.0" y="1100.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">24.2s</text>
+<text x="195" y="1131" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q19</text>
+<rect x="225" y="1114.0" width="81.3" height="6" rx="3" fill="#336791"/>
+<text x="312.3" y="1120.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">20.3s</text>
+<rect x="225" y="1122.5" width="81.2" height="6" rx="3" fill="#d9aa16"/>
+<text x="312.2" y="1128.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">20.3s</text>
+<rect x="225" y="1131.0" width="63.0" height="6" rx="3" fill="#c63d2f"/>
+<text x="294.0" y="1137.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">15.8s</text>
+<text x="195" y="1168" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q20</text>
+<rect x="225" y="1151.0" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 1150.0 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="1157.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="1159.5" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 1158.5 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="1165.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="1168.0" width="73.5" height="6" rx="3" fill="#c63d2f"/>
+<text x="304.5" y="1174.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">18.4s</text>
+<text x="195" y="1205" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q21</text>
+<rect x="225" y="1188.0" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 1187.0 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="1194.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="1196.5" width="800.0" height="6" rx="3" fill="#d1d5db"/>
+<path d="M 1023 1195.5 l 7 4 l -7 4 z" fill="#475569"/>
+<text x="1043" y="1202.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">600s timeout</text>
+<rect x="225" y="1205.0" width="249.6" height="6" rx="3" fill="#c63d2f"/>
+<text x="480.6" y="1211.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">62.4s</text>
+<text x="195" y="1242" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#0f172a">Q22</text>
+<rect x="225" y="1225.0" width="82.4" height="6" rx="3" fill="#336791"/>
+<text x="313.4" y="1231.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">20.6s</text>
+<rect x="225" y="1233.5" width="83.8" height="6" rx="3" fill="#d9aa16"/>
+<text x="314.8" y="1239.5" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">21.0s</text>
+<rect x="225" y="1242.0" width="19.9" height="6" rx="3" fill="#c63d2f"/>
+<text x="250.9" y="1248.0" font-family="Helvetica,Arial,sans-serif" font-size="10.5" fill="#64748b">5.0s</text>
+<line x1="225" y1="1280" x2="1025" y2="1280" stroke="#0f172a" stroke-width="1.2"/>
+<text x="72" y="1338" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#64748b">* Q1 YAAP result differs: SF100 N|O sum_charge is negative, while PG and pg_duckdb agree on a positive value. Timings do not establish result correctness.</text>
+<text x="72" y="1358" font-family="Helvetica,Arial,sans-serif" font-size="11" fill="#94a3b8">PG and pg_duckdb were tested in separate runs; YAAP and pg_duckdb were interleaved by query. OS file cache was not cleared.</text>
+</svg>

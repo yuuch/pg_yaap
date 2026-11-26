@@ -33,6 +33,9 @@ bool IsExistsStyleMarkJoinCandidate(LogicalOperator* plan) {
     if (join->join_type != JOIN_MARK || !join->convert_mark_to_semi || plan->children.size() != 2) {
         return false;
     }
+    if (join->null_aware_mark) {
+        return false;
+    }
     return true;
 }
 

@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <stdexcept>
 
 #include "../adapter/yaap_adapter.hpp"
+#include "../logical/logical_utils.hpp"
 
 namespace yaap {
 
@@ -215,6 +217,329 @@ void RecomputeUnaryCardinality(LogicalOperator* plan) {
 	}
 }
 
+bool RemapSemiProjectionReferences(Expression *expr, const LogicalProjection &projection) {
+	if (expr == nullptr)
+		return true;
+	switch (expr->type) {
+		case ExpressionType::BOUND_COLUMN_REF: {
+			auto *ref = static_cast<BoundColumnRefExpression *>(expr);
+			if (ref->binding.table_index.index != projection.table_index.index)
+				return true;
+			const size_t idx = ref->binding.column_index.index;
+			if (idx >= projection.expressions.size() ||
+				projection.expressions[idx] == nullptr ||
+				projection.expressions[idx]->type != ExpressionType::BOUND_COLUMN_REF)
+				return false;
+			const auto *input = static_cast<const BoundColumnRefExpression *>(
+				projection.expressions[idx].get());
+			ref->binding = input->binding;
+			ref->table_name = input->table_name;
+			ref->column_name = input->column_name;
+			return true;
+		}
+		case ExpressionType::BOUND_FUNCTION: {
+			auto *function = static_cast<BoundFunctionExpression *>(expr);
+			for (auto &child : function->children)
+				if (!RemapSemiProjectionReferences(child.get(), projection))
+					return false;
+			return true;
+		}
+		case ExpressionType::BOUND_CONJUNCTION: {
+			auto *conjunction = static_cast<BoundConjunctionExpression *>(expr);
+			for (auto &child : conjunction->children)
+				if (!RemapSemiProjectionReferences(child.get(), projection))
+					return false;
+			return true;
+		}
+		case ExpressionType::BOUND_AGGREGATE: {
+			auto *aggregate = static_cast<BoundAggregateExpression *>(expr);
+			for (auto &child : aggregate->children)
+				if (!RemapSemiProjectionReferences(child.get(), projection))
+					return false;
+			return true;
+		}
+		case ExpressionType::BOUND_SUBQUERY: {
+			auto *subquery = static_cast<BoundSubqueryExpression *>(expr);
+			for (auto &child : subquery->children)
+				if (!RemapSemiProjectionReferences(child.get(), projection))
+					return false;
+			return true;
+		}
+		case ExpressionType::BOUND_CONSTANT:
+			return true;
+		case ExpressionType::BOUND_COMPARISON:
+		case ExpressionType::OPAQUE:
+			return false;
+		default:
+			return false;
+	}
+}
+
+bool CollectSemiBindings(Expression *expr, std::set<ColumnBindingKey> &bindings) {
+	if (expr == nullptr)
+		return true;
+	switch (expr->type) {
+		case ExpressionType::BOUND_COLUMN_REF: {
+			const auto *ref = static_cast<const BoundColumnRefExpression *>(expr);
+			bindings.insert(ColumnBindingKey{ref->binding.table_index.index, ref->binding.column_index.index});
+			return true;
+		}
+		case ExpressionType::BOUND_FUNCTION: {
+			const auto *function = static_cast<const BoundFunctionExpression *>(expr);
+			for (const auto &child : function->children)
+				if (!CollectSemiBindings(child.get(), bindings)) return false;
+			return true;
+		}
+		case ExpressionType::BOUND_CONJUNCTION: {
+			const auto *conjunction = static_cast<const BoundConjunctionExpression *>(expr);
+			for (const auto &child : conjunction->children)
+				if (!CollectSemiBindings(child.get(), bindings)) return false;
+			return true;
+		}
+		case ExpressionType::BOUND_AGGREGATE: {
+			const auto *aggregate = static_cast<const BoundAggregateExpression *>(expr);
+			for (const auto &child : aggregate->children)
+				if (!CollectSemiBindings(child.get(), bindings)) return false;
+			return true;
+		}
+		case ExpressionType::BOUND_SUBQUERY: {
+			const auto *subquery = static_cast<const BoundSubqueryExpression *>(expr);
+			for (const auto &child : subquery->children)
+				if (!CollectSemiBindings(child.get(), bindings)) return false;
+			return true;
+		}
+		case ExpressionType::BOUND_CONSTANT:
+			return true;
+		case ExpressionType::BOUND_COMPARISON:
+		case ExpressionType::OPAQUE:
+			return false;
+		default:
+			return false;
+	}
+}
+
+bool FindSemiPushChild(const LogicalComparisonJoin &semi,
+			       const LogicalOperator &inner,
+			       const LogicalProjection *projection,
+			       std::set<size_t> &left_refs,
+			       size_t &push_child) {
+	std::set<size_t> semi_left_tables;
+	std::set<size_t> semi_right_tables;
+	std::set<size_t> inner_left_tables;
+	std::set<size_t> inner_right_tables;
+	CollectOutputTables(semi.children[0].get(), semi_left_tables);
+	CollectOutputTables(semi.children[1].get(), semi_right_tables);
+	CollectOutputTables(inner.children[0].get(), inner_left_tables);
+	CollectOutputTables(inner.children[1].get(), inner_right_tables);
+	std::set<size_t> right_refs;
+	for (const auto &condition : semi.conditions) {
+		std::set<ColumnBindingKey> refs;
+		if (!CollectSemiBindings(condition.get(), refs))
+			return false;
+		for (const ColumnBindingKey &binding : refs) {
+			size_t table = binding.table_index;
+			if (projection != nullptr && table == projection->table_index.index) {
+				if (binding.column_index >= projection->expressions.size() ||
+					projection->expressions[binding.column_index] == nullptr ||
+					projection->expressions[binding.column_index]->type != ExpressionType::BOUND_COLUMN_REF)
+					return false;
+				const auto *input = static_cast<const BoundColumnRefExpression *>(
+					projection->expressions[binding.column_index].get());
+				table = input->binding.table_index.index;
+			}
+			const bool is_left = semi_left_tables.count(table) != 0;
+			const bool is_right = semi_right_tables.count(table) != 0;
+			if (is_left == is_right)
+				return false;
+			if (is_left)
+				left_refs.insert(table);
+			else
+				right_refs.insert(table);
+		}
+	}
+	if (left_refs.empty() || right_refs.empty())
+		return false;
+	const auto subset = [](const std::set<size_t> &needles, const std::set<size_t> &haystack) {
+		return std::all_of(needles.begin(), needles.end(), [&](size_t value) {
+			return haystack.count(value) != 0;
+		});
+	};
+	const bool in_left = subset(left_refs, inner_left_tables);
+	const bool in_right = subset(left_refs, inner_right_tables);
+	if (in_left == in_right)
+		return false;
+	push_child = in_left ? 0 : 1;
+	return true;
+}
+
+void FlattenAndExpression(std::unique_ptr<Expression> expression,
+			  std::vector<std::unique_ptr<Expression>> &conjuncts) {
+	if (expression && expression->type == ExpressionType::BOUND_CONJUNCTION) {
+		auto *conjunction = static_cast<BoundConjunctionExpression *>(expression.get());
+		if (conjunction->bool_expr_type == 0) {
+			for (auto &child : conjunction->children)
+				FlattenAndExpression(std::move(child), conjuncts);
+			return;
+		}
+	}
+	conjuncts.push_back(std::move(expression));
+}
+
+void RemoveFiltersReferencing(std::vector<std::unique_ptr<Expression>> &expressions,
+				     const std::set<size_t> &hidden_tables) {
+	std::vector<std::unique_ptr<Expression>> conjuncts;
+	for (auto &expression : expressions)
+		FlattenAndExpression(std::move(expression), conjuncts);
+	std::vector<std::unique_ptr<Expression>> kept;
+	for (auto &expression : conjuncts) {
+		std::set<size_t> references;
+		CollectReferencedTables(expression.get(), references);
+		const bool references_hidden = std::any_of(
+			references.begin(), references.end(), [&](size_t table) {
+				return hidden_tables.count(table) != 0;
+			});
+		if (!references_hidden)
+			kept.push_back(std::move(expression));
+	}
+	expressions = std::move(kept);
+}
+
+std::set<size_t> PruneDanglingSemiReferences(
+	std::unique_ptr<LogicalOperator> &plan,
+	const std::set<const LogicalComparisonJoin *> &pushed_semis) {
+	if (!plan)
+		return {};
+
+	std::set<size_t> hidden_tables;
+	for (auto &child : plan->children) {
+		auto child_hidden = PruneDanglingSemiReferences(child, pushed_semis);
+		hidden_tables.insert(child_hidden.begin(), child_hidden.end());
+	}
+
+	if (plan->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = static_cast<LogicalComparisonJoin *>(plan.get());
+		if (pushed_semis.count(join) != 0) {
+			std::set<size_t> semi_right_tables;
+			CollectOutputTables(join->children[1].get(), semi_right_tables);
+			hidden_tables.insert(semi_right_tables.begin(), semi_right_tables.end());
+			return hidden_tables;
+		}
+		// Predicate propagation can leave equivalent predicates that mention the
+		// SEMI right input above this join. That input is no longer visible there;
+		// the pushed SEMI still enforces its predicate on the owning left input.
+		if (join->join_type == JOIN_INNER)
+			RemoveFiltersReferencing(join->conditions, hidden_tables);
+		if (join->join_type == JOIN_INNER && join->conditions.empty()) {
+			auto cross_product = std::make_unique<LogicalCrossProduct>();
+			cross_product->children = std::move(plan->children);
+			cross_product->estimated_cardinality =
+				cross_product->children[0]->estimated_cardinality *
+				cross_product->children[1]->estimated_cardinality;
+			plan = std::move(cross_product);
+		}
+	} else if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto *filter = static_cast<LogicalFilter *>(plan.get());
+		RemoveFiltersReferencing(filter->expressions, hidden_tables);
+		if (filter->expressions.empty() && plan->children.size() == 1)
+			plan = std::move(plan->children[0]);
+	}
+	return hidden_tables;
+}
+
+std::unique_ptr<LogicalOperator> PushSemiJoinIntoInnerChild(
+	std::unique_ptr<LogicalOperator> semi_plan,
+	std::unique_ptr<LogicalOperator> inner_plan,
+	std::unique_ptr<LogicalOperator> semi_right,
+	std::vector<std::unique_ptr<Expression>> conditions,
+	size_t push_child) {
+	auto *inner = inner_plan.get();
+	auto *semi = static_cast<LogicalComparisonJoin *>(semi_plan.get());
+	const size_t semi_cardinality = semi->estimated_cardinality;
+	semi->conditions = std::move(conditions);
+	semi->children.clear();
+	semi->children.push_back(std::move(inner->children[push_child]));
+	semi->children.push_back(std::move(semi_right));
+	semi->estimated_cardinality = std::min(
+		semi->children[0]->estimated_cardinality, semi_cardinality);
+	inner->children[push_child] = std::move(semi_plan);
+	RecomputeNonReorderableBinaryCardinality(inner);
+	return inner_plan;
+}
+
+std::unique_ptr<LogicalOperator> PushSelectiveSemiJoinsDown(
+	std::unique_ptr<LogicalOperator> plan,
+	std::set<const LogicalComparisonJoin *> &pushed_semis) {
+	if (!plan)
+		return nullptr;
+	for (auto &child : plan->children)
+		child = PushSelectiveSemiJoinsDown(std::move(child), pushed_semis);
+	if (plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		plan->children.size() != 2)
+		return plan;
+	auto *semi = static_cast<LogicalComparisonJoin *>(plan.get());
+	if (semi->join_type != JOIN_SEMI || semi->dependent || semi->has_mark_index ||
+		semi->children[0] == nullptr || semi->children[1] == nullptr)
+		return plan;
+
+	// For an INNER join, a SEMI predicate that references only one input can be
+	// applied to that input before the join. This is the useful shape for queries
+	// such as Q18: filter orders by qualifying order keys before joining customer
+	// and lineitem. Keep the rewrite conservative when bindings cannot be mapped
+	// through a projection or span both INNER inputs.
+
+	LogicalProjection *projection = nullptr;
+	LogicalOperator *inner_op = semi->children[0].get();
+	if (inner_op->type == LogicalOperatorType::LOGICAL_PROJECTION &&
+		inner_op->children.size() == 1 && inner_op->children[0] != nullptr) {
+		projection = static_cast<LogicalProjection *>(inner_op);
+		inner_op = projection->children[0].get();
+	}
+	if ((inner_op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+		 inner_op->type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT) ||
+		inner_op->children.size() != 2)
+		return plan;
+	if (inner_op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *inner = static_cast<LogicalComparisonJoin *>(inner_op);
+		if (inner->join_type != JOIN_INNER || inner->dependent)
+			return plan;
+	}
+	if (inner_op->children[0] == nullptr || inner_op->children[1] == nullptr)
+		return plan;
+
+	std::set<size_t> left_refs;
+	size_t push_child = 0;
+	if (!FindSemiPushChild(*semi, *inner_op, projection, left_refs, push_child))
+		return plan;
+
+	std::vector<std::unique_ptr<Expression>> rewritten_conditions;
+	rewritten_conditions.reserve(semi->conditions.size());
+	for (const auto &condition : semi->conditions) {
+		auto rewritten = CloneExpressionTree(condition.get());
+		if (!rewritten || (projection != nullptr &&
+			!RemapSemiProjectionReferences(rewritten.get(), *projection)))
+			return plan;
+		rewritten_conditions.push_back(std::move(rewritten));
+	}
+	semi->conditions = std::move(rewritten_conditions);
+
+	auto conditions = std::move(semi->conditions);
+	auto semi_right = std::move(semi->children[1]);
+	pushed_semis.insert(semi);
+	std::unique_ptr<LogicalOperator> rewritten_inner;
+	if (projection != nullptr) {
+		auto projection_plan = std::move(plan->children[0]);
+		auto inner_plan = std::move(projection_plan->children[0]);
+		rewritten_inner = PushSemiJoinIntoInnerChild(std::move(plan), std::move(inner_plan),
+			std::move(semi_right), std::move(conditions), push_child);
+		projection_plan->children[0] = PushSelectiveSemiJoinsDown(std::move(rewritten_inner), pushed_semis);
+		RecomputeUnaryCardinality(projection_plan.get());
+		return projection_plan;
+	}
+	auto inner_plan = std::move(plan->children[0]);
+	return PushSelectiveSemiJoinsDown(PushSemiJoinIntoInnerChild(std::move(plan), std::move(inner_plan),
+		std::move(semi_right), std::move(conditions), push_child), pushed_semis);
+}
+
 } // namespace
 
 std::unique_ptr<LogicalOperator> JoinOrderOptimizer::OptimizeJoinSubset(
@@ -421,7 +746,10 @@ std::unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(std::unique_ptr<Lo
 	if (!plan) {
 		return nullptr;
 	}
-	auto rewritten = Rewrite(std::move(plan));
+	std::set<const LogicalComparisonJoin *> pushed_semis;
+	auto rewritten = PushSelectiveSemiJoinsDown(Rewrite(std::move(plan)), pushed_semis);
+	if (!pushed_semis.empty())
+		PruneDanglingSemiReferences(rewritten, pushed_semis);
 	NormalizeJoinCardinality(rewritten.get());
 	return rewritten;
 }

@@ -33,6 +33,9 @@ public:
 	dsa_pointer          shared_payload_dp = InvalidDsaPointer;
 	HashAggSharedPayload *payload = nullptr;
 	HashAggPartition    *partitions = nullptr;
+	HashAggPartition    *distinct_partitions = nullptr;
+	const TupleDataLayout *distinct_layout = nullptr;
+	dsa_pointer          distinct_layout_dp = InvalidDsaPointer;
 	uint32_t             partition_count = 0;
 	uint32_t             max_groups = 256;
 	bool                 finalized = false;
@@ -44,8 +47,6 @@ public:
 	HashAggSharedPayload *payload = nullptr;
 	HashAggPartition     *partitions = nullptr;
 	uint32_t              partition_count = 0;
-	uint32_t              source_partition = 0;
-	uint32_t              source_cursor = 0;
 	bool                  finalized = false;
 };
 
@@ -56,6 +57,7 @@ public:
 	 * radix partition before dedupe/update. */
 	dsa_pointer          local_partitions_dp = InvalidDsaPointer;
 	HashAggPartition    *local_partitions = nullptr;
+	PgVector<buffer::YaapSegmentedTdc> segmented_writers;
 	const TupleDataLayout *layout = nullptr;
 	dsa_pointer          layout_dp = InvalidDsaPointer;
 	uint32_t             partition_count = 0;
@@ -77,6 +79,9 @@ public:
 class HashAggLocalSourceState final : public LocalSourceState {
 public:
 	bool initialized = false;
+	uint32_t source_partition = UINT32_MAX;
+	uint32_t source_cursor = 0;
+	dsa_pointer source_segment_desc_dp = InvalidDsaPointer;
 };
 
 class HashAggOperatorState final : public OperatorState {
@@ -111,9 +116,12 @@ public:
 	{}
 
 	bool IsSource() const override { return true; }
+	bool ParallelSource() const override { return true; }
 	bool IsSink() const override { return true; }
 	bool IsPipelineBreaker() const override { return true; }
 	int  MaxThreads(ExecCtx &ctx) const override;
+
+	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
 
 	std::unique_ptr<GlobalSinkState>   GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState>    GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
@@ -151,8 +159,8 @@ public:
 	 * desc_list_ (push_back, never overwrite), and StoreSharedPayloadOnDescriptor
 	 * iterates desc_list_ to publish the shared payload pointer into ALL
 	 * slots — so workers reading from EITHER pipeline's slot see the same
-	 * leader-allocated AHT/TDC. desc_ retains the last-attached slot for
-	 * single-attach Resolve helpers (worker side attaches once → list size 1).
+	 * shared AHT/TDC. Workers attach all aliases and retain their own role
+	 * descriptor as the primary slot for reads.
 	 *
 	 * Without per-slot fan-out, the leader writes to the LAST attach (P2.sink
 	 * slot) but workers running P1.source read from the P1 slot → mismatch →

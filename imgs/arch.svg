@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1672" height="941" viewBox="0 0 1672 941" role="img" aria-labelledby="title desc">
+  <title id="title">pg_yaap replaces PostgreSQL optimizer and executor</title>
+  <desc id="desc">High-level architecture diagram showing pg_yaap as a PostgreSQL extension that keeps PostgreSQL parser and storage while replacing the optimizer and executor path with a faster modern OLAP path.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="0.55" stop-color="#eef6fb"/>
+      <stop offset="1" stop-color="#f3f0ff"/>
+    </linearGradient>
+    <linearGradient id="pgBox" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dfeefd"/>
+    </linearGradient>
+    <linearGradient id="yaap" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07c9ff"/>
+      <stop offset="0.56" stop-color="#1268ff"/>
+      <stop offset="1" stop-color="#7443ff"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.45" stop-color="#dde5ee"/>
+      <stop offset="1" stop-color="#b9c5d0"/>
+    </linearGradient>
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#24354a" flood-opacity="0.18"/>
+    </filter>
+    <filter id="glow" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feColorMatrix in="b" type="matrix" values="0 0 0 0 0.03 0 0 0 0 0.62 0 0 0 0 1 0 0 0 .7 0"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrowBlue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="14" markerHeight="14" orient="auto">
+      <path d="M1 1 L11 6 L1 11 Z" fill="#1170ff"/>
+    </marker>
+    <marker id="arrowGray" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" orient="auto">
+      <path d="M1 1 L11 6 L1 11 Z" fill="#6d7f91"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; letter-spacing: 0; }
+      .title { font-weight: 850; font-size: 56px; fill: #08111f; }
+      .subtitle { font-size: 22px; fill: #3d566e; }
+      .label { font-weight: 800; font-size: 27px; fill: #0c1728; }
+      .sub { font-size: 18px; fill: #43576d; }
+      .tiny { font-size: 15px; fill: #597087; }
+      .whiteTitle { font-weight: 850; font-size: 34px; fill: #fff; }
+      .whiteSub { font-size: 21px; fill: #e6f5ff; }
+      .mutedTitle { font-weight: 800; font-size: 24px; fill: #708095; }
+      .mutedSub { font-size: 17px; fill: #8a98a8; }
+    </style>
+  </defs>
+
+  <rect width="1672" height="941" fill="url(#bg)"/>
+  <g opacity="0.34">
+    <path d="M0 186H1672M0 468H1672M0 748H1672M226 0V941M500 0V941M774 0V941M1048 0V941M1322 0V941" stroke="#cad7e4"/>
+    <path d="M130 790C384 692 516 740 742 598C980 448 1158 520 1532 322" fill="none" stroke="#b4d2ff" stroke-width="2"/>
+  </g>
+
+  <g transform="translate(84 48)">
+    <image href="logo.png" x="0" y="-8" width="150" height="98" preserveAspectRatio="xMidYMid meet"/>
+    <text class="title" x="164" y="54">pg_yaap Architecture</text>
+    <text class="subtitle" x="166" y="88">A PostgreSQL extension that swaps the classic optimizer + executor path for a modern OLAP path.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="188" width="1520" height="550" rx="34" fill="#ffffff" stroke="#b4c5d8" stroke-width="2"/>
+    <text class="label" x="116" y="238">PostgreSQL stays in charge of the database</text>
+    <text class="sub" x="116" y="268">SQL parsing, catalog, transactions, storage, and result delivery remain PostgreSQL-owned.</text>
+    <image href="postgresql-elephant.svg" x="1372" y="218" width="112" height="112" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+
+  <!-- PostgreSQL outer path -->
+  <g filter="url(#shadow)">
+    <rect x="130" y="344" width="216" height="144" rx="24" fill="url(#pgBox)" stroke="#91a9c0" stroke-width="2"/>
+    <image href="postgresql-elephant.svg" x="154" y="358" width="48" height="48" preserveAspectRatio="xMidYMid meet"/>
+    <text class="label" x="214" y="394">Parser</text>
+    <text class="sub" x="168" y="428">PostgreSQL</text>
+    <text class="tiny" x="168" y="456">SQL → query tree</text>
+
+    <rect x="1328" y="344" width="216" height="144" rx="24" fill="url(#pgBox)" stroke="#91a9c0" stroke-width="2"/>
+    <text class="label" x="1378" y="392">Storage</text>
+    <text class="sub" x="1370" y="424">PostgreSQL</text>
+    <text class="tiny" x="1366" y="452">heap / index / buffer</text>
+    <ellipse cx="1436" cy="310" rx="42" ry="14" fill="#336791" stroke="#e8f6ff" stroke-width="3"/>
+    <path d="M1394 310v44c0 7 18 14 42 14s42-7 42-14v-44" fill="#336791" stroke="#e8f6ff" stroke-width="3"/>
+    <path d="M1394 328c0 7 18 14 42 14s42-7 42-14M1394 344c0 7 18 14 42 14s42-7 42-14" fill="none" stroke="#e8f6ff" stroke-width="2"/>
+  </g>
+
+  <!-- Replaced PG modules -->
+  <g filter="url(#shadow)">
+    <rect x="454" y="326" width="242" height="172" rx="24" fill="#f4f6f8" stroke="#b9c3ce" stroke-width="2" stroke-dasharray="9 8"/>
+    <image href="postgresql-elephant.svg" x="478" y="352" width="42" height="42" opacity="0.55" preserveAspectRatio="xMidYMid meet"/>
+    <text class="mutedTitle" x="528" y="384">PostgreSQL</text>
+    <text class="mutedTitle" x="516" y="416">Optimizer</text>
+    <text class="mutedSub" x="500" y="456">bypassed by YAAP</text>
+
+    <rect x="976" y="326" width="242" height="172" rx="24" fill="#f4f6f8" stroke="#b9c3ce" stroke-width="2" stroke-dasharray="9 8"/>
+    <image href="postgresql-elephant.svg" x="1000" y="352" width="42" height="42" opacity="0.55" preserveAspectRatio="xMidYMid meet"/>
+    <text class="mutedTitle" x="1050" y="384">PostgreSQL</text>
+    <text class="mutedTitle" x="1042" y="416">Executor</text>
+    <text class="mutedSub" x="1022" y="456">bypassed by YAAP</text>
+  </g>
+
+  <!-- YAAP plugin -->
+  <g filter="url(#glow)">
+    <rect x="430" y="528" width="820" height="178" rx="32" fill="url(#yaap)"/>
+    <text class="whiteTitle" x="496" y="582">pg_yaap plugin path</text>
+    <text class="whiteSub" x="496" y="684">modern OLAP execution: vectorized batches · pipelines · parallelism</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="496" y="608" width="300" height="54" rx="18" fill="rgba(255,255,255,0.20)" stroke="#bdeaff"/>
+    <text class="whiteTitle" x="530" y="644" style="font-size:24px">YAAP Optimizer</text>
+    <path d="M816 635H856" stroke="#dff8ff" stroke-width="4" marker-end="url(#arrowBlue)"/>
+    <rect x="884" y="608" width="300" height="54" rx="18" fill="rgba(255,255,255,0.20)" stroke="#bdeaff"/>
+    <text class="whiteTitle" x="918" y="644" style="font-size:24px">YAAP Executor</text>
+  </g>
+
+  <!-- Flow arrows -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M346 416H440" stroke="#6d7f91" stroke-width="4" marker-end="url(#arrowGray)"/>
+    <path d="M696 416H962" stroke="#a7b2bf" stroke-width="4" stroke-dasharray="10 9" marker-end="url(#arrowGray)"/>
+    <path d="M1218 416H1314" stroke="#6d7f91" stroke-width="4" marker-end="url(#arrowGray)"/>
+
+    <path d="M238 488C238 626 344 618 414 618" stroke="#1170ff" stroke-width="6" marker-end="url(#arrowBlue)" filter="url(#glow)"/>
+    <path d="M1250 618C1336 618 1370 560 1390 494" stroke="#1170ff" stroke-width="5" marker-end="url(#arrowBlue)" filter="url(#glow)"/>
+  </g>
+
+  <g transform="translate(340 776)" filter="url(#shadow)">
+    <rect x="0" y="0" width="1050" height="72" rx="24" fill="#08172b"/>
+    <text x="86" y="46" fill="#ffffff" font-weight="850" font-size="27">OLAP query: PG parse → YAAP optimize + execute → PG output</text>
+  </g>
+</svg>

@@ -62,6 +62,21 @@ public:
 	const FilterStep *simple_filter_step_cache = nullptr;
 	SeqScanReadStreamState read_stream_state{};
 
+	struct ActiveRuntimeFilter {
+		const pg_atomic_uint64 *words = nullptr;
+		uint32_t word_mask = 0;
+		int64_t  min_val = 0;
+		int64_t  max_val = 0;
+		uint16_t attno = 0;
+		int32_t  attcacheoff = -1;
+		bool     is_int64 = false;
+		bool     bloom_usable = false;
+		bool     has_minmax = false;
+	};
+	ActiveRuntimeFilter active_runtime_filters[MAX_SEQ_SCAN_RUNTIME_FILTERS]{};
+	uint8_t          n_active_runtime_filters = 0;
+	bool             runtime_filter_empty_shortcircuit = false;
+
 	/* M-Q1-PERF B.1: split deform into qual-side (1-row scratch chunk, written
 	 * at row 0 every tuple, evaluated inline) + projection-side (written at
 	 * out.count and only advanced on qual survival). Kills nocachegetattr
@@ -174,6 +189,16 @@ public:
 	uint16_t       filter_bool_regs() const { return filter_bool_regs_; }
 	uint32_t       filter_string_const_bytes() const { return filter_string_const_bytes_; }
 	dsa_pointer    shared_payload_dp() const { return shared_payload_dp_; }
+	uint8_t        n_runtime_filters() const { return n_runtime_filters_; }
+	SeqScanRuntimeFilterDesc runtime_filter(uint8_t idx) const {
+		return idx < MAX_SEQ_SCAN_RUNTIME_FILTERS ? runtime_filters_[idx] : SeqScanRuntimeFilterDesc{};
+	}
+	bool AttachRuntimeFilter(const SeqScanRuntimeFilterDesc &rf) {
+		if (n_runtime_filters_ >= MAX_SEQ_SCAN_RUNTIME_FILTERS)
+			return false;
+		runtime_filters_[n_runtime_filters_++] = rf;
+		return true;
+	}
 	OpDescriptor  *desc() const { return desc_; }
 	const PgVector<OpDescriptor *> &descs() const { return desc_list_; }
 	void           AttachDescriptor(OpDescriptor *desc) { desc_ = desc; desc_list_.push_back(desc); }  /* see physical_hash_aggregate.hpp Fix A2 */
@@ -192,6 +217,8 @@ private:
 	uint16_t     filter_bool_regs_;
 	uint32_t     filter_string_const_bytes_;
 	dsa_pointer  shared_payload_dp_;
+	SeqScanRuntimeFilterDesc runtime_filters_[MAX_SEQ_SCAN_RUNTIME_FILTERS]{};
+	uint8_t      n_runtime_filters_ = 0;
 	OpDescriptor *desc_;
 	PgVector<OpDescriptor *> desc_list_;
 };

@@ -1,456 +1,395 @@
-/*
- * pipeline/task_scheduler.cpp  (M-FRAME-MIN step 3g.2 / C1)
- *
- * See task_scheduler.hpp banner for the full C1 contract. This TU implements:
- *   - SchedulerState / PerPipelineState (lazy per-pipeline tables)
- *   - BindRuntime (bind already-attached PipelineSharedControl + DsmTaskQueue
- *     + dsa_area pointers; scheduler does not own DSM/DSA)
- *   - AllocateEventShmStates (DSA-allocate the per-event counter array and
- *     publish via PipelineSharedControl::event_states_root + event_count)
- *   - EnqueueTasks (real body; dispatches by Event::kind() into RUN/COMBINE/
- *     FINALIZE fan-out; initializes EventShmState.tasks_remaining BEFORE the
- *     first push; pushes N TaskDescriptors via DsmTaskQueue::TryPush which
- *     auto-wakes registered worker latches)
- *   - EstimateDsmSize (corrected to sizeof(EventShmState); see below)
- *
- * 3g.1 already shipped: ctor, BuildEvents, pipeline-id registration. Those
- * bodies are preserved verbatim.
- *
- * Worker bgworker launch + leader Run() event loop are deferred to C7
- * (pipeline_leader.cpp) per the user-locked C1 scope split.
- */
-
 #include "parallel/pipeline/task_scheduler.hpp"
 
 extern "C" {
-#include "port/atomics.h"
-#include "utils/dsa.h"
+#include "miscadmin.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 }
 
 #include <algorithm>
+#include <utility>
 
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/dsm_task_queue.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
+#include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/physical_cross_product.hpp"
-#include "parallel/pipeline/physical_hash_aggregate.hpp"
+#include "parallel/pipeline/physical_delim_scan.hpp"
 #include "parallel/pipeline/physical_hash_join.hpp"
-#include "parallel/pipeline/physical_perfect_hash_aggregate.hpp"
-#include "parallel/pipeline/output_sink.hpp"
-#include "parallel/pipeline/pipeline_combine_event.hpp"
-#include "parallel/pipeline/pipeline_finalize_event.hpp"
-#include "parallel/pipeline/pipeline_run_event.hpp"
+#include "parallel/pipeline/physical_hash_join_probe.hpp"
+#include "parallel/pipeline/pipeline_dsm_lookup.hpp"
+#include "parallel/pipeline/execution_trace.hpp"
+#include "parallel/pipeline/worker_error.hpp"
 
-namespace pg_yaap {
-namespace pipeline {
+namespace pg_yaap::pipeline {
 
-/* ------------------------------------------------------------------------ */
-/* PerPipelineState                                                          */
-/* ------------------------------------------------------------------------ */
+namespace {
 
-PerPipelineState::PerPipelineState(MemoryContext mcxt)
-    : global_ops(PgMemoryContextAllocator<std::unique_ptr<GlobalOperatorState>>(mcxt))
-    , local_source_per_worker(PgMemoryContextAllocator<std::unique_ptr<LocalSourceState>>(mcxt))
-    , local_sink_per_worker(PgMemoryContextAllocator<std::unique_ptr<LocalSinkState>>(mcxt))
-    , local_op_states_per_worker(
-          PgMemoryContextAllocator<PgVector<std::unique_ptr<OperatorState>>>(mcxt))
+constexpr uint32_t kEventsPerPipeline = 3;
+
+PipelineId EventPipeline(EventId id)
 {
+	return static_cast<PipelineId>(id / kEventsPerPipeline);
 }
 
-/* ------------------------------------------------------------------------ */
-/* SchedulerState                                                            */
-/* ------------------------------------------------------------------------ */
-
-SchedulerState::SchedulerState(MemoryContext mcxt, uint32_t worker_count)
-    : mcxt_(mcxt)
-    , worker_count_(worker_count)
-    , per_pipeline_(PgMemoryContextAllocator<std::unique_ptr<PerPipelineState>>(mcxt))
+TaskKind EventKind(EventId id)
 {
-	Assert(mcxt_ != nullptr);
-	Assert(worker_count_ >= 1);
+	return static_cast<TaskKind>(id % kEventsPerPipeline + 1);
 }
 
-PerPipelineState &
-SchedulerState::GetOrCreate(PipelineId pid)
+bool Stopping(PipelineSharedControl *control)
 {
-	Assert(pid != INVALID_PIPELINE_ID);
-	const size_t idx = static_cast<size_t>(pid);
-	if (per_pipeline_.size() <= idx)
-		per_pipeline_.resize(idx + 1);
-	if (!per_pipeline_[idx])
-		per_pipeline_[idx] = std::make_unique<PerPipelineState>(mcxt_);
-	return *per_pipeline_[idx];
+	return pg_atomic_read_u32(&control->shutdown_requested) != 0 ||
+		WorkerErrorPending(control);
 }
 
-PerPipelineState &
-SchedulerState::Get(PipelineId pid)
+void ReleaseRunInputs(ExecCtx &ctx, Pipeline &pipeline)
 {
-	const size_t idx = static_cast<size_t>(pid);
-	Assert(idx < per_pipeline_.size());
-	Assert(per_pipeline_[idx] != nullptr);
-	return *per_pipeline_[idx];
-}
-
-/* ------------------------------------------------------------------------ */
-/* TaskScheduler                                                             */
-/* ------------------------------------------------------------------------ */
-
-TaskScheduler::TaskScheduler(MemoryContext              mcxt,
-                             std::unique_ptr<MetaPipelineBundle> bundle,
-                             const TaskSchedulerSizing &sizing)
-    : mcxt_(mcxt)
-    , bundle_(std::move(bundle))
-    , sizing_(sizing)
-    , pipelines_(mcxt)
-    , events_(mcxt)
-    , events_owned_(PgMemoryContextAllocator<std::shared_ptr<Event>>(mcxt))
-    , run_task_counts_(PgMemoryContextAllocator<uint32_t>(mcxt))
-    , state_(mcxt, sizing.worker_count)
-{
-	Assert(mcxt_ != nullptr);
-	Assert(bundle_ != nullptr);
-	Assert(sizing_.worker_count >= 1);
-
-	for (auto &p : bundle_->pipelines)
+	if (pipeline.source->type() == PhysicalOperatorType::HASH_JOIN_PROBE)
+		static_cast<PhysicalHashJoinProbe *>(pipeline.source)->ReleaseAfterConsumerRun(ctx);
+	else if (pipeline.source->type() == PhysicalOperatorType::MATERIALIZE)
+		static_cast<PhysicalMaterialize *>(pipeline.source)->ReleaseAfterConsumerRun(ctx);
+	for (auto *op : pipeline.ops)
 	{
-		Assert(p->id != INVALID_PIPELINE_ID);
-		pipelines_.Register(static_cast<uint32_t>(p->id), p.get());
-	}
-}
-
-void
-TaskScheduler::BuildEvents()
-{
-	Assert(events_owned_.empty());
-
-	const auto &pipelines = bundle_->pipelines;
-
-	PgMemoryContextAllocator<std::shared_ptr<PipelineRunEvent>>      run_alloc(mcxt_);
-	PgMemoryContextAllocator<std::shared_ptr<PipelineCombineEvent>>  cmb_alloc(mcxt_);
-	PgMemoryContextAllocator<std::shared_ptr<PipelineFinalizeEvent>> fin_alloc(mcxt_);
-
-	std::vector<std::shared_ptr<PipelineRunEvent>,
-	            PgMemoryContextAllocator<std::shared_ptr<PipelineRunEvent>>>
-	    run_events(run_alloc);
-	std::vector<std::shared_ptr<PipelineCombineEvent>,
-	            PgMemoryContextAllocator<std::shared_ptr<PipelineCombineEvent>>>
-	    combine_events(cmb_alloc);
-	std::vector<std::shared_ptr<PipelineFinalizeEvent>,
-	            PgMemoryContextAllocator<std::shared_ptr<PipelineFinalizeEvent>>>
-	    finalize_events(fin_alloc);
-	run_events.reserve(pipelines.size());
-	combine_events.reserve(pipelines.size());
-	finalize_events.reserve(pipelines.size());
-
-	for (auto &p : pipelines)
-	{
-		auto run = AllocatePgShared<PipelineRunEvent>(p->id, p.get(), this);
-		auto cmb = AllocatePgShared<PipelineCombineEvent>(p->id, p.get(), this);
-		auto fin = AllocatePgShared<PipelineFinalizeEvent>(p->id, p.get(), this);
-
-		cmb->AddDependency(run);
-		fin->AddDependency(cmb);
-
-		run_events.push_back(run);
-		combine_events.push_back(cmb);
-		finalize_events.push_back(fin);
-	}
-
-	for (size_t i = 0; i < pipelines.size(); i++)
-	{
-		for (PipelineId dep_pid : pipelines[i]->depends_on)
+		switch (op->type())
 		{
-			Assert(dep_pid < pipelines.size());
-			run_events[i]->AddDependency(finalize_events[dep_pid]);
+			case PhysicalOperatorType::HASH_JOIN_PROBE:
+				static_cast<PhysicalHashJoinProbe *>(op)->ReleaseAfterConsumerRun(ctx);
+				break;
+			case PhysicalOperatorType::HASH_JOIN:
+				static_cast<PhysicalHashJoin *>(op)->ReleaseBuildPayloadAfterConsumerRun(ctx);
+				break;
+			case PhysicalOperatorType::CROSS_PRODUCT:
+				static_cast<PhysicalCrossProduct *>(op)->ReleaseBuildPayloadAfterConsumerRun(ctx);
+				break;
+			default:
+				break;
 		}
 	}
+}
 
-	auto publish = [&](const std::shared_ptr<Event> &ev) {
-		EventId id = next_event_id_++;
-		events_.Register(id, ev.get());
-		events_owned_.push_back(ev);
-	};
+}  /* namespace */
 
-	for (size_t i = 0; i < pipelines.size(); i++)
+void
+TaskScheduler::BuildEvents(const MetaPipelineBundle &bundle, ExecCtx &ctx)
+{
+	const auto count = static_cast<EventId>(bundle.pipelines.size()) * kEventsPerPipeline;
+	Assert(count > 0);
+	auto *control = ctx.control;
+
+	PgVector<std::pair<EventId, EventId>> edges;
+	PgUnorderedMap<const PhysicalOperator *, PipelineId> sink_owners;
+	for (const auto &pipeline : bundle.pipelines)
 	{
-		publish(run_events[i]);
-		publish(combine_events[i]);
-		publish(finalize_events[i]);
+		if (pipeline->source == nullptr || pipeline->sink == nullptr)
+			elog(ERROR, "pg_yaap: pipeline %u is missing source or sink", pipeline->id);
+		const auto [it, inserted] = sink_owners.emplace(pipeline->sink, pipeline->id);
+		if (!inserted)
+			elog(ERROR, "pg_yaap: sink operator shared by pipelines %u and %u without a shared sink-group contract",
+				it->second, pipeline->id);
+		const EventId run = static_cast<EventId>(pipeline->id) * kEventsPerPipeline;
+		edges.emplace_back(run, run + 1);
+		edges.emplace_back(run + 1, run + 2);
+		for (PipelineId dep : pipeline->depends_on)
+		{
+			if (dep >= bundle.pipelines.size())
+				elog(ERROR, "pg_yaap: invalid pipeline dependency %u", dep);
+			edges.emplace_back(static_cast<EventId>(dep) * kEventsPerPipeline + 2, run);
+		}
 	}
-}
+	std::sort(edges.begin(), edges.end());
+	edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
 
-TaskSchedulerDsmLayout
-TaskScheduler::EstimateDsmSize() const
-{
-	/* C1 fix vs 3g.1: per-event counters are now full EventShmState structs
-	 * (tasks_remaining + saw_error), not bare pg_atomic_uint32. The array
-	 * lives in DSA (allocated by AllocateEventShmStates) so this byte count
-	 * is the DSA budget the leader must reserve, not part of the inline DSM
-	 * segment. */
-	TaskSchedulerDsmLayout layout{};
-	layout.control_bytes        = MAXALIGN(sizeof(PipelineSharedControl));
-	layout.task_queue_bytes     = MAXALIGN(
-		DsmTaskQueue::EstimateSize(sizing_.task_queue_capacity));
-	layout.event_counters_bytes = MAXALIGN(
-		(size_t) next_event_id_ * sizeof(EventShmState));
-	layout.total_bytes          = layout.control_bytes
-	                            + layout.task_queue_bytes
-	                            + layout.event_counters_bytes;
-	return layout;
-}
+	control->event_states_root = dsa_allocate0(ctx.dsa, count * sizeof(EventShmState));
+	auto *events = static_cast<EventShmState *>(dsa_get_address(ctx.dsa, control->event_states_root));
+	control->event_successors_root = dsa_allocate(ctx.dsa, edges.size() * sizeof(EventId));
+	auto *successors = static_cast<EventId *>(dsa_get_address(ctx.dsa, control->event_successors_root));
 
-void
-TaskScheduler::BindRuntime(PipelineSharedControl *control,
-                           DsmTaskQueue          *task_queue,
-                           dsa_area              *dsa)
-{
-	Assert(control != nullptr);
-	Assert(task_queue != nullptr);
-	Assert(dsa != nullptr);
-	Assert(control_ == nullptr);
-	Assert(control->magic == PIPELINE_DSM_MAGIC);
-
-	control_    = control;
-	task_queue_ = task_queue;
-	dsa_        = dsa;
-}
-
-void
-TaskScheduler::AllocateEventShmStates()
-{
-	Assert(control_ != nullptr);
-	Assert(dsa_ != nullptr);
-	Assert(event_shm_ == nullptr);
-	Assert(next_event_id_ > 0);
-
-	const size_t bytes = (size_t) next_event_id_ * sizeof(EventShmState);
-	event_shm_dp_      = dsa_allocate0(dsa_, bytes);
-	event_shm_         = static_cast<EventShmState *>(
-		dsa_get_address(dsa_, event_shm_dp_));
-
-	for (uint32_t i = 0; i < next_event_id_; i++)
+	for (size_t index = 0; index < edges.size(); ++index)
 	{
-		pg_atomic_init_u32(&event_shm_[i].tasks_remaining, 0);
-		pg_atomic_init_u32(&event_shm_[i].saw_error, 0);
+		const auto [from, to] = edges[index];
+		auto &event = events[from];
+		if (event.successor_count++ == 0)
+			event.successor_offset = static_cast<uint32_t>(index);
+		successors[index] = to;
+		++events[to].dependencies_remaining;
 	}
 
-	control_->event_states_root = event_shm_dp_;
-	control_->event_count       = next_event_id_;
+	PgVector<uint32_t> indegree(count);
+	PgVector<EventId> ready;
+	for (EventId id = 0; id < count; ++id)
+	{
+		auto &event = events[id];
+		event.phase = SharedEventPhase::WAITING;
+		event.activated_by = -1;
+		event.completed_by = -1;
+		pg_atomic_init_u32(&event.tasks_remaining, 0);
+		pg_atomic_init_u32(&event.tasks_in_flight, 0);
+		indegree[id] = event.dependencies_remaining;
+		if (indegree[id] == 0)
+			ready.push_back(id);
+	}
+	for (size_t visited = 0; visited < ready.size(); ++visited)
+	{
+		const auto &event = events[ready[visited]];
+		for (uint32_t j = 0; j < event.successor_count; ++j)
+		{
+			const EventId next = successors[event.successor_offset + j];
+			if (--indegree[next] == 0)
+				ready.push_back(next);
+		}
+	}
+	if (ready.size() != count)
+		elog(ERROR, "pg_yaap: pipeline event graph contains a dependency cycle");
+	uint32_t terminal_events = 0;
+	for (EventId id = 0; id < count; ++id)
+		if (events[id].successor_count == 0)
+			++terminal_events;
+	if (terminal_events == 0)
+		elog(ERROR, "pg_yaap: pipeline event graph has no terminal event");
+
+	control->event_count = count;
+	control->active_probe_run = INVALID_EVENT_ID;
+	pg_atomic_init_u32(&control->events_remaining, count);
+	pg_atomic_init_u32(&control->scheduler_started, 0);
+	pg_atomic_init_u32(&control->scheduler_busy, 0);
 }
 
-EventShmState &
-TaskScheduler::event_shm_slot(EventId id)
+TaskScheduler::TaskScheduler(ExecCtx &ctx, DsmTaskQueue &queue,
+                             const PipelineDsmLookup<Pipeline> &pipelines)
+	: ctx_(ctx), queue_(queue), pipelines_(pipelines),
+	  events_(static_cast<EventShmState *>(dsa_get_address(ctx.dsa, ctx.control->event_states_root))),
+	  successors_(static_cast<const EventId *>(dsa_get_address(ctx.dsa, ctx.control->event_successors_root)))
 {
-	Assert(event_shm_ != nullptr);
-	Assert(id < next_event_id_);
-	return event_shm_[id];
 }
 
-uint32_t
-TaskScheduler::DeriveRunTaskCount(Pipeline &pipeline) const
+bool
+TaskScheduler::Activate(EventId id)
 {
-	Assert(pipeline.source != nullptr);
-	Assert(pipeline.sink != nullptr);
-	ExecCtx ctx{mcxt_, dsa_, LEADER_WORKER_INDEX};
-	uint32_t bound = sizing_.worker_count;
-	auto apply = [&](int v) {
-		if (v > 0)
-			bound = std::min(bound, static_cast<uint32_t>(v));
-	};
-	/*
-	 * Only sources that explicitly implement parallel morsel ownership may fan
-	 * out RUN tasks. Pipeline-breaker sources such as HASH_AGGREGATE expose a
-	 * single shared cursor in GetData(); letting multiple workers consume them
-	 * duplicates rows. Today SEQ_SCAN is the only parallel source.
-	 */
-	apply(pipeline.source->ParallelSource() ? pipeline.source->MaxThreads(ctx) : 1);
-	for (auto *op : pipeline.ops)
-		apply(op->MaxThreads(ctx));
-	apply(pipeline.sink->MaxThreads(ctx));
-	return bound == 0 ? 1u : bound;
-}
-
-void
-TaskScheduler::RememberRunTaskCount(PipelineId pid, uint32_t task_count)
-{
-	Assert(pid != INVALID_PIPELINE_ID);
-	const size_t idx = static_cast<size_t>(pid);
-	if (run_task_counts_.size() <= idx)
-		run_task_counts_.resize(idx + 1);
-	run_task_counts_[idx] = std::max<uint32_t>(1u, task_count);
-}
-
-uint32_t
-TaskScheduler::RememberedRunTaskCount(PipelineId pid) const
-{
-	Assert(pid != INVALID_PIPELINE_ID);
-	const size_t idx = static_cast<size_t>(pid);
-	if (idx < run_task_counts_.size() && run_task_counts_[idx] != 0)
-		return run_task_counts_[idx];
-	return 1u;
-}
-
-void
-TaskScheduler::EnqueueTasks(Event &event)
-{
-	/* Preconditions: BindRuntime + AllocateEventShmStates already called by
-	 * the leader before any Event::Schedule() runs. EnqueueTasks is invoked
-	 * from PipelineRunEvent::Schedule / PipelineCombineEvent::Schedule /
-	 * PipelineFinalizeEvent::Schedule (3 cpp files, see C1 dispatch). */
-	Assert(control_ != nullptr);
-	Assert(task_queue_ != nullptr);
-	Assert(event_shm_ != nullptr);
-
-	const PipelineId pid = event.pipeline_id();
-	Assert(pid != INVALID_PIPELINE_ID);
-	Pipeline *pipeline = pipelines_.Resolve(static_cast<uint32_t>(pid));
-	Assert(pipeline != nullptr);
-	auto *sink = pipeline->sink;
-	Assert(sink != nullptr);
-
-	/* Resolve the EventId scheduler-side. BuildEvents publishes 3 events
-	 * per pipeline in the deterministic order (Run, Combine, Finalize)
-	 * starting at id = pid*3, so we recover the id by kind without needing
-	 * a reverse Resolve(). This stays consistent with PipelineDsmLookup since
-	 * Register() was called in the same order. */
-	EventId base_id = static_cast<EventId>(pid) * 3u;
-	EventId event_id;
-	uint32_t task_count;
-	const TaskKind kind = event.kind();
+	auto &event = events_[id];
+	const PipelineId pid = EventPipeline(id);
+	auto *pipeline = pipelines_.Resolve(pid);
+	Assert(pipeline != nullptr && pipeline->source != nullptr && pipeline->sink != nullptr);
+	const TaskKind kind = EventKind(id);
+	ExecCtx stage_ctx = ctx_;
+	stage_ctx.initialize_shared_state = true;
+	SinkTaskPlan plan{0, 0, false};
 	switch (kind)
 	{
 		case TaskKind::RUN:
-			event_id   = base_id + 0;
-			task_count = DeriveRunTaskCount(*pipeline);
-			RememberRunTaskCount(pid, task_count);
+		{
+			const bool hybrid = std::any_of(pipeline->ops.begin(), pipeline->ops.end(),
+				[](const PhysicalOperator *op) {
+					return op->type() == PhysicalOperatorType::HASH_JOIN_PROBE;
+				});
+			if (hybrid || pipeline->source->type() == PhysicalOperatorType::HASH_JOIN_PROBE)
+			{
+				if (ctx_.control->active_probe_run != INVALID_EVENT_ID)
+					return false;
+				ctx_.control->active_probe_run = id;
+			}
+
+			(void) pipeline->source->GetGlobalSourceState(stage_ctx);
+			(void) pipeline->sink->GetGlobalSinkState(stage_ctx);
+			uint32_t tasks = ExecutionWorkerCount(stage_ctx);
+			auto limit = [&](int cap) {
+				if (cap > 0)
+					tasks = std::min(tasks, static_cast<uint32_t>(cap));
+			};
+			limit(pipeline->source->ParallelSource() ? pipeline->source->MaxThreads(stage_ctx) : 1);
+			for (auto *op : pipeline->ops)
+				limit(op->MaxThreads(stage_ctx));
+			limit(pipeline->sink->MaxThreads(stage_ctx));
+			plan = {tasks, tasks, false};
+			if (hybrid)
+			{
+				for (auto *op : pipeline->ops)
+					if (op->type() == PhysicalOperatorType::HASH_JOIN_PROBE)
+						static_cast<PhysicalHashJoinProbe *>(op)->InitializeHybrid(stage_ctx, tasks);
+			}
+			YAAP_TRACE_INSTANT(YaapTraceEventType::PIPELINE_READY,
+			                   YaapTraceCategory::EXECUTION,
+			                   pid, YAAP_TRACE_INVALID_ID, 0);
 			break;
+		}
 		case TaskKind::COMBINE:
-			event_id   = base_id + 1;
-			if (sink->CombineIsTrivial())
-			{
-				EventShmState &shm = event_shm_[event_id];
-				pg_atomic_write_u32(&shm.tasks_remaining, 0);
-				event.FinishEvent();
-				return;
-			}
-			if (pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
-			{
-				auto *hash_agg = static_cast<PhysicalHashAggregate *>(pipeline->sink);
-				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_agg);
-				if (!DsaPointerIsValid(payload_dp))
-					elog(ERROR, "pg_yaap: hash aggregate payload missing during COMBINE scheduling");
-				auto *payload = static_cast<HashAggSharedPayload *>(dsa_get_address(dsa_, payload_dp));
-				task_count = payload->partition_count;
-			}
-			else if (pipeline->sink->type() == PhysicalOperatorType::PERFECT_HASH_AGGREGATE)
-			{
-				auto *perfect_hash_agg = static_cast<PhysicalPerfectHashAggregate *>(pipeline->sink);
-				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(perfect_hash_agg);
-				if (!DsaPointerIsValid(payload_dp))
-					elog(ERROR, "pg_yaap: perfect hash aggregate payload missing during COMBINE scheduling");
-				task_count = 1;
-			}
-			else if (pipeline->sink->type() == PhysicalOperatorType::HASH_JOIN)
-			{
-				auto *hash_join = static_cast<PhysicalHashJoin *>(pipeline->sink);
-				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(hash_join);
-				if (!DsaPointerIsValid(payload_dp))
-					elog(ERROR, "pg_yaap: hash join payload missing during COMBINE scheduling");
-				task_count = RememberedRunTaskCount(pid);
-			}
-			else if (pipeline->sink->type() == PhysicalOperatorType::CROSS_PRODUCT)
-			{
-				auto *cross_product = static_cast<PhysicalCrossProduct *>(pipeline->sink);
-				dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(cross_product);
-				if (!DsaPointerIsValid(payload_dp))
-					elog(ERROR, "pg_yaap: cross product payload missing during COMBINE scheduling");
-				task_count = RememberedRunTaskCount(pid);
-			}
-			else
-			{
-				/* One combine task per worker that participated in Run; matches
-				 * the Run fan-out for non-partition-owner sinks. */
-				task_count = RememberedRunTaskCount(pid);
-			}
+			if (!pipeline->sink->CombineIsTrivial())
+				plan = pipeline->sink->GetCombineTaskPlan(stage_ctx, events_[id - 1].task_count);
 			break;
 		case TaskKind::FINALIZE:
-			event_id   = base_id + 2;
-			if (sink->FinalizeIsTrivial())
-			{
-				EventShmState &shm = event_shm_[event_id];
-				pg_atomic_write_u32(&shm.tasks_remaining, 0);
-				{
-					ExecCtx leader_ctx{mcxt_, dsa_, LEADER_WORKER_INDEX, control_, event_id};
-					auto &ps = state_.GetOrCreate(pid);
-					if (ps.global_sink == nullptr)
-						ps.global_sink = sink->GetGlobalSinkState(leader_ctx);
-					if (ps.global_sink != nullptr)
-					{
-						SinkFinalizeType fres = sink->Finalize(leader_ctx, *ps.global_sink);
-						if (fres != SinkFinalizeType::READY)
-							elog(ERROR, "pg_yaap: trivial finalize did not finish");
-					}
-				}
-				event.FinishEvent();
-				return;
-			}
-			/* Finalize is leader-only (Sink::Finalize is a leader op). The
-			 * leader's worker_index is LEADER_WORKER_INDEX; C7's event loop
-			 * runs Finalize inline rather than dispatching to the DSM
-			 * queue. We still publish 1 to tasks_remaining so the C7 loop
-			 * uses the same count==0 transition signal. */
-			task_count = 1;
+			plan = pipeline->sink->GetFinalizeTaskPlan(stage_ctx, events_[id - 2].task_count);
 			break;
-		default:
-			Assert(false);
-			return;
 	}
 
-	Assert(events_.Resolve(event_id) == &event);
-
-	EventShmState &shm = event_shm_[event_id];
-
-	/* MUST init tasks_remaining BEFORE the first TryPush. Workers decrement
-	 * after each Task::Execute; if even one push happens before the counter
-	 * is set to N, a worker may observe tasks_remaining=0 and prematurely
-	 * trigger the leader's FinishEvent. */
-	pg_atomic_write_u32(&shm.tasks_remaining, task_count);
-
-	if (kind == TaskKind::FINALIZE)
-		return;
-
-	for (uint32_t i = 0; i < task_count; i++)
+	if (plan.task_count != 0 &&
+		(plan.worker_count == 0 || plan.worker_count > ExecutionWorkerCount(stage_ctx)))
+		elog(ERROR, "pg_yaap: operator returned an invalid sink task plan");
+	event.task_count = plan.task_count;
+	event.max_concurrency = plan.worker_count;
+	event.partitioned = plan.partitioned;
+	event.phase = SharedEventPhase::RUNNING;
+	event.activated_by = ctx_.worker_index;
+	/* The complete logical count precedes publication of the first task. */
+	pg_atomic_write_u32(&event.tasks_remaining, plan.task_count);
+	YAAP_TRACE_INSTANT(YaapTraceEventType::EVENT_SCHEDULE,
+	                   YaapTraceCategory::SCHEDULER,
+	                   pid, id,
+	                   YaapTracePackEventArg(static_cast<uint8_t>(kind), plan.task_count));
+	if (kind == TaskKind::RUN)
 	{
-		TaskDescriptor desc{};
-		desc.pipeline_id  = static_cast<uint32_t>(pid);
-		desc.event_id     = event_id;
-		desc.partition_id = UINT32_MAX;
-		desc.worker_index = static_cast<int32_t>(i);
-		desc.kind         = static_cast<uint8_t>(kind);
-		if (kind == TaskKind::COMBINE &&
-			pipeline->sink->type() == PhysicalOperatorType::HASH_AGGREGATE)
-		{
-			desc.partition_id = i;
-			desc.worker_index = static_cast<int32_t>(i % DeriveRunTaskCount(*pipeline));
-		}
+		YAAP_TRACE_INSTANT(YaapTraceEventType::PIPELINE_SCHEDULE,
+		                   YaapTraceCategory::SCHEDULER,
+		                   pid, YAAP_TRACE_INVALID_ID, plan.task_count);
+	}
+	return true;
+}
 
-		/* TryPush wakes every registered worker latch on success
-		 * (DsmTaskQueue C2). Capacity sized in EstimateDsmSize is
-		 * worst-case >= sum(task_count) across in-flight events, so the
-		 * loop never spuriously fails in M-FRAME-MIN. If it ever does
-		 * (capacity misconfigured), assert rather than spin: C7 will
-		 * surface this as a worker_error and Abort the query. */
-		const bool ok = task_queue_->TryPush(desc);
-		if (!ok)
-		{
-			pg_atomic_write_u32(&shm.tasks_remaining, 0);
-			elog(ERROR,
-			     "pg_yaap: task queue full while enqueuing event %u "
-			     "(pipeline %u, kind %u, capacity %u)",
-			     event_id, (unsigned) pid, (unsigned) kind,
-			     task_queue_->Capacity());
-		}
+void
+TaskScheduler::FinishEvent(EventId id)
+{
+	auto &event = events_[id];
+	const PipelineId pid = EventPipeline(id);
+	const TaskKind kind = EventKind(id);
+	if (kind == TaskKind::RUN)
+	{
+		ReleaseRunInputs(ctx_, *pipelines_.Resolve(pid));
+		if (ctx_.control->active_probe_run == id)
+			ctx_.control->active_probe_run = INVALID_EVENT_ID;
+		dsa_trim(ctx_.dsa);
+	}
+
+	if (Stopping(ctx_.control))
+		return;
+	event.phase = SharedEventPhase::FINISHED;
+	event.completed_by = ctx_.worker_index;
+	YAAP_TRACE_INSTANT(YaapTraceEventType::EVENT_FINISH,
+	                   YaapTraceCategory::SCHEDULER,
+	                   pid, id,
+	                   YaapTracePackEventArg(static_cast<uint8_t>(kind), event.task_count));
+	if (kind == TaskKind::FINALIZE)
+	{
+		YAAP_TRACE_INSTANT(YaapTraceEventType::PIPELINE_FINISH,
+		                   YaapTraceCategory::EXECUTION,
+		                   pid, YAAP_TRACE_INVALID_ID, 0);
+	}
+	for (uint32_t j = 0; j < event.successor_count; ++j)
+	{
+		auto &next = events_[successors_[event.successor_offset + j]];
+		Assert(next.dependencies_remaining > 0 && next.phase == SharedEventPhase::WAITING);
+		--next.dependencies_remaining;
+	}
+	if (pg_atomic_sub_fetch_u32(&ctx_.control->events_remaining, 1) == 0)
+	{
+		PGPROC *leader = BackendPidGetProc(ctx_.control->leader_pid);
+		if (leader != nullptr)
+			SetLatch(&leader->procLatch);
 	}
 }
 
-}  /* namespace pipeline */
-}  /* namespace pg_yaap */
+bool
+TaskScheduler::DispatchReadyTasks()
+{
+	bool progress = false;
+	/* Prioritize barrier-completing work (FINALIZE -> COMBINE -> RUN) so
+	 * lightweight completions never queue behind heavy parallel scans. */
+	static constexpr TaskKind kDispatchOrder[3] = {
+		TaskKind::FINALIZE,
+		TaskKind::COMBINE,
+		TaskKind::RUN,
+	};
+	for (TaskKind want_kind : kDispatchOrder)
+	{
+		for (EventId id = 0; id < ctx_.control->event_count && !Stopping(ctx_.control); ++id)
+		{
+			if (EventKind(id) != want_kind)
+				continue;
+			auto &event = events_[id];
+			if (event.phase != SharedEventPhase::RUNNING)
+				continue;
+			while (event.next_task < event.task_count &&
+			       pg_atomic_read_membarrier_u32(&event.tasks_in_flight) < event.max_concurrency)
+			{
+				const uint32_t index = event.next_task;
+				TaskDescriptor desc{};
+				desc.pipeline_id = EventPipeline(id);
+				desc.event_id = id;
+				desc.partition_id = event.partitioned ? index : UINT32_MAX;
+				desc.task_index = index;
+				desc.kind = static_cast<uint8_t>(want_kind);
+				pg_atomic_add_fetch_u32(&event.tasks_in_flight, 1);
+				if (!queue_.TryPush(desc))
+				{
+					pg_atomic_sub_fetch_u32(&event.tasks_in_flight, 1);
+					return progress;
+				}
+				YAAP_TRACE_INSTANT(YaapTraceEventType::TASK_ENQUEUE,
+				                   YaapTraceCategory::SCHEDULER,
+				                   desc.pipeline_id, desc.task_index,
+				                   YaapTracePackTaskArg(desc.event_id, desc.kind, desc.partition_id));
+				++event.next_task;
+				progress = true;
+			}
+		}
+	}
+	return progress;
+}
+
+bool
+TaskScheduler::Advance()
+{
+	auto *control = ctx_.control;
+	if (pg_atomic_read_membarrier_u32(&control->scheduler_started) == 0 ||
+		pg_atomic_read_u32(&control->events_remaining) == 0 || Stopping(control))
+		return false;
+	uint32_t expected = 0;
+	if (!pg_atomic_compare_exchange_u32(&control->scheduler_busy, &expected, 1))
+		return false;
+
+	/* ERROR aborts the entire query; clear the election token on either exit. */
+	volatile bool progress = false;
+	PG_TRY();
+	{
+		bool changed;
+		do
+		{
+			changed = false;
+			for (EventId id = 0; id < control->event_count && !Stopping(control); ++id)
+			{
+				auto &event = events_[id];
+				if (event.phase == SharedEventPhase::WAITING && event.dependencies_remaining == 0)
+					changed |= Activate(id);
+				if (event.phase == SharedEventPhase::RUNNING &&
+					pg_atomic_read_membarrier_u32(&event.tasks_remaining) == 0)
+				{
+					FinishEvent(id);
+					changed = true;
+				}
+			}
+			progress |= changed;
+		} while (changed && !Stopping(control));
+		progress |= DispatchReadyTasks();
+	}
+	PG_CATCH();
+	{
+		/* Prevent another worker from advancing a partially activated event. */
+		pg_atomic_write_membarrier_u32(&control->shutdown_requested, 1);
+		pg_atomic_write_membarrier_u32(&control->scheduler_busy, 0);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pg_atomic_write_membarrier_u32(&control->scheduler_busy, 0);
+	return progress;
+}
+
+void
+TaskScheduler::CompleteTask(EventId id)
+{
+	auto &event = events_[id];
+	pg_atomic_sub_fetch_u32(&event.tasks_in_flight, 1);
+	pg_atomic_sub_fetch_u32(&event.tasks_remaining, 1);
+	/* A worker already in Advance may have just inspected this phase. */
+	queue_.WakeRegisteredWorkers();
+}
+
+}  /* namespace pg_yaap::pipeline */

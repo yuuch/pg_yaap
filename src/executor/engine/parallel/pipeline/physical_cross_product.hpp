@@ -64,6 +64,9 @@ public:
 
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta) override;
 
+	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+	SinkCombineResultType FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
+
 	std::unique_ptr<GlobalSinkState> GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState> GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	SinkResultType                  SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
@@ -80,7 +83,7 @@ public:
 	dsa_pointer right_payload_layout_dp() const { return right_payload_layout_dp_; }
 	dsa_pointer output_columns_dp() const { return output_columns_dp_; }
 	uint16_t output_column_count() const { return output_column_count_; }
-	dsa_pointer shared_payload_dp() const { return shared_payload_dp_; }
+	dsa_pointer shared_payload_dp() const;
 	uint32_t max_rows() const { return max_rows_; }
 	OpDescriptor *desc() const { return desc_; }
 	const PgVector<OpDescriptor *> &descs() const { return desc_list_; }

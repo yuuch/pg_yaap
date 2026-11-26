@@ -37,6 +37,8 @@ struct HashJoinProbeCursorState {
 	bool have_build_cursor = false;
 	uint16_t probe_salt = 0;
 	bool probe_matched = false;
+	bool probe_key_null = false;
+	uint32_t partition_id = UINT32_MAX;
 };
 
 void InitializeHashJoinFastProbeState(HashJoinFastProbeState &state,
@@ -59,6 +61,13 @@ void CopyRowsByResolvedMappingBatch(const PipelineChunk &left_chunk,
 				    PipelineChunk &out,
 				    uint16_t out_row_base,
 				    uint16_t batch_count);
+
+void CopyUnmatchedBuildRow(const TupleDataCollection *right_tdc,
+				   const uint8_t *right_row,
+				   const HashJoinResolvedOutputColumn *resolved_columns,
+				   uint16_t output_column_count,
+				   PipelineChunk &out,
+				   uint16_t out_row_idx);
 
 bool TryFastInnerJoinProbe(ExecCtx &ctx,
 			   const HashJoinFastProbeState &state,

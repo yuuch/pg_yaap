@@ -106,7 +106,7 @@ TupleDataLayoutAppendAggregate(TupleDataLayout *layout,
 							   TdcAggKind kind,
 							   uint16_t src_col_idx,
 							   Oid pg_agg_oid,
-							   int16_t numeric_scale)
+								 int16_t numeric_scale)
 {
 	Assert(layout != nullptr);
 	if (layout->aggregate_count >= TUPLE_DATA_MAX_COLUMNS)
@@ -137,6 +137,18 @@ TupleDataLayoutSeal(TupleDataLayout *layout)
 	const uint16_t rem = static_cast<uint16_t>(layout->row_width % 8);
 	if (rem != 0)
 		layout->row_width = static_cast<uint16_t>(layout->row_width + (8 - rem));
+}
+
+void
+TupleDataLayoutEnableValidity(TupleDataLayout *layout)
+{
+	Assert(layout != nullptr);
+	if (layout->column_count == 0 || layout->validity_width != 0)
+		return;
+	TupleDataLayoutSeal(layout);
+	layout->validity_width = static_cast<uint16_t>((layout->column_count + 7u) / 8u);
+	layout->row_width = static_cast<uint16_t>(layout->row_width +
+		TupleDataLayoutValidityStorageWidth(layout));
 }
 
 }  /* namespace pipeline */

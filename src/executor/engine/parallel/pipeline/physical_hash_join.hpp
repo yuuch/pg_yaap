@@ -9,6 +9,8 @@ extern "C" {
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
+#include "buffer_manager/yaap_segmented_tdc.hpp"
+#include "buffer_manager/yaap_spill_store.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -34,6 +36,8 @@ public:
 	TupleDataCollection   *build_rows = nullptr;
 	uint32_t               local_state_slot_count = 0;
 	bool                   finalized = false;
+	dsa_pointer            runtime_filter_dp = InvalidDsaPointer;
+	HashJoinRuntimeFilter *runtime_filter = nullptr;
 };
 
 class HashJoinLocalSinkState final : public LocalSinkState {
@@ -44,7 +48,20 @@ public:
 	const TupleDataLayout *build_layout = nullptr;
 	TupleDataCollection   *build_keys = nullptr;
 	TupleDataCollection   *build_rows = nullptr;
+	buffer::YaapSegmentedTdc key_segmented;
+	buffer::YaapSegmentedTdc row_segmented;
+	PgVector<buffer::YaapSegmentedTdc> partition_key_segmented;
+	PgVector<buffer::YaapSegmentedTdc> partition_row_segmented;
+	dsa_pointer partition_state_dp = InvalidDsaPointer;
+	dsa_pointer key_refs_dp = InvalidDsaPointer;
+	dsa_pointer row_refs_dp = InvalidDsaPointer;
+	bool segmented_writer_initialized = false;
+	uint32_t spill_scan_ticks = 0;
 	uint64_t build_input_rows = 0;
+	int64_t  rf_min = INT64_MAX;
+	int64_t  rf_max = INT64_MIN;
+	uint64_t rf_rows = 0;
+	bool     rf_published = false;
 };
 
 class PhysicalHashJoin final : public PhysicalOperator {
@@ -156,15 +173,31 @@ public:
 
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta) override;
 
+	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+	SinkCombineResultType FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
+	SinkTaskPlan GetFinalizeTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+
 	std::unique_ptr<GlobalSinkState> GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState> GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	SinkResultType                  SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
 	SinkCombineResultType           Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
 	SinkFinalizeType                Finalize(ExecCtx &ctx, GlobalSinkState &gstate) override;
+	SinkFinalizeType                FinalizePartition(ExecCtx &ctx,
+										 GlobalSinkState &gstate,
+										 uint32_t partition_id);
 
 	std::unique_ptr<OperatorState> GetOperatorState(ExecCtx &ctx) override;
+	void SetProbeBatch(OperatorState &state, dsa_pointer batch_dp);
+	void BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t partition_id);
+	bool IsBatchBuildRowMatched(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx) const;
+	void EmitBuildResultRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t row_idx,
+						OperatorState &state, PipelineChunk &out);
 	OperatorResultType Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state) override;
 	void ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx);
+	void ReleaseBuildPayloadAtQueryEnd(ExecCtx &ctx);
+	bool EvictUnusedBuildSegment(ExecCtx &ctx, const buffer::YaapSegmentHandle &exclude);
+	void ReleaseBuildPartitionAfterProbe(ExecCtx &ctx, uint32_t partition_id);
+
 
 	dsa_pointer left_input_schema_dp() const { return left_input_schema_dp_; }
 	dsa_pointer right_input_schema_dp() const { return right_input_schema_dp_; }
@@ -185,7 +218,9 @@ public:
 	uint16_t filter_bool_regs() const { return filter_bool_regs_; }
 	HashJoinMatchMode join_mode() const { return join_mode_; }
 	uint32_t filter_string_const_bytes() const { return filter_string_const_bytes_; }
-	dsa_pointer shared_payload_dp() const { return shared_payload_dp_; }
+	dsa_pointer shared_payload_dp() const;
+	dsa_pointer runtime_filter_dp() const { return runtime_filter_dp_; }
+	void SetRuntimeFilter(dsa_pointer dp) { runtime_filter_dp_ = dp; }
 	uint16_t n_left_keys() const { return n_left_keys_; }
 	uint16_t n_right_keys() const { return n_right_keys_; }
 	uint32_t max_rows() const { return max_rows_; }
@@ -194,6 +229,7 @@ public:
 	void AttachDescriptor(OpDescriptor *desc) { desc_ = desc; desc_list_.push_back(desc); }
 
 private:
+	std::unique_ptr<PhysicalOperator> probe_stage_;
 	dsa_pointer  left_input_schema_dp_;
 	dsa_pointer  right_input_schema_dp_;
 	dsa_pointer  output_schema_dp_;
@@ -214,6 +250,7 @@ private:
 	HashJoinMatchMode join_mode_;
 	uint32_t     filter_string_const_bytes_;
 	dsa_pointer  shared_payload_dp_;
+	dsa_pointer  runtime_filter_dp_ = InvalidDsaPointer;
 	uint16_t     n_left_keys_;
 	uint16_t     n_right_keys_;
 	uint32_t     max_rows_;
