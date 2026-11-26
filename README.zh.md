@@ -65,10 +65,10 @@ PostgreSQL 依然是数据库主体，继续负责：
 
 | 数据规模 | 引擎 | 通过 / 总数 | SQL 耗时 | 墙钟耗时 | 备注与配置 |
 |---|---|---|---|---|---|
-| **SF10** | `pg_yaap` | **22 / 22** | **20.5 s** | **21.4 s** | `shared_buffers=4GB`，12 workers，`memory_limit=8GB` |
+| **SF10** | `pg_yaap` | **22 / 22** | **20.4 s** | **21.4 s** | `shared_buffers=4GB`，12 workers，`memory_limit=8GB` |
 | **SF10** | `pg_duckdb` | 22 / 22 | 95.8 s | — | 基线对比测试 |
 | **SF10** | PostgreSQL | 22 / 22 | 447.9 s | — | 基线对比测试 |
-| **SF100** | `pg_yaap` | **22 / 22** | **414.5 s** | **425.3 s** | `shared_buffers=4GB`，12 workers，`memory_limit=8GB`，0 超时 |
+| **SF100** | `pg_yaap` | **22 / 22** | **417.0 s** | **429.0 s** | `shared_buffers=4GB`，12 workers，`memory_limit=8GB`，0 超时 |
 | **SF100** | PostgreSQL | 18 / 22 | 3,302.0 s | — | `shared_buffers=2GB` 基线；4 条超时（每条按 600 s 计） |
 | **SF100** | `pg_duckdb` | 18 / 22 | 3,346.6 s | — | `shared_buffers=2GB` 基线，默认 4 GiB 内存；4 条超时（每条 600 s） |
 

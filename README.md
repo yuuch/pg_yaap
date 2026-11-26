@@ -65,10 +65,10 @@ Snapshots below were measured on an **Apple M4 Pro (24 GB RAM)** with `pg_yaap` 
 
 | Scale | Engine | Passed / Total | SQL Time | Wall Time | Notes |
 |---|---|---|---|---|---|
-| **SF10** | `pg_yaap` | **22 / 22** | **20.5 s** | **21.4 s** | `shared_buffers=4GB`, 12 workers, `memory_limit=8GB` |
+| **SF10** | `pg_yaap` | **22 / 22** | **20.4 s** | **21.4 s** | `shared_buffers=4GB`, 12 workers, `memory_limit=8GB` |
 | **SF10** | `pg_duckdb` | 22 / 22 | 95.8 s | — | Baseline run |
 | **SF10** | PostgreSQL | 22 / 22 | 447.9 s | — | Baseline run |
-| **SF100** | `pg_yaap` | **22 / 22** | **414.5 s** | **425.3 s** | `shared_buffers=4GB`, 12 workers, `memory_limit=8GB`, 0 timeouts |
+| **SF100** | `pg_yaap` | **22 / 22** | **417.0 s** | **429.0 s** | `shared_buffers=4GB`, 12 workers, `memory_limit=8GB`, 0 timeouts |
 | **SF100** | PostgreSQL | 18 / 22 | 3,302.0 s | — | `shared_buffers=2GB` baseline; 4 timeouts (600 s each in total) |
 | **SF100** | `pg_duckdb` | 18 / 22 | 3,346.6 s | — | `shared_buffers=2GB` baseline, default 4 GiB memory; 4 timeouts (600 s each) |
 
