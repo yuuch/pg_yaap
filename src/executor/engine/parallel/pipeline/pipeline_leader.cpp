@@ -13,6 +13,7 @@ extern "C" {
 #include "utils/dsa.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 }
@@ -33,19 +34,17 @@ extern "C" {
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
-#include "parallel/pipeline/pipeline_dsm_lookup.hpp"
 #include "parallel/pipeline/pipeline_leader.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/pipeline_timeline.hpp"
 #include "parallel/pipeline/query_state.hpp"
 #include "parallel/pipeline/runtime_dsm.hpp"
-#include "parallel/pipeline/task.hpp"
 #include "parallel/pipeline/task_scheduler.hpp"
 #include "parallel/pipeline/types.hpp"
+#include "parallel/pipeline/worker_error.hpp"
 
 extern "C" {
 extern int pg_yaap_parallel_max_workers;
-extern bool pg_yaap_parallel_leader_participation;
 extern bool pg_yaap_trace_hooks;
 extern char pg_yaap_bgworker_library_path[];
 extern bool pg_yaap_trace_execution_path;
@@ -57,7 +56,6 @@ namespace pipeline {
 
 namespace {
 
-static constexpr uint32_t kTaskQueueCapacity = 64;
 
 /* B.2 startup-tax probe: one-shot phase timer to localize the ~2700 ms cold-
  * cache fixed cost in PgYaapPipelineRun. Toggle via env PG_YAAP_PHASE=1.
@@ -140,8 +138,7 @@ static void
 DetectUnexpectedWorkerExit(PipelineSharedControl *control,
 							 const PgVector<BackgroundWorkerHandle *> &handles)
 {
-	if (control == nullptr || pg_atomic_read_u32(&control->shutdown_requested) != 0 ||
-		pg_atomic_read_u32(&control->worker_error) != 0)
+	if (control == nullptr || WorkerErrorPending(control))
 		return;
 	for (size_t i = 0; i < handles.size(); ++i)
 	{
@@ -152,14 +149,9 @@ DetectUnexpectedWorkerExit(PipelineSharedControl *control,
 		const BgwHandleStatus status = GetBackgroundWorkerPid(handle, &pid);
 		if (status != BGWH_STOPPED && status != BGWH_POSTMASTER_DIED)
 			continue;
-		uint32 expected = 0;
-		if (pg_atomic_compare_exchange_u32(&control->worker_error, &expected, 1u))
-		{
-			std::snprintf(control->worker_error_msg,
-				PIPELINE_WORKER_ERROR_MSG_LEN,
-				"pg_yaap worker %zu (pid %d) exited unexpectedly",
-				i, static_cast<int>(pid));
-		}
+		ReportWorkerError(control,
+			"pg_yaap worker %zu (pid %d) exited unexpectedly",
+			i, static_cast<int>(pid));
 		return;
 	}
 }
@@ -267,7 +259,11 @@ FailEarly(const char **failure_reason,
 		  PgYaapQueryState *state)
 {
 	if (failure_reason != nullptr)
-		*failure_reason = reason;
+	{
+		/* A worker's diagnostic may live in the DSM we are about to unmap.
+		 * Return a copy that also outlives the leader's local context. */
+		*failure_reason = MemoryContextStrdup(state->context, reason);
+	}
 	if (state != nullptr)
 	{
 		state->parallel_plan = nullptr;
@@ -275,62 +271,6 @@ FailEarly(const char **failure_reason,
 	}
 	ShutdownAndDestroy(cleanup);
 	return false;
-}
-
-static bool
-AllEventsFinished(TaskScheduler &scheduler)
-{
-	for (uint32_t id = 0; id < scheduler.event_count(); ++id)
-	{
-		Event *event = scheduler.event_lookup().Resolve(id);
-		Assert(event != nullptr);
-		EventState state = event->state();
-		if (state != EventState::FINISHED && state != EventState::ABORTED)
-			return false;
-	}
-	return true;
-}
-
-enum class PipelineRunCleanupRole {
-	SOURCE,
-	OPERATOR,
-	SINK,
-};
-
-static void
-DispatchConsumerResourceCleanup(ExecCtx &ctx,
-						 PhysicalOperator *op,
-						 PipelineRunCleanupRole role)
-{
-	if (op == nullptr)
-		return;
-
-	switch (op->type())
-	{
-		case PhysicalOperatorType::HASH_JOIN_PROBE:
-			if (role == PipelineRunCleanupRole::SOURCE || role == PipelineRunCleanupRole::OPERATOR)
-				static_cast<PhysicalHashJoinProbe *>(op)->ReleaseAfterConsumerRun(ctx);
-			return;
-		case PhysicalOperatorType::HASH_JOIN:
-			if (role == PipelineRunCleanupRole::OPERATOR)
-				static_cast<PhysicalHashJoin *>(op)->ReleaseBuildPayloadAfterConsumerRun(ctx);
-			return;
-		case PhysicalOperatorType::CROSS_PRODUCT:
-			if (role == PipelineRunCleanupRole::OPERATOR)
-				static_cast<PhysicalCrossProduct *>(op)->ReleaseBuildPayloadAfterConsumerRun(ctx);
-			return;
-		default:
-			return;
-	}
-}
-
-static void
-PipelinePostConsumerRunCleanup(ExecCtx &ctx, Pipeline &consumer)
-{
-	DispatchConsumerResourceCleanup(ctx, consumer.source, PipelineRunCleanupRole::SOURCE);
-	for (PhysicalOperator *op : consumer.ops)
-		DispatchConsumerResourceCleanup(ctx, op, PipelineRunCleanupRole::OPERATOR);
-	DispatchConsumerResourceCleanup(ctx, consumer.sink, PipelineRunCleanupRole::SINK);
 }
 
 static void
@@ -385,63 +325,16 @@ RaiseWorkerFailure(PipelineSharedControl *control,
 	(void) state;
 
 	char errmsg_buf[PIPELINE_WORKER_ERROR_MSG_LEN];
-	std::memcpy(errmsg_buf, control->worker_error_msg, sizeof(errmsg_buf));
-	errmsg_buf[sizeof(errmsg_buf) - 1] = '\0';
+	const char *message = WorkerErrorMessage(control);
+	/* A reporter may have died while owning WRITING. Never read its partial
+	 * buffer, and do not wait forever for a READY it can no longer publish. */
+	std::snprintf(errmsg_buf, sizeof(errmsg_buf), "%s",
+		message != nullptr ? message : "worker failed while publishing its diagnostic");
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INTERNAL_ERROR),
 			 errmsg("pg_yaap worker reported failure: %s",
 					errmsg_buf[0] != '\0' ? errmsg_buf : "(no message)")));
-}
-
-static TaskExecutionResult
-ExecuteLeaderTask(TaskDescriptor desc,
-			 Pipeline *pipeline,
-			 WorkerTaskRuntime *leader_rt)
-{
-	std::unique_ptr<Task> task;
-
-	switch (static_cast<TaskKind>(desc.kind))
-	{
-		case TaskKind::RUN:
-			task = std::make_unique<PipelineRunTask>(desc.event_id,
-								pipeline,
-								leader_rt,
-								desc.worker_index);
-			break;
-		case TaskKind::COMBINE:
-			task = std::make_unique<PipelineCombineTask>(desc.event_id,
-								pipeline,
-								leader_rt,
-								desc.worker_index,
-								desc.partition_id);
-			break;
-		case TaskKind::FINALIZE:
-			task = std::make_unique<PipelineFinalizeTask>(desc.event_id,
-								pipeline,
-								leader_rt,
-												desc.worker_index,
-												desc.partition_id);
-			break;
-	}
-
-	Assert(task != nullptr);
-	return task->Execute();
-}
-
-static bool
-UsesWorkerPartitionedHashJoinFinalize(Pipeline *pipeline, dsa_area *dsa)
-{
-	if (pipeline == nullptr || pipeline->sink == nullptr || dsa == nullptr ||
-		pipeline->sink->type() != PhysicalOperatorType::HASH_JOIN)
-		return false;
-	auto *join = static_cast<PhysicalHashJoin *>(pipeline->sink);
-	const dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(join);
-	if (!DsaPointerIsValid(payload_dp))
-		return false;
-	auto *payload = static_cast<HashJoinSharedPayload *>(dsa_get_address(dsa, payload_dp));
-	return payload != nullptr && payload->direct_segmented_build &&
-		payload->build_partition_count > 1 && !payload->partition_probe_mode;
 }
 
 }  /* namespace */
@@ -497,15 +390,10 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 	DsmTaskQueue *queue = nullptr;
 	dsa_area *dsa = nullptr;
 	shm_toc *toc = nullptr;
-	WorkerTaskRuntime leader_rt{};
-	PipelineDsmLookup<Pipeline> leader_lookup(leader_mcxt);
 	PgVector<BackgroundWorkerHandle *> handles{
 		PgMemoryContextAllocator<BackgroundWorkerHandle *>(leader_mcxt)};
 	PgVector<pid_t> registered_pids{
 		PgMemoryContextAllocator<pid_t>(leader_mcxt)};
-	PgVector<char> event_scheduled{PgMemoryContextAllocator<char>(leader_mcxt)};
-	PgVector<char> event_finished{PgMemoryContextAllocator<char>(leader_mcxt)};
-	PgVector<char> run_cleanup_done{PgMemoryContextAllocator<char>(leader_mcxt)};
 
 	cleanup.handles = &handles;
 
@@ -575,6 +463,14 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		Assert(control->leader_pid == MyProcPid);
 		control->num_workers = bgworker_count;
 
+		Snapshot leader_snapshot = queryDesc != nullptr ? queryDesc->snapshot : nullptr;
+		if (leader_snapshot == nullptr)
+			return FailEarly(failure_reason, "pg_yaap: query has no snapshot to share with workers", cleanup, state);
+		Size snapshot_size = EstimateSnapshotSpace(leader_snapshot);
+		control->snapshot_root = dsa_allocate(dsa, snapshot_size);
+		SerializeSnapshot(leader_snapshot,
+			static_cast<char *>(dsa_get_address(dsa, control->snapshot_root)));
+
 		control->pipelines_root = LeaderSerializePipelines(*bundle, dsa);
 		control->num_pipelines = static_cast<int32>(bundle->pipelines.size());
 		if (pg_yaap_trace_execution_path)
@@ -584,28 +480,10 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 		phase.mark("T3_descriptor_pub");
 
-		const bool leader_participate_requested =
-			pg_yaap_parallel_leader_participation;
-		const bool leader_participate = false;
-		(void) leader_participate_requested;
-		/* Per-current scheduler/task-descriptor contract, leader participation
-		 * remains disabled until a dedicated LEADER_WORKER_INDEX task slot is
-		 * published. */
-
-		TaskScheduler scheduler(leader_mcxt,
-						std::move(bundle),
-						TaskSchedulerSizing{static_cast<uint32_t>(bgworker_count),
-										kTaskQueueCapacity});
-		scheduler.BuildEvents();
-		scheduler.BindRuntime(control, queue, dsa);
-		scheduler.AllocateEventShmStates();
-		if (pg_yaap_trace_execution_path)
-			elog(LOG, "pg_yaap pipeline leader: scheduler initialized events=%u",
-				 scheduler.event_count());
-		PipelineProfileAllocate(control,
-							 dsa,
-							 scheduler.event_count(),
-							 static_cast<uint32>(bgworker_count));
+		ExecCtx leader_ctx{leader_mcxt, dsa, LEADER_WORKER_INDEX, control, INVALID_EVENT_ID};
+		TaskScheduler::BuildEvents(*bundle, leader_ctx);
+		PipelineProfileAllocate(control, dsa, control->event_count,
+			static_cast<uint32_t>(bgworker_count));
 		pg_atomic_write_u32(&control->trace_execution_path,
 							 pg_yaap_trace_execution_path ? 1u : 0u);
 		PipelineProfileRegisterProcess(control,
@@ -648,16 +526,17 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 			std::memcpy(bgw.bgw_extra, &worker_index, sizeof(int32_t));
 
 			if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
-			{
-				return FailEarly(failure_reason, "pg_yaap: RegisterDynamicBackgroundWorker failed (worker slots exhausted?)", cleanup, state);
-			}
+				break;
 
 			handles.push_back(handle);
 		}
 
+		if (handles.empty())
+			return FailEarly(failure_reason, "pg_yaap: no pipeline worker slots available", cleanup, state);
+
 		phase.mark("T4_bgw_registered");
 
-		registered_pids.reserve(handles.size() + (leader_participate ? 1 : 0));
+		registered_pids.reserve(handles.size());
 
 		auto *ready_array = static_cast<pg_atomic_uint32 *>(
 			shm_toc_lookup(toc, PIPELINE_DSM_KEY_WORKER_READY, false));
@@ -681,20 +560,22 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 			 * BGWH_STARTED means the postmaster has assigned slot->pid only;
 			 * the worker may not yet have completed InitProcessPhase2, so its
 			 * PGPROC may not yet be visible to BackendPidGetProc. Wait for the
-			 * worker to publish its ready bit (set after
-			 * BackgroundWorkerInitializeConnectionByOid returns). Detect early
-			 * worker death via BGWH_STOPPED.
+			 * worker to publish readiness after setting up its PG connection
+			 * and reconstructing the pipelines. Detect early worker death
+			 * via BGWH_STOPPED.
 			 */
-			while (pg_atomic_read_u32(&ready_array[worker_idx]) == 0)
+			while (pg_atomic_read_membarrier_u32(&ready_array[worker_idx]) == 0)
 			{
+				ResetLatch(MyLatch);
 				CHECK_FOR_INTERRUPTS();
 
 				pid_t poll_pid = 0;
 				BgwHandleStatus poll_status = GetBackgroundWorkerPid(handle, &poll_pid);
 				if (poll_status == BGWH_STOPPED)
 				{
-					if (control->worker_error_msg[0] != '\0')
-						return FailEarly(failure_reason, control->worker_error_msg, cleanup, state);
+					const char *message = WorkerErrorMessage(control);
+					if (message != nullptr && message[0] != '\0')
+						return FailEarly(failure_reason, message, cleanup, state);
 					return FailEarly(failure_reason, "pg_yaap: pipeline worker exited before reporting ready", cleanup, state);
 				}
 				if (poll_status == BGWH_POSTMASTER_DIED)
@@ -702,7 +583,7 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 					return FailEarly(failure_reason, "pg_yaap: postmaster died while waiting for worker ready", cleanup, state);
 				}
 
-				if (pg_atomic_read_u32(&ready_array[worker_idx]) != 0)
+				if (pg_atomic_read_membarrier_u32(&ready_array[worker_idx]) != 0)
 					break;
 
 				instr_time wait_start;
@@ -725,7 +606,6 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 										  PipelineProfileStage::LEADER_WAIT_READY,
 										  elapsed);
 				}
-				ResetLatch(MyLatch);
 				if (rc & WL_POSTMASTER_DEATH)
 				{
 					return FailEarly(failure_reason, "pg_yaap: postmaster died while waiting for worker ready", cleanup, state);
@@ -745,138 +625,39 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 							  worker_pid);
 		}
 
-		/* The producer must wake when consumers make room, even without
-		 * leader task participation. */
-		registered_pids.push_back(MyProcPid);
+		/* The successful registrations form a dense prefix. Size the task
+		 * cohorts from that ready set before publishing any work. */
+		control->num_workers = static_cast<int>(registered_pids.size());
+		if (pg_yaap_trace_execution_path)
+			elog(LOG, "pg_yaap pipeline leader: workers requested=%d ready=%d",
+				bgworker_count, control->num_workers);
 
+		/* Register worker latches before publishing the graph. */
 		queue->RegisterWorkerPids(registered_pids.data(),
 						 static_cast<uint32>(registered_pids.size()));
 
 		phase.mark("T5_workers_ready");
 
-		leader_rt.exec_ctx = ExecCtx{leader_mcxt, dsa, LEADER_WORKER_INDEX, control, INVALID_EVENT_ID};
-		leader_rt.control = control;
-		leader_rt.event_shm = static_cast<EventShmState *>(
-			dsa_get_address(dsa, control->event_states_root));
-		leader_rt.pipelines = &leader_lookup;
-		leader_rt.leader_qd = queryDesc;
-		leader_rt.final_output = nullptr;
-
-		for (auto &pipeline_uptr : scheduler.bundle().pipelines)
+		OutputSink *final_output = nullptr;
+		for (const auto &pipeline : bundle->pipelines)
 		{
-			leader_lookup.Register(static_cast<uint32_t>(pipeline_uptr->id),
-						      pipeline_uptr.get());
-			if (pipeline_uptr->sink != nullptr &&
-				pipeline_uptr->sink->type() == PhysicalOperatorType::OUTPUT)
-			{
-				leader_rt.final_output = static_cast<OutputSink *>(pipeline_uptr->sink);
-			}
+			if (pipeline->sink != nullptr && pipeline->sink->type() == PhysicalOperatorType::OUTPUT)
+				final_output = static_cast<OutputSink *>(pipeline->sink);
 		}
 
-		event_scheduled.assign(scheduler.event_count(), 0);
-		event_finished.assign(scheduler.event_count(), 0);
-		run_cleanup_done.assign(scheduler.event_count(), 0);
-
-		for (auto &pipeline_uptr : scheduler.bundle().pipelines)
-		{
-			if (!pipeline_uptr->depends_on.empty())
-				continue;
-
-			EventId event_id = static_cast<EventId>(pipeline_uptr->id) * 3u;
-			Event *event = scheduler.event_lookup().Resolve(event_id);
-			Assert(event != nullptr);
-			if (event->TrySchedule())
-				event_scheduled[event_id] = 1;
-		}
-
-		phase.mark("T6_first_enqueue");
+		pg_atomic_write_membarrier_u32(&control->scheduler_started, 1);
+		queue->WakeRegisteredWorkers();
+		phase.mark("T6_release_event_graph");
 
 		for (;;)
 		{
+			ResetLatch(MyLatch);
 			CHECK_FOR_INTERRUPTS();
 
 			DetectUnexpectedWorkerExit(control, handles);
-			if (pg_atomic_read_u32(&control->worker_error) != 0)
+			if (WorkerErrorPending(control))
 				RaiseWorkerFailure(control, handles, state);
-
-			bool progress = scheduler.DispatchPendingTasks();
-
-			for (uint32_t event_id = 0; event_id < scheduler.event_count(); ++event_id)
-			{
-				Event *event = scheduler.event_lookup().Resolve(event_id);
-				Assert(event != nullptr);
-
-				if (!event_scheduled[event_id] && event->state() == EventState::SCHEDULED)
-					event_scheduled[event_id] = 1;
-
-				if (!event_finished[event_id] && event->state() == EventState::ABORTED)
-				{
-					event_finished[event_id] = 1;
-					progress = true;
-					continue;
-				}
-
-				if ((event_id % 3u) == 2u &&
-					event_scheduled[event_id] &&
-					!event_finished[event_id] &&
-					event->state() == EventState::SCHEDULED &&
-					pg_atomic_read_u32(&leader_rt.event_shm[event_id].tasks_remaining) > 0)
-				{
-					Pipeline *pipeline = leader_lookup.Resolve(event->pipeline_id());
-					Assert(pipeline != nullptr);
-					if (UsesWorkerPartitionedHashJoinFinalize(pipeline, dsa))
-						continue;
-
-					TaskDescriptor desc{};
-					desc.pipeline_id = static_cast<uint32_t>(pipeline->id);
-					desc.event_id = event_id;
-					desc.partition_id = UINT32_MAX;
-					desc.worker_index = LEADER_WORKER_INDEX;
-					desc.kind = static_cast<uint8_t>(TaskKind::FINALIZE);
-
-					TaskExecutionResult exec_result = ExecuteLeaderTask(desc,
-										   pipeline,
-										   &leader_rt);
-					if (exec_result != TaskExecutionResult::TASK_FINISHED)
-					{
-						ereport(ERROR,
-							(errcode(ERRCODE_INTERNAL_ERROR),
-							 errmsg("pg_yaap: leader finalize task did not finish")));
-					}
-
-					pg_atomic_write_u32(&leader_rt.event_shm[event_id].tasks_remaining, 0);
-					event->FinishEvent();
-					event_finished[event_id] = 1;
-					progress = true;
-					continue;
-				}
-
-				if (event_scheduled[event_id] &&
-					!event_finished[event_id] &&
-					pg_atomic_read_u32(&leader_rt.event_shm[event_id].tasks_remaining) == 0)
-				{
-					if ((event_id % 3u) == 0u && !run_cleanup_done[event_id])
-					{
-						Pipeline *pipeline = leader_lookup.Resolve(event->pipeline_id());
-						Assert(pipeline != nullptr);
-						PipelinePostConsumerRunCleanup(leader_rt.exec_ctx, *pipeline);
-						scheduler.NotifyPartitionProbeRunFinished(event_id);
-							/* A completed breaker/consumer phase may have freed many
-							 * DSA objects. Return fully empty spans before a later phase
-							 * grows its directories, while preserving any live segments. */
-							dsa_trim(dsa);
-						run_cleanup_done[event_id] = 1;
-					}
-					event->FinishEvent();
-					event_finished[event_id] = 1;
-					progress = true;
-				}
-			}
-
-			if (progress)
-				continue;
-
-			if (AllEventsFinished(scheduler))
+			if (pg_atomic_read_membarrier_u32(&control->events_remaining) == 0)
 				break;
 
 			instr_time wait_start;
@@ -899,7 +680,6 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 									  PipelineProfileStage::LEADER_WAIT_EVENT,
 									  elapsed);
 			}
-			ResetLatch(MyLatch);
 			if (rc & WL_POSTMASTER_DEATH)
 			{
 				cleanup.control = control;
@@ -910,7 +690,7 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 
 		/*
 		 * Successful completion path: all events FINISHED. Workers are still
-		 * blocked in their main-loop WaitLatch (TryPopForWorker returned empty
+		 * blocked in their main-loop WaitLatch (TryPop returned empty
 		 * + nobody SetLatch'd them since the queue is permanently drained).
 		 * We must signal shutdown and wake them, otherwise
 		 * WaitForBackgroundWorkerShutdown below blocks forever.
@@ -921,29 +701,29 @@ PgYaapPipelineRun(QueryDesc *queryDesc,
 		 * already use it.
 		 */
 		SignalShutdownAndWait(cleanup);
-		ReleaseHashJoinPayloadsAtQueryEnd(leader_rt.exec_ctx, scheduler.bundle());
+		ReleaseHashJoinPayloadsAtQueryEnd(leader_ctx, *bundle);
 
 		phase.mark("T7_events_done");
 
-		if (leader_rt.final_output != nullptr)
+		if (final_output != nullptr)
 		{
-			leader_rt.final_output->RefreshDestFromQueryDesc(
+			final_output->RefreshDestFromQueryDesc(
 				queryDesc->dest,
 				queryDesc->tupDesc,
 				static_cast<int>(queryDesc->operation));
-			EventId previous_profile_event = leader_rt.exec_ctx.profile_event_id;
-			leader_rt.exec_ctx.profile_event_id = 0;
+			EventId previous_profile_event = leader_ctx.profile_event_id;
+			leader_ctx.profile_event_id = 0;
 			{
-				PipelineProfileScope emit_scope(leader_rt.exec_ctx,
+				PipelineProfileScope emit_scope(leader_ctx,
 					PipelineProfileStage::OUTPUT_EMIT);
-				leader_rt.final_output->EmitGlobalTdcToDest(leader_rt.exec_ctx);
+				final_output->EmitGlobalTdcToDest(leader_ctx);
 			}
-			leader_rt.exec_ctx.profile_event_id = previous_profile_event;
+			leader_ctx.profile_event_id = previous_profile_event;
 		}
 
 		phase.mark("T8_emit_done");
 
-		if (pg_atomic_read_u32(&control->worker_error) != 0)
+		if (WorkerErrorPending(control))
 			RaiseWorkerFailure(control, handles, state);
 
 		if (pg_atomic_read_u32(&control->profile_enabled) != 0)

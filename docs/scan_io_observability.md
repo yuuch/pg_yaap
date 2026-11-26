@@ -11,7 +11,7 @@ their internal Start/Wait timing or AIO queue state without changing PG core.
 | Buffer ready at consumption | Unavailable | Native ReadStream hides per-page pre-Wait state | A valid returned Buffer is ready, but whether it waited is not exposed |
 | `StartReadBuffers` / `WaitReadBuffers` duration | Unavailable | ReadStream owns these calls | `scan_load_page` includes its public `read_stream_next_buffer` interval, not a separated wait duration |
 | AIO submission queue depth/full fallback | Unavailable | PG worker provider internals | Do not infer queue-full from elapsed time or `f_sync` |
-| BAS ring use by YAAP SeqScan | Disabled | YAAP scan initialization | Heap scan is created without `SO_ALLOW_STRAT`; ReadStream receives a null strategy |
+| BAS ring use by YAAP SeqScan | Selected by PG | YAAP scan initialization | Heap scan allows `SO_ALLOW_STRAT`; ReadStream receives the selected strategy |
 | Physical device bytes / latency | Unavailable in extension | OS/device tools | PG reads may be served by the OS page cache |
 
 Use `pg_yaap.profile_scan=sample` or `exact` for scan stage timing and PG

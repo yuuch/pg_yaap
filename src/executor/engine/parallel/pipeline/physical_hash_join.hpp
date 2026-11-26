@@ -167,6 +167,10 @@ public:
 
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta) override;
 
+	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+	SinkCombineResultType FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
+	SinkTaskPlan GetFinalizeTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+
 	std::unique_ptr<GlobalSinkState> GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState> GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	SinkResultType                  SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
@@ -208,7 +212,7 @@ public:
 	uint16_t filter_bool_regs() const { return filter_bool_regs_; }
 	HashJoinMatchMode join_mode() const { return join_mode_; }
 	uint32_t filter_string_const_bytes() const { return filter_string_const_bytes_; }
-	dsa_pointer shared_payload_dp() const { return shared_payload_dp_; }
+	dsa_pointer shared_payload_dp() const;
 	uint16_t n_left_keys() const { return n_left_keys_; }
 	uint16_t n_right_keys() const { return n_right_keys_; }
 	uint32_t max_rows() const { return max_rows_; }

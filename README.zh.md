@@ -100,6 +100,8 @@ PostgreSQL 是非常优秀的通用数据库，但分析型查询通常需要一
 
 4. 结果再转换回 PostgreSQL 正常的 tuple 接口返回。
 
+任务调度、共享状态归属、进程间同步及当前限制见 [Pipeline 运行时与进程通信](docs/pipeline_runtime.md)。
+
 ---
 
 ## TPC-H 快照 📊
@@ -108,6 +110,14 @@ PostgreSQL 是非常优秀的通用数据库，但分析型查询通常需要一
 
 > Benchmark 结果会受到硬件、PostgreSQL 配置、数据规模、查询覆盖范围、YAAP 支持程度等因素影响。这里的图表是当前阶段的性能快照，不代表所有环境下的通用结论。
 
+### SF100（100GB）
+
+![TPC-H SF100 对比图](imgs/comparison-sf100.svg)
+
+本轮使用 `tpch100g` 数据库（磁盘占用约 125GB），运行于 24GB 内存的 M4 Pro，`shared_buffers=2GB`。YAAP 配置为 12 workers、8GiB payload 上限、20GiB DSA 上限；pg_duckdb 使用默认 4GiB 内存和默认扫描并行度。YAAP 与 pg_duckdb 按查询交错运行，PostgreSQL 单独运行；总耗时中每个 timeout 按 600 秒计。
+
+**正确性注意：**SF100 Q1 的 `N|O` 组 `sum_charge` 不一致：YAAP 返回负数，而 PostgreSQL 和 pg_duckdb 返回正数。图表比较的是耗时，不代表结果一致。
+
 ---
 
 ## 构建 🔧
@@ -115,9 +125,23 @@ PostgreSQL 是非常优秀的通用数据库，但分析型查询通常需要一
 ### Meson
 
 ```bash
-meson setup build -Dpg_config=/path/to/pg_config
+meson setup build -Dpg_config=/path/to/pg_config -Dbuildtype=release
 meson compile -C build
 meson install -C build
+```
+
+需要在离线 Linux 从 PostgreSQL 源码开始构建时，可制作只包含源码（不含 Git 历史、构建产物和数据）的 tar 包，再在目标机一键构建 PostgreSQL 与扩展：
+
+```bash
+./scripts/make_offline_bundle.sh --output /path/to/pg_yaap-offline.tar.gz
+# 解包后：
+./pg_yaap/scripts/build_postgres_and_yaap.sh --prefix "$HOME/pgsql-yaap"
+```
+
+只构建扩展或了解离线依赖、LLVM/PostgreSQL 要求和运行配置，见[离线构建与安装指南](docs/offline-linux-build.md)：
+
+```bash
+./scripts/build_install.sh --pg-config /path/to/pg_config
 ```
 
 ### PGXS / Makefile

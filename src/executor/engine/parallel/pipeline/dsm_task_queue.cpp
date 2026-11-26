@@ -1,14 +1,7 @@
-/*
- * pipeline/dsm_task_queue.cpp  (M-FRAME-MIN step 3e)
- *
- * Vyukov bounded MPMC queue. See dsm_task_queue.hpp for the full contract.
- */
-
 #include "parallel/pipeline/dsm_task_queue.hpp"
 
-#include <cstring>
-
 extern "C" {
+#include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 }
@@ -16,229 +9,121 @@ extern "C" {
 namespace pg_yaap {
 namespace pipeline {
 
-#define PG_YAAP_IS_POW2(v) ((v) >= 2 && ((v) & ((v) - 1)) == 0)
-
-size_t
-DsmTaskQueue::EstimateSize(uint32_t capacity)
+static void WakeProcess(pid_t pid)
 {
-	Assert(PG_YAAP_IS_POW2(capacity));
-	return sizeof(DsmTaskQueue) + (size_t) capacity * sizeof(DsmTaskQueueCell);
+    if (pid == 0) return;
+    PGPROC *proc = BackendPidGetProc(pid);
+    if (proc != nullptr) SetLatch(&proc->procLatch);
 }
 
-DsmTaskQueueCell *
-DsmTaskQueue::Cells()
+size_t DsmTaskQueue::EstimateSize(uint32_t capacity, uint32_t workers)
 {
-	return reinterpret_cast<DsmTaskQueueCell *>(this + 1);
+    Assert(capacity >= 2 && (capacity & (capacity - 1)) == 0);
+    return MAXALIGN(sizeof(DsmTaskQueue)) +
+        MAXALIGN(sizeof(pid_t) * static_cast<size_t>(workers)) +
+        sizeof(DsmTaskQueueCell) * capacity;
 }
 
-DsmTaskQueue *
-DsmTaskQueue::InitInPlace(void *buffer, uint32_t capacity)
+pid_t *DsmTaskQueue::WorkerPids()
 {
-	Assert(buffer != nullptr);
-	Assert(PG_YAAP_IS_POW2(capacity));
-
-	DsmTaskQueue *q = reinterpret_cast<DsmTaskQueue *>(buffer);
-	q->capacity_ = capacity;
-	q->mask_     = capacity - 1;
-	q->worker_pid_count_ = 0;
-	for (uint32_t i = 0; i < DsmTaskQueue::kMaxWorkerPids; i++)
-		q->worker_pids_[i] = 0;
-	pg_atomic_init_u64(&q->enqueue_pos_, 0);
-	pg_atomic_init_u64(&q->dequeue_pos_, 0);
-
-	DsmTaskQueueCell *cells = q->Cells();
-	for (uint32_t i = 0; i < capacity; i++)
-	{
-		pg_atomic_init_u32(&cells[i].sequence, i);
-		std::memset(&cells[i].desc, 0, sizeof(TaskDescriptor));
-	}
-	return q;
+    return reinterpret_cast<pid_t *>(
+        reinterpret_cast<char *>(this) + MAXALIGN(sizeof(DsmTaskQueue)));
 }
 
-DsmTaskQueue *
-DsmTaskQueue::AttachInPlace(void *buffer)
+DsmTaskQueueCell *DsmTaskQueue::Cells()
 {
-	Assert(buffer != nullptr);
-	DsmTaskQueue *q = reinterpret_cast<DsmTaskQueue *>(buffer);
-	Assert(PG_YAAP_IS_POW2(q->capacity_));
-	Assert(q->mask_ == q->capacity_ - 1);
-	return q;
+    return reinterpret_cast<DsmTaskQueueCell *>(
+        reinterpret_cast<char *>(WorkerPids()) +
+        MAXALIGN(sizeof(pid_t) * static_cast<size_t>(workers_)));
 }
 
-void
-DsmTaskQueue::RegisterWorkerPids(const pid_t *pids, uint32 count)
+DsmTaskQueue *DsmTaskQueue::InitInPlace(void *buffer, uint32_t capacity, uint32_t workers)
 {
-	if (count > kMaxWorkerPids)
-		elog(ERROR, "pg_yaap: task queue wake registry supports at most %u processes, requested %u",
-		     kMaxWorkerPids, count);
-	worker_pid_count_ = count;
-	for (uint32 i = 0; i < count; ++i)
-		worker_pids_[i] = pids[i];
+    Assert(buffer != nullptr);
+    Assert(capacity >= 2 && (capacity & (capacity - 1)) == 0);
+    auto *q = static_cast<DsmTaskQueue *>(buffer);
+    q->capacity_ = capacity;
+    q->workers_ = workers;
+    q->worker_pid_count_ = 0;
+    pg_atomic_init_u64(&q->enqueue_pos_, 0);
+    pg_atomic_init_u64(&q->dequeue_pos_, 0);
+    for (uint32_t i = 0; i < capacity; ++i)
+        pg_atomic_init_u64(&q->Cells()[i].sequence, i);
+    for (uint32_t i = 0; i < workers; ++i)
+        q->WorkerPids()[i] = 0;
+    return q;
 }
 
-void
-DsmTaskQueue::WakeRegisteredWorkers()
+DsmTaskQueue *DsmTaskQueue::AttachInPlace(void *buffer)
 {
-	for (uint32 i = 0; i < worker_pid_count_; ++i)
-	{
-		pid_t pid = worker_pids_[i];
-		if (pid == 0)
-			continue;
-		/*
-		 * BackendPidGetProc resolves the live PGPROC for any backend in the
-		 * cluster (including bgworkers). Cross-process safe by construction:
-		 * the lookup walks ProcArray by PID, so the queue does not have to
-		 * cache a leader-private Latch* (which DSM cannot validly publish).
-		 * Returns NULL if the worker has exited; skip silently in that case
-		 * (the pop loop guarantees forward progress without that wake).
-		 */
-		PGPROC *p = BackendPidGetProc(pid);
-		if (p != NULL)
-			SetLatch(&p->procLatch);
-	}
+    Assert(buffer != nullptr);
+    auto *q = static_cast<DsmTaskQueue *>(buffer);
+    Assert(q->capacity_ >= 2 && (q->capacity_ & (q->capacity_ - 1)) == 0);
+    return q;
 }
 
-bool
-DsmTaskQueue::TryPush(const TaskDescriptor &desc)
+void DsmTaskQueue::RegisterWorkerPids(const pid_t *pids, uint32 count)
 {
-	DsmTaskQueueCell *cells = Cells();
-	uint64_t          pos   = pg_atomic_read_u64(&enqueue_pos_);
-
-	for (;;)
-	{
-		DsmTaskQueueCell *cell = &cells[pos & mask_];
-		uint32_t          seq  = pg_atomic_read_u32(&cell->sequence);
-		int64_t           diff = (int64_t) seq - (int64_t) (uint32_t) pos;
-
-		if (diff == 0)
-		{
-			/*
-			 * Slot is the next one we may claim. CAS the producer cursor;
-			 * losers re-read and retry. Winner owns the cell exclusively
-			 * until the sequence store below.
-			 */
-			if (pg_atomic_compare_exchange_u64(&enqueue_pos_, &pos, pos + 1))
-			{
-				cell->desc = desc;
-				/*
-				 * Release: publishes desc to consumer. Consumer waits for
-				 * sequence == pos + 1.
-				 */
-				pg_atomic_write_u32(&cell->sequence, (uint32_t) (pos + 1));
-				WakeRegisteredWorkers();
-				return true;
-			}
-			/* CAS failure; pos has been refreshed by pg_atomic API. */
-		}
-		else if (diff < 0)
-		{
-			return false;            /* Queue full at this slot. */
-		}
-		else
-		{
-			pos = pg_atomic_read_u64(&enqueue_pos_);
-		}
-	}
+    Assert(count > 0 && count <= workers_);
+    worker_pid_count_ = count;
+    for (uint32_t i = 0; i < count; ++i)
+        WorkerPids()[i] = pids[i];
 }
 
-bool
-DsmTaskQueue::TryPop(TaskDescriptor *out)
+void DsmTaskQueue::WakeRegisteredWorkers()
 {
-	Assert(out != nullptr);
-
-	DsmTaskQueueCell *cells = Cells();
-	uint64_t          pos   = pg_atomic_read_u64(&dequeue_pos_);
-
-	for (;;)
-	{
-		DsmTaskQueueCell *cell = &cells[pos & mask_];
-		uint32_t          seq  = pg_atomic_read_u32(&cell->sequence);
-		int64_t           diff = (int64_t) seq - (int64_t) (uint32_t) (pos + 1);
-
-		if (diff == 0)
-		{
-			if (pg_atomic_compare_exchange_u64(&dequeue_pos_, &pos, pos + 1))
-			{
-				*out = cell->desc;
-				/*
-				 * Release the slot for reuse capacity_ generations later.
-				 * Producer at the same wrapped index waits for sequence ==
-				 * pos + capacity_.
-				 */
-				pg_atomic_write_u32(&cell->sequence,
-				                    (uint32_t) (pos + capacity_));
-				return true;
-			}
-		}
-		else if (diff < 0)
-		{
-			return false;            /* Queue empty at this slot. */
-		}
-		else
-		{
-			pos = pg_atomic_read_u64(&dequeue_pos_);
-		}
-	}
+    for (uint32_t i = 0; i < worker_pid_count_; ++i)
+        WakeProcess(WorkerPids()[i]);
 }
 
-bool
-DsmTaskQueue::TryPopForWorker(int32_t worker_index, TaskDescriptor *out)
+bool DsmTaskQueue::TryPush(const TaskDescriptor &desc)
 {
-	Assert(out != nullptr);
-
-	DsmTaskQueueCell *cells = Cells();
-	uint64_t          pos   = pg_atomic_read_u64(&dequeue_pos_);
-
-	for (;;)
-	{
-		DsmTaskQueueCell *cell = &cells[pos & mask_];
-		uint32_t          seq  = pg_atomic_read_u32(&cell->sequence);
-		int64_t           diff = (int64_t) seq - (int64_t) (uint32_t) (pos + 1);
-
-		if (diff == 0)
-		{
-			/*
-			 * Strict worker affinity for RUN/COMBINE: the COMBINE task at
-			 * worker W consumes ProcessPipelineExecState (local TDC, local
-			 * AHT) that the matching RUN at the same W produced in
-			 * process-private memory. Stealing across workers crashes the
-			 * backend (verified empirically — Bug O attempt #1). HOL is the
-			 * only safe option here; we mitigate the WaitLatch staircase by
-			 * waking all registered workers on every successful pop below
-			 * (see Wake call after the cursor advance).
-			 */
-			if (cell->desc.worker_index != worker_index)
-				return false;
-
-			if (pg_atomic_compare_exchange_u64(&dequeue_pos_, &pos, pos + 1))
-			{
-				*out = cell->desc;
-				pg_atomic_write_u32(&cell->sequence,
-				                    (uint32_t) (pos + capacity_));
-				/*
-				 * KEY Bug O fix: advancing the dequeue cursor exposes the
-				 * NEXT cell at the head, which may be affine to a different
-				 * worker that is currently sleeping in WaitLatch. Without
-				 * this wake, that worker only learns about its task when
-				 * its 1000ms timeout fires — producing the 1s/2s/5s tail
-				 * staircase Bug N exposed. The pop side wake is symmetric
-				 * with TryPush's WakeRegisteredWorkers and closes the
-				 * lost-wakeup window.
-				 */
-				WakeRegisteredWorkers();
-				return true;
-			}
-		}
-		else if (diff < 0)
-		{
-			return false;
-		}
-		else
-		{
-			pos = pg_atomic_read_u64(&dequeue_pos_);
-		}
-	}
+    uint64_t pos = pg_atomic_read_u64(&enqueue_pos_);
+    for (;;) {
+        DsmTaskQueueCell &cell = Cells()[pos & (capacity_ - 1)];
+        const uint64_t sequence = pg_atomic_read_membarrier_u64(&cell.sequence);
+        const int64_t difference = static_cast<int64_t>(sequence - pos);
+        if (difference == 0) {
+            if (pg_atomic_compare_exchange_u64(&enqueue_pos_, &pos, pos + 1)) {
+                cell.desc = desc;
+                /* Publish only after the complete non-atomic descriptor.
+                 * Ordinary pg_atomic_write_u64 has no release semantics. */
+                pg_atomic_write_membarrier_u64(&cell.sequence, pos + 1);
+                // Every idle executor is eligible; task_index is not affinity.
+                WakeRegisteredWorkers();
+                return true;
+            }
+        } else if (difference < 0) {
+            return false;
+        } else {
+            pos = pg_atomic_read_u64(&enqueue_pos_);
+        }
+    }
 }
 
-}  /* namespace pipeline */
-}  /* namespace pg_yaap */
+bool DsmTaskQueue::TryPop(TaskDescriptor *out)
+{
+    Assert(out != nullptr);
+    uint64_t pos = pg_atomic_read_u64(&dequeue_pos_);
+    for (;;) {
+        DsmTaskQueueCell &cell = Cells()[pos & (capacity_ - 1)];
+        const uint64_t sequence = pg_atomic_read_membarrier_u64(&cell.sequence);
+        const int64_t difference = static_cast<int64_t>(sequence - (pos + 1));
+        if (difference == 0) {
+            if (pg_atomic_compare_exchange_u64(&dequeue_pos_, &pos, pos + 1)) {
+                *out = cell.desc;
+                /* Reclaim after every descriptor read, so a producer cannot
+                 * overwrite a slot while its consumer still copies it. */
+                pg_atomic_write_membarrier_u64(&cell.sequence, pos + capacity_);
+                return true;
+            }
+        } else if (difference < 0) {
+            return false;
+        } else {
+            pos = pg_atomic_read_u64(&dequeue_pos_);
+        }
+    }
+}
+
+} // namespace pipeline
+} // namespace pg_yaap

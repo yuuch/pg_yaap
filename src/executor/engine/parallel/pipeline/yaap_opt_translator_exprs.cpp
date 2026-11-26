@@ -1400,7 +1400,6 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 		static_cast<uint16_t>(node.final_sort_keys.size()),
 		output_payload_dp,
 		row_capacity,
-		node.final_sort_keys,
 		node.limit_count,
 		nullptr);
 	output_op->AddChild(std::move(node.op));

@@ -28,6 +28,7 @@ extern "C" {
 #include "postgres.h"
 #include "access/relscan.h"
 #include "storage/block.h"
+#include "storage/lwlock.h"
 #include "port/atomics.h"
 #include "utils/dsa.h"
 }
@@ -70,6 +71,7 @@ enum class OpKind : uint8_t {
 	FILTER         = 9,
 	PROJECTION     = 10,
 	HASH_JOIN_PROBE = 11,
+ MATERIALIZE = 12,
 };
 
 /* -------------------------------------------------------------------------
@@ -506,7 +508,7 @@ struct HashJoinPartition {
 };
 
 struct HashJoinSharedPayload {
-	slock_t     mutex;
+	LWLock      mutex;
 	uint64_t    directory_charged_bytes; /* non-spillable heads/links/salts */
 	uint64_t    owner_tag;
 	uint32_t    local_state_slot_count;
@@ -557,7 +559,7 @@ struct CrossProductLocalBuildRegistryEntry {
 };
 
 struct CrossProductSharedPayload {
-	slock_t     mutex;
+	LWLock      mutex;
 	uint32_t    local_state_slot_count;
 	bool        finalized;
 	uint8_t     _pad0[3];
@@ -577,6 +579,7 @@ struct CrossProductSharedPayload {
 
 struct OutputSharedPayload {
 	dsa_pointer tdc_dp;
+	dsa_pointer sort_indices_dp;
 	dsa_pointer segment_arena_dp;
 	dsa_pointer segment_first_desc_dp;
 	dsa_pointer segment_desc_dp;
@@ -654,6 +657,8 @@ struct HashAggOpBody {
 	uint32_t    perfect_hash_capacity;
 };
 
+struct MaterializeOpBody { dsa_pointer layout; dsa_pointer shared_payload; dsa_pointer scan; };
+
 struct DelimScanOpBody {
 	dsa_pointer input_schema;        /* SchemaDescriptor */
 	dsa_pointer shared_payload;      /* HashAggSharedPayload wrapper */
@@ -709,10 +714,15 @@ struct OpDescriptor {
 	uint8_t  n_children;
 	uint16_t _pad0;
 	uint32_t child_indices[4];
+	/* One identity across all occurrences of an operator. Probe occurrences
+	 * also carry the identity of the build payload they consume. */
+	uint32_t operator_id;
+	uint32_t build_operator_id;
 
 	union OpBodyUnion {
 		SeqScanOpBody seq_scan;
 		DelimScanOpBody delim_scan;
+        MaterializeOpBody materialize;
 		HashAggOpBody hash_agg;
 		HashAggOpBody perfect_hash_agg;
 		HashJoinOpBody hash_join;
@@ -730,11 +740,8 @@ struct OpDescriptor {
  * bundle. `ops` is a dsa_pointer to OpDescriptor[op_count].
  *
  * `global_source_state` / `global_sink_state` start at InvalidDsaPointer at
- * serialize time; they are lazily populated by the leader's first
- * `Sink::GetGlobalSinkState(ExecCtx&)` / `Source::GetGlobalSourceState(...)`
- * call (the one branch where `worker_index == LEADER_WORKER_INDEX`) via
- * StoreSharedPayloadOnDescriptor(). Workers attach via
- * LoadSharedPayloadFromDescriptor().
+ * serialize time; operator payloads are published through the corresponding
+ * OpDescriptor aliases before dependent tasks are queued.
  *
  * `task_slot_next` is a per-pipeline atomic morsel cursor used by the
  * scheduler to hand out PipelineTask slots round-robin.
@@ -742,7 +749,6 @@ struct OpDescriptor {
 struct PipelineDescriptor {
 	int32              pipeline_id;
 	int32              op_count;
-	uint64             dependency_mask;     /* bit i set => depends on pipeline_id i */
 	dsa_pointer        ops;                  /* OpDescriptor[op_count] */
 	dsa_pointer        global_source_state;  /* lazy; set by leader on first Get */
 	dsa_pointer        global_sink_state;    /* lazy; set by leader on first Get */

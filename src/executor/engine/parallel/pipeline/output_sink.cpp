@@ -31,14 +31,7 @@ extern "C" {
 namespace pg_yaap {
 namespace pipeline {
 
-extern "C" bool pg_yaap_trace_hooks;
-
 namespace {
-
-/* Output payloads are promoted before worker launch by BuildOutputTdc. */
-static constexpr bool kEnableOutputSegmentBacking = true;
-/* The former GetGlobalSinkState promotion is racy on fallback flat payloads. */
-static constexpr bool kEnableLateOutputPromotion = false;
 
 static inline bool
 LayoutHasStringColumns(const TupleDataLayout *layout)
@@ -699,60 +692,6 @@ OutputSink::GetGlobalSinkState(ExecCtx &ctx)
 		state->segmented_writer.segment_count = 1;
 		state->segmented_writer_initialized = true;
 	}
-	/* Output is single-threaded, so the leader can promote the initially
-	 * allocated empty TDC to a segment-backed writer before RUN begins.  Keep
-	 * Top-N flat: it mutates/replaces rows and has a deliberately bounded
-	 * payload. */
-	if (kEnableLateOutputPromotion && kEnableOutputSegmentBacking &&
-		ctx.worker_index == LEADER_WORKER_INDEX &&
-		!state->shared_payload->segment_backed &&
-		state->n_sort_keys == 0 && state->max_emit_rows == 0 && ctx.control != nullptr)
-	{
-		const uint32_t row_capacity = std::min<uint32_t>(state->global_tdc->row_capacity, 16384u);
-		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout, row_capacity);
-		const uint64_t required = offsetof(TupleDataCollection, rows) +
-			static_cast<uint64_t>(row_capacity) * state->layout->row_width + heap_capacity;
-		auto *buffer_state = ResolveBufferState(ctx);
-		auto *arena = buffer_state != nullptr
-			? buffer::YaapSharedSegmentArenaResolve(ctx.dsa, ctx.control->shared_segment_arena_root)
-			: nullptr;
-		if (arena != nullptr && required <= arena->segment_size)
-		{
-			const dsa_pointer old_tdc_dp = state->shared_payload->tdc_dp;
-			const auto handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa,
-				buffer_state, ctx.control->shared_segment_arena_root,
-				static_cast<uint32_t>(std::max(ctx.worker_index, 0)));
-			auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
-				ctx.control->shared_segment_arena_root, handle);
-			if (segment == nullptr)
-				ereport(ERROR, (errmsg("pg_yaap: output segment allocation failed")));
-			auto *segment_tdc = static_cast<TupleDataCollection *>(
-				dsa_get_address(ctx.dsa, segment->payload_dp));
-			TupleDataCollectionInit(segment_tdc, row_capacity, state->layout->row_width,
-				layout_dp, heap_capacity);
-			state->shared_payload->tdc_dp = segment->payload_dp;
-			state->shared_payload->segment_arena_dp = ctx.control->shared_segment_arena_root;
-			state->shared_payload->segment_first_desc_dp = segment->self_dp;
-			state->shared_payload->segment_desc_dp = segment->self_dp;
-			state->shared_payload->segment_id = handle.segment_id;
-			state->shared_payload->segment_generation = handle.generation;
-			state->shared_payload->segment_row_count = 0;
-			state->shared_payload->segment_backed = true;
-			state->global_tdc = segment_tdc;
-			buffer::YaapSegmentedTdcInit(&state->segmented_writer,
-				state->shared_payload->segment_arena_dp, layout_dp,
-				static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
-					state->layout->row_width, row_capacity, heap_capacity, 0,
-					"output promotion");
-			state->segmented_writer.first = handle;
-			state->segmented_writer.active = handle;
-			state->segmented_writer.segment_count = 1;
-			state->segmented_writer_initialized = true;
-			if (DsaPointerIsValid(old_tdc_dp))
-				dsa_free(ctx.dsa, old_tdc_dp);
-		}
-	}
-
 	state->shared_payload_dp = payload_dp;
 
 	/* Leader-only artifacts: dest/tupdesc/slot are owned in the leader process
@@ -876,61 +815,140 @@ OutputSink::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	return SinkCombineResultType::FINISHED;
 }
 
+/* Both finalization and result delivery have exclusive ownership of their
+ * input chain. Retire each page only after its consumer has copied the rows. */
+template <typename Consume>
+static void
+ConsumeOutputSegments(ExecCtx &ctx, OutputSharedPayload &payload, Consume consume)
+{
+	auto *budget = ResolveBufferState(ctx);
+	for (dsa_pointer dp = payload.segment_first_desc_dp; DsaPointerIsValid(dp);)
+	{
+		CHECK_FOR_INTERRUPTS();
+		auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, dp));
+		dp = segment->chain_next_dp;
+		EnsureOutputSegmentResident(ctx, &payload, segment);
+		const buffer::YaapSegmentHandle handle{segment->arena_id, segment->segment_id, segment->generation};
+		buffer::YaapSharedSegmentReadLease lease;
+		if (!buffer::YaapSharedSegmentAcquireRead(ctx.dsa, payload.segment_arena_dp, handle, &lease))
+			ereport(ERROR, (errmsg("pg_yaap: output segment read lease failed")));
+		const auto *store = static_cast<const TupleDataCollection *>(lease.data);
+		PG_TRY();
+		{
+			consume(store);
+		}
+		PG_CATCH();
+		{
+			buffer::YaapSharedSegmentReleaseRead(ctx.dsa, payload.segment_arena_dp, &lease);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		buffer::YaapSharedSegmentReleaseRead(ctx.dsa, payload.segment_arena_dp, &lease);
+		if (!buffer::YaapSharedSegmentRetire(ctx.dsa, budget, payload.segment_arena_dp, handle))
+			ereport(ERROR, (errmsg("pg_yaap: output consumed segment retire failed")));
+	}
+}
+
+static void
+SortOutputSegments(ExecCtx &ctx, OutputGlobalState &global)
+{
+	auto &payload = *global.shared_payload;
+	auto *budget = ResolveBufferState(ctx);
+	const dsa_pointer arena_dp = payload.segment_arena_dp;
+
+	/* Reclaim the unsorted pages before producing the new chain. PG tuplesort
+	 * bounds the sort workspace and spills its private runs as needed. */
+	SpillCompletedTdcSegments(ctx, arena_dp, payload.segment_first_desc_dp, "pg_yaap_output");
+	TdcExternalSorter sorter(ctx, global.layout, global.layout, global.sort_keys,
+		global.n_sort_keys, false);
+	ConsumeOutputSegments(ctx, payload, [&](const TupleDataCollection *store) {
+		const uint32_t count = pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&store->row_count));
+		for (uint32_t row = 0; row < count; ++row)
+		{
+			CHECK_FOR_INTERRUPTS();
+			sorter.Put(store, TupleDataCollectionGetRowConst(store, row));
+		}
+	});
+
+	const auto &input_writer = global.segmented_writer;
+	buffer::YaapSegmentedTdc writer;
+	buffer::YaapSegmentedTdcInit(&writer, arena_dp, input_writer.layout_dp,
+		input_writer.owner_worker, input_writer.row_width, input_writer.row_capacity,
+		input_writer.heap_capacity, input_writer.owner_tag, "sorted output");
+	dsa_pointer first_dp = InvalidDsaPointer;
+	TupleDataCollection *target = nullptr;
+	sorter.Perform();
+	while (global.max_emit_rows == 0 || writer.row_count < global.max_emit_rows)
+	{
+		CHECK_FOR_INTERRUPTS();
+		const auto *source = sorter.Next();
+		if (source == nullptr)
+			break;
+		const uint8_t *row = TupleDataCollectionGetRowConst(source, 0);
+		const uint32_t heap_bytes = TupleDataCollectionRequiredHeapBytesForRow(global.layout, source, row);
+		if (target != nullptr && !TupleDataCollectionHasSpaceForAppend(target, heap_bytes))
+		{
+			buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
+			SpillCompletedTdcSegments(ctx, arena_dp, first_dp, "pg_yaap_sorted_output");
+		}
+		buffer::YaapSegmentedRowHandle handle;
+		uint8_t *dst = nullptr;
+		if (!buffer::YaapSegmentedTdcAppendWithHeap(ctx.dsa, budget, &writer, heap_bytes, &handle, &target, &dst))
+			ereport(ERROR, (errmsg("pg_yaap: sorted output row append failed")));
+		CopyTdcRow(global.layout, source, row, target, dst);
+		if (!DsaPointerIsValid(first_dp))
+			first_dp = buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, writer.first)->self_dp;
+	}
+	buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
+	payload.segment_first_desc_dp = first_dp;
+	payload.segment_row_count = writer.row_count;
+	const auto *tail = writer.active.IsValid()
+		? buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, writer.active) : nullptr;
+	payload.segment_desc_dp = tail != nullptr ? tail->self_dp : InvalidDsaPointer;
+	payload.segment_id = writer.active.segment_id;
+	payload.segment_generation = writer.active.generation;
+	payload.tdc_dp = tail != nullptr ? tail->payload_dp : InvalidDsaPointer;
+	global.global_tdc = target;
+}
+
 SinkFinalizeType
 OutputSink::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	auto &global = static_cast<OutputGlobalState &>(gstate);
 
-	/* Publish sink->source handoff: Output has no downstream operator, but
-	 * EmitGlobalTdcToDest gates on this flag so the leader cannot drain a
-	 * partially-populated TDC if Finalize is somehow re-entered. */
-	if (global.global_tdc != nullptr)
-		global.global_tdc->finalized = true;
-	if (global.shared_payload != nullptr)
+	auto &payload = *global.shared_payload;
+	if (global.n_sort_keys != 0 && global.sort_keys == nullptr)
+		elog(ERROR, "pg_yaap: output finalization missing sort keys");
+
+	if (payload.segment_backed)
 	{
-		if (global.shared_payload->segment_backed)
-		{
-			buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &global.segmented_writer);
-			auto *tail = buffer::YaapSharedSegmentResolve(ctx.dsa,
-				global.shared_payload->segment_arena_dp, global.segmented_writer.active);
-			if (tail == nullptr)
-				ereport(ERROR, (errmsg("pg_yaap: output segment finalize tail missing")));
-			global.shared_payload->segment_desc_dp = tail->self_dp;
-			global.shared_payload->segment_id = tail->segment_id;
-			global.shared_payload->segment_generation = tail->generation;
-			global.shared_payload->tdc_dp = tail->payload_dp;
-		}
-		global.shared_payload->finalized = true;
-		if (auto *buffer_state = ResolveBufferState(ctx);
-			buffer_state != nullptr && buffer::YaapBufferOverSoftLimit(buffer_state) &&
-			global.shared_payload->segment_backed)
-		{
-			if (ctx.control == nullptr)
-				ereport(ERROR, (errmsg("pg_yaap: output spill control missing")));
-			buffer::YaapSpillStore spill(ctx.mcxt);
-			spill.AttachSharedFileSet(&ctx.control->spill_fileset, "pg_yaap_output");
-			for (dsa_pointer desc_dp = global.shared_payload->segment_first_desc_dp;
-				 DsaPointerIsValid(desc_dp);)
-			{
-				auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(
-					dsa_get_address(ctx.dsa, desc_dp));
-				if (segment == nullptr)
-					ereport(ERROR, (errmsg("pg_yaap: output spill segment missing")));
-				const dsa_pointer next_dp = segment->chain_next_dp;
-				if (pg_atomic_read_u32(&segment->state) ==
-					static_cast<uint32_t>(buffer::YaapSharedSegmentState::PUBLISHED))
-				{
-					const buffer::YaapSegmentHandle handle{segment->arena_id,
-						segment->segment_id, segment->generation};
-					buffer::YaapSpillExtent extent{};
-					if (!buffer::YaapSharedSegmentSpill(ctx.dsa, buffer_state, handle,
-						global.shared_payload->segment_arena_dp, &spill, &extent))
-						ereport(ERROR, (errmsg("pg_yaap: output segment spill failed")));
-				}
-				desc_dp = next_dp;
-			}
-		}
+		buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &global.segmented_writer);
+		if (global.n_sort_keys != 0)
+			SortOutputSegments(ctx, global);
+		SpillCompletedTdcSegments(ctx, payload.segment_arena_dp,
+			payload.segment_first_desc_dp, "pg_yaap_output");
 	}
+	else
+	{
+		if (global.n_sort_keys != 0)
+		{
+			const uint32_t count = pg_atomic_read_u32(&global.global_tdc->row_count);
+			const dsa_pointer order_dp = dsa_allocate0(ctx.dsa,
+				sizeof(OrderSortIndices) + static_cast<Size>(count) * sizeof(uint32_t));
+			auto *order = static_cast<OrderSortIndices *>(dsa_get_address(ctx.dsa, order_dp));
+			order->count = count;
+			for (uint32_t i = 0; i < count; ++i)
+				order->indices[i] = i;
+			std::sort(order->indices, order->indices + count, [&](uint32_t lhs, uint32_t rhs) {
+				return CompareStoredOutputRows(global,
+					TupleDataCollectionGetRowConst(global.global_tdc, lhs),
+					TupleDataCollectionGetRowConst(global.global_tdc, rhs)) < 0;
+			});
+			payload.sort_indices_dp = order_dp;
+		}
+		global.global_tdc->finalized = true;
+	}
+	payload.finalized = true;
 	global.finalized = true;
 
 	return SinkFinalizeType::READY;
@@ -980,12 +998,6 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 	dest_->rStartup(dest_, operation_, tupdesc_);
 	if (shared_payload->segment_backed)
 	{
-        SpillCompletedTdcSegments(ctx, shared_payload->segment_arena_dp,
-            shared_payload->segment_first_desc_dp, "pg_yaap_output");
-        std::unique_ptr<TdcExternalSorter> sorter;
-        if (!final_sort_keys_.empty())
-            sorter = std::make_unique<TdcExternalSorter>(ctx, layout, layout,
-                final_sort_keys_.data(), final_sort_keys_.size(), false);
         uint64 emitted = 0;
         bool receiver_done = false;
         MemoryContext row_context = AllocSetContextCreate(ctx.mcxt,
@@ -1021,35 +1033,14 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
             MemoryContextSwitchTo(old);
             MemoryContextReset(row_context);
         };
-        auto *budget = ResolveBufferState(ctx);
-        for (dsa_pointer dp = shared_payload->segment_first_desc_dp; DsaPointerIsValid(dp);) {
-            auto *segment = static_cast<buffer::YaapSharedSegmentDesc *>(dsa_get_address(ctx.dsa, dp));
-            dp = segment->chain_next_dp;
-            EnsureOutputSegmentResident(ctx, shared_payload, segment);
-            const buffer::YaapSegmentHandle handle{segment->arena_id, segment->segment_id, segment->generation};
-            buffer::YaapSharedSegmentReadLease lease;
-            if (!buffer::YaapSharedSegmentAcquireRead(ctx.dsa, shared_payload->segment_arena_dp, handle, &lease))
-                ereport(ERROR, (errmsg("pg_yaap: output segment read lease failed")));
-            auto *store = static_cast<const TupleDataCollection *>(lease.data);
-            for (uint32_t r = 0; r < pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&store->row_count)); ++r) {
+        ConsumeOutputSegments(ctx, *shared_payload, [&](const TupleDataCollection *store) {
+            const uint32_t count = pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&store->row_count));
+            for (uint32_t r = 0; r < count && !receiver_done &&
+                 (max_emit_rows_ == 0 || emitted < max_emit_rows_); ++r) {
                 CHECK_FOR_INTERRUPTS();
-                const uint8_t *row = TupleDataCollectionGetRowConst(store, r);
-                if (sorter) sorter->Put(store, row);
-                else emit_row(store, row);
+                emit_row(store, TupleDataCollectionGetRowConst(store, r));
             }
-            buffer::YaapSharedSegmentReleaseRead(ctx.dsa, shared_payload->segment_arena_dp, &lease);
-            if (budget == nullptr || !buffer::YaapSharedSegmentRetire(ctx.dsa, budget,
-                shared_payload->segment_arena_dp, handle))
-                ereport(ERROR, (errmsg("pg_yaap: output consumed segment retire failed")));
-        }
-        if (sorter) {
-            sorter->Perform();
-            while (!receiver_done && (max_emit_rows_ == 0 || emitted < max_emit_rows_)) {
-                const auto *store = sorter->Next();
-                if (store == nullptr) break;
-                emit_row(store, TupleDataCollectionGetRowConst(store, 0));
-            }
-        }
+        });
         MemoryContextDelete(row_context);
         dest_->rShutdown(dest_);
         ExecDropSingleTupleTableSlot(slot);
@@ -1062,66 +1053,29 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 	}
 
 	const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
-	std::vector<uint32_t> row_order;
-	if (pg_yaap_trace_hooks)
-		elog(LOG,
-			 "pg_yaap: OutputSink.Emit rows=%u final_sort_keys=%zu max_emit_rows=%llu",
-			 row_count,
-			 final_sort_keys_.size(),
-			 (unsigned long long) max_emit_rows_);
-	if (!final_sort_keys_.empty())
-	{
-		const std::vector<SortKeyDesc> sort_keys = final_sort_keys_;
-		if (pg_yaap_trace_hooks)
-		{
-			for (size_t i = 0; i < sort_keys.size(); ++i)
-				elog(LOG,
-					 "pg_yaap: OutputSink.SortKey idx=%zu col_idx=%u asc=%d nulls_first=%d",
-					 i,
-					 sort_keys[i].col_idx,
-					 sort_keys[i].asc ? 1 : 0,
-					 sort_keys[i].nulls_first ? 1 : 0);
-		}
-		row_order.resize(row_count);
-		for (uint32_t i = 0; i < row_count; ++i)
-			row_order[i] = i;
-		std::sort(row_order.begin(), row_order.end(),
-			[&sort_keys, layout, tdc](uint32_t lhs, uint32_t rhs)
-		{
-			const uint8_t *row_a = TupleDataCollectionGetRowConst(tdc, lhs);
-			const uint8_t *row_b = TupleDataCollectionGetRowConst(tdc, rhs);
-			for (const SortKeyDesc &key : sort_keys)
-			{
-				if (key.col_idx >= layout->column_count)
-					continue;
-				const bool null_a = TupleDataLayoutColumnIsNull(layout, row_a, key.col_idx);
-				const bool null_b = TupleDataLayoutColumnIsNull(layout, row_b, key.col_idx);
-				if (null_a != null_b)
-					return null_a == key.nulls_first;
-				if (null_a)
-					continue;
-				const TdcColumnDesc &col = layout->columns[key.col_idx];
-				const int cmp = CompareOutputKeyColumn(tdc, col, row_a, row_b);
-				if (cmp != 0)
-					return key.asc ? (cmp < 0) : (cmp > 0);
-			}
-			return false;
-		});
-	}
+	const auto *order = DsaPointerIsValid(shared_payload->sort_indices_dp)
+		? static_cast<const OrderSortIndices *>(dsa_get_address(ctx.dsa, shared_payload->sort_indices_dp))
+		: nullptr;
+	if (order != nullptr && order->count != row_count)
+		elog(ERROR, "pg_yaap: output sort index does not match row count");
 	const uint32_t emit_count =
 		(max_emit_rows_ > 0 && max_emit_rows_ < row_count)
 			? static_cast<uint32_t>(max_emit_rows_)
 			: row_count;
+	MemoryContext row_context = AllocSetContextCreate(ctx.mcxt,
+		"YAAP flat output row", ALLOCSET_SMALL_SIZES);
 	for (uint32_t i = 0; i < emit_count; ++i)
 	{
-		const uint32_t row_idx = row_order.empty() ? i : row_order[i];
+		CHECK_FOR_INTERRUPTS();
+		const uint32_t row_idx = order != nullptr ? order->indices[i] : i;
 		const uint8_t *row_ptr = TupleDataCollectionGetRowConst(tdc, row_idx);
 
+		MemoryContext old = MemoryContextSwitchTo(row_context);
 		ExecClearTuple(slot);
 		for (uint16_t c = 0; c < natts; ++c)
 		{
 			ColumnSchema col = schema->columns[c];
-            col.type_oid = TupleDescAttr(tupdesc_, c)->atttypid;
+			col.type_oid = TupleDescAttr(tupdesc_, c)->atttypid;
 
 			slot->tts_isnull[c] = TupleDataLayoutColumnIsNull(layout, row_ptr, c);
 			slot->tts_values[c] = slot->tts_isnull[c]
@@ -1142,8 +1096,16 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 			}
 		}
 		ExecStoreVirtualTuple(slot);
-		dest_->receiveSlot(slot, dest_);
+		MemoryContextSwitchTo(old);
+		const bool keep_going = dest_->receiveSlot(slot, dest_);
+		MemoryContextSwitchTo(row_context);
+		ExecClearTuple(slot);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(row_context);
+		if (!keep_going)
+			break;
 	}
+	MemoryContextDelete(row_context);
 
 	dest_->rShutdown(dest_);
 
@@ -1155,7 +1117,9 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 	 * now instead of retaining the entire result until DSM teardown. */
 	if (DsaPointerIsValid(payload_dp))
 	{
-		if (shared_payload != nullptr && DsaPointerIsValid(shared_payload->tdc_dp))
+		if (DsaPointerIsValid(shared_payload->sort_indices_dp))
+			dsa_free(ctx.dsa, shared_payload->sort_indices_dp);
+		if (DsaPointerIsValid(shared_payload->tdc_dp))
 			dsa_free(ctx.dsa, shared_payload->tdc_dp);
 		dsa_free(ctx.dsa, payload_dp);
 		shared_payload_dp_ = InvalidDsaPointer;

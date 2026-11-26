@@ -58,7 +58,6 @@ The execution and memory settings listed below are `PGC_USERSET`; the timeline e
 | `pg_yaap.parallel` | `false` | bool | Enable pipeline runtime dispatch. **Required `on` for any pg_yaap execution today** (see `pg_yaap_initialize_plan`: returns `false` when off). |
 | `pg_yaap.parallel_max_workers` | `4` | 0–1024 | Max bgworkers per query. |
 | `pg_yaap.parallel_min_relation_blocks` | `1024` | 0–`INT_MAX` | Min relation size before parallel lowering is considered. |
-| `pg_yaap.parallel_leader_participation` | `true` | bool | Leader runs pipeline tasks alongside workers. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | `false` | bool | Reserved; **no effect in greenfield** (HashJoin removed). Kept registered to avoid breaking existing config files. |
 | `pg_yaap.profile` | `false` | bool | Emit per-stage pipeline timing after each offloaded query. Fine-grained scan stages add visible overhead; use for diagnosis, not benchmark timing. |
 | `pg_yaap.profile_scan` | `off` | enum: off/sample/exact | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |

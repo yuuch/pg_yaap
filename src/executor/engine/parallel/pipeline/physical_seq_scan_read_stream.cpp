@@ -103,12 +103,13 @@ SeqScanReadNextParallel(ReadStream *stream, void *callback_private_data, void *p
 		scan->rs_inited = true;
 		if (state->trace_enabled)
 			elog(LOG,
-				 "pg_yaap: seqscan read_stream_init worker=%d rel=%s startblock=%u total_blocks=%u chunk_size=%u ring_buffers=0 io_combine_limit=%d effective_io_concurrency=%d io_workers=%d flags=SEQUENTIAL|USE_BATCHING",
+				 "pg_yaap: seqscan read_stream_init worker=%d rel=%s startblock=%u total_blocks=%u chunk_size=%u ring_buffers=%d io_combine_limit=%d effective_io_concurrency=%d io_workers=%d flags=SEQUENTIAL|USE_BATCHING",
 				 state->worker_index,
 				 RelationGetRelationName(scan->rs_base.rs_rd),
 				 pbscan->phs_startblock,
 				 scan_nblocks,
 				 pbscanwork->phsw_chunk_size,
+				 GetAccessStrategyBufferCount(scan->rs_strategy),
 				 io_combine_limit,
 				 effective_io_concurrency,
 				 io_workers);
@@ -145,14 +146,6 @@ InstallParallelSeqScanReadStream(HeapScanDesc scan,
 		scan->rs_read_stream = nullptr;
 	}
 
-	/* YAAP uses PG ReadStream without BAS_BULKREAD's small recycling ring. */
-	if (scan->rs_strategy != nullptr)
-	{
-		FreeAccessStrategy(scan->rs_strategy);
-		scan->rs_strategy = nullptr;
-	}
-	Assert(scan->rs_strategy == nullptr);
-
 	scan->rs_inited = false;
 	scan->rs_prefetch_block = InvalidBlockNumber;
 
@@ -164,7 +157,7 @@ InstallParallelSeqScanReadStream(HeapScanDesc scan,
 
 	scan->rs_read_stream = read_stream_begin_relation(
 		READ_STREAM_SEQUENTIAL | READ_STREAM_USE_BATCHING,
-		nullptr,
+		scan->rs_strategy,
 		rel,
 		MAIN_FORKNUM,
 		SeqScanReadNextParallel,

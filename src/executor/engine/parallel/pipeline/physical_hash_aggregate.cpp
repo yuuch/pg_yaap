@@ -19,6 +19,7 @@ extern bool pg_yaap_trace_hooks;
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "parallel/pipeline/types.hpp"
 #include "buffer_manager/yaap_shared_segment_arena.hpp"
@@ -44,6 +45,8 @@ static constexpr uint32_t kInitialGlobalPartitionRows = 16384;
 static constexpr uint32_t kMinLocalSegmentBackedRows = 32768;
 
 static uint32_t PartitionRowCapacity(uint32_t max_groups, uint32_t partition_count);
+static uint32_t InitialPartitionRows(const ExecCtx &ctx, const TupleDataLayout *layout,
+	uint32_t estimated_groups, uint32_t partition_count, uint32_t workers);
 static void AllocAhtForTdc(ExecCtx &ctx, dsa_pointer tdc_dp, uint32_t row_capacity,
 	dsa_pointer *aht_dp, AggregateHashTable **aht_out);
 static const TupleDataLayout *ResolveLayout(dsa_area *dsa, dsa_pointer layout_dp);
@@ -215,7 +218,7 @@ static uint32_t
 EffectiveWorkerCount(const ExecCtx &ctx)
 {
 	if (ctx.control != nullptr && ctx.control->num_workers > 0)
-		return static_cast<uint32_t>(ctx.control->num_workers);
+		return ExecutionWorkerCount(ctx);
 	return static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
 }
 
@@ -242,6 +245,33 @@ ResolveBufferState(const ExecCtx &ctx)
 		return nullptr;
 	return static_cast<buffer::YaapBufferSharedState *>(
 		dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
+}
+
+/* Keep startup storage bounded across the global table and every producer.
+ * Estimates describe the whole query, not a reservation for each process.
+ * Later inserts retain the existing capacity-growth and spill paths. */
+static uint32_t
+InitialPartitionRows(const ExecCtx &ctx, const TupleDataLayout *layout,
+	uint32_t estimated_groups, uint32_t partition_count, uint32_t workers)
+{
+	uint32_t rows = std::min(PartitionRowCapacity(estimated_groups, partition_count),
+		kInitialGlobalPartitionRows);
+	auto *budget = ResolveBufferState(ctx);
+	if (budget == nullptr)
+		return rows;
+	const uint64_t slots = static_cast<uint64_t>(std::max(1u, workers)) + 1u;
+	const uint64_t allowance = budget->hard_limit / 8u /
+		(slots * std::max(1u, partition_count));
+	while (rows > 16u)
+	{
+		const uint32_t heap = TupleDataCollectionDefaultHeapCapacity(layout, rows);
+		const uint64_t bytes = TupleDataCollectionAllocSize(rows, layout->row_width, heap) +
+			AggregateHashTableAllocSize(AggregateHashTableChooseCapacity(rows));
+		if (bytes <= allowance)
+			break;
+		rows = std::max(16u, rows / 2u);
+	}
+	return rows;
 }
 
 static bool
@@ -321,7 +351,7 @@ TryInitSegmentBackedTdc(ExecCtx &ctx, HashAggPartition &part,
 			return false;
 	}
 	const buffer::YaapSegmentHandle handle = buffer::YaapSharedSegmentArenaAllocate(
-		ctx.dsa, state, arena_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)));
+		ctx.dsa, state, arena_dp, ExecutionTaskSlot(ctx));
 	auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, handle);
 	if (segment == nullptr || arena == nullptr)
 		ereport(ERROR, (errmsg("pg_yaap: hash aggregate segment allocation failed")));
@@ -502,7 +532,7 @@ CombineLocalRowsIntoSegmentedGlobal(ExecCtx &ctx,
 
 	buffer::YaapSegmentedTdc writer;
 	buffer::YaapSegmentedTdcInit(&writer, global_part.segment_arena_dp,
-		layout_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+		layout_dp, ExecutionTaskSlot(ctx),
 			tail_store->row_width, tail_store->row_capacity, tail_store->heap_capacity,
 			0, "hash aggregate global combine");
 	writer.first = buffer::YaapSegmentHandle{first->arena_id, first->segment_id,
@@ -1285,13 +1315,23 @@ GatherDenseAggregateOutput(const TupleDataLayout *layout,
 
 }  /* namespace */
 
+SinkTaskPlan
+PhysicalHashAggregate::GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const
+{
+	dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(this);
+	if (!DsaPointerIsValid(payload_dp))
+		elog(ERROR, "pg_yaap: hash aggregate payload missing during COMBINE scheduling");
+	auto *payload = static_cast<HashAggSharedPayload *>(dsa_get_address(ctx.dsa, payload_dp));
+	return {payload->partition_count, run_tasks, true};
+}
+
 int
 PhysicalHashAggregate::MaxThreads(ExecCtx &ctx) const
 {
 	/* String layouts above four workers use the existing flat DSA local-TDC
 	 * path (TryInitSegmentBackedTdc declines segment backing).  That storage
 	 * choice must not silently cap scan fan-out; honor the query GUC here. */
-	return std::max(1, pg_yaap_parallel_max_workers);
+	return static_cast<int>(EffectiveWorkerCount(ctx));
 }
 
 dsa_pointer
@@ -1355,7 +1395,7 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		!DsaPointerIsValid(state->payload->partitions_dp) ||
 		state->payload->partition_count == 0;
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && needs_init)
+	if (ctx.initialize_shared_state && needs_init)
 	{
 		const uint32_t perfect_capacity = PerfectHashCapacityFromDescriptor();
 		const bool use_perfect_hash = perfect_capacity > 0 &&
@@ -1368,8 +1408,8 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		state->partition_count = (use_perfect_hash || use_single_state) ? 1u :
 			HashAggChoosePartitionCount(workers, state->layout->row_width);
 		const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
-		const uint32_t initial_global_partition_rows = std::min(per_partition_groups,
-			kInitialGlobalPartitionRows);
+		const uint32_t initial_global_partition_rows = InitialPartitionRows(ctx, state->layout,
+			state->max_groups, state->partition_count, workers);
 		const bool has_distinct_count = GetSingleDistinctCountAgg(state->layout);
 
 		if (!DsaPointerIsValid(state->shared_payload_dp))
@@ -1493,8 +1533,11 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	/* Cardinality estimates are global upper bounds.  Reserving that capacity
 	 * in every worker/partition multiplies a sparse aggregation (Q1 has four
 	 * groups) by workers × partitions.  Start bounded and grow on demand. */
-	const uint32_t initial_local_partition_rows = std::min(per_partition_groups,
-		kInitialGlobalPartitionRows);
+	const uint32_t workers = EffectiveWorkerCount(ctx);
+	const uint32_t local_groups = static_cast<uint32_t>(
+		(static_cast<uint64_t>(state->max_groups) + workers - 1u) / workers);
+	const uint32_t initial_local_partition_rows = InitialPartitionRows(ctx, state->layout,
+		local_groups, state->partition_count, workers);
 
 	state->local_partitions_dp = dsa_allocate0(ctx.dsa,
 		static_cast<size_t>(state->partition_count) * sizeof(HashAggPartition));
@@ -1522,7 +1565,7 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 			auto *writer_tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 			buffer::YaapSegmentedTdcInit(&state->segmented_writers[part_idx],
 				part.segment_arena_dp, global.layout_dp,
-				static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+				ExecutionTaskSlot(ctx),
 					writer_tdc->row_width, writer_tdc->row_capacity, writer_tdc->heap_capacity,
 					0, "hash aggregate local writer");
 			state->segmented_writers[part_idx].first =
@@ -1547,12 +1590,11 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		AggregateHashTable *aht = nullptr;
 		AllocAhtForTdc(ctx, part.tdc_dp, initial_local_partition_rows, &part.aht_dp, &aht);
 	}
-	if (ctx.worker_index >= 0)
 	{
 		auto *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
-		if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: hash aggregate local registry missing");
-		registry[ctx.worker_index] = state->local_partitions_dp;
+		registry[ExecutionTaskSlot(ctx)] = state->local_partitions_dp;
 	}
 
 	return state;
@@ -1858,20 +1900,25 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	if (registry == nullptr)
 		elog(ERROR, "pg_yaap: hash aggregate local registry missing");
 	HashAggPartition &global_part = global.partitions[input.partition_id];
+	bool cancelled = false;
 	LWLockAcquire(&global_part.mutex, LW_EXCLUSIVE);
 	PG_TRY();
 	{
 		for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
 		{
 			if (PipelineCancelRequestedEvery(ctx, slot))
-				return SinkCombineResultType::FINISHED;
+			{
+				cancelled = true;
+				break;
+			}
 			if (!DsaPointerIsValid(registry[slot]))
 				continue;
 			auto *parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
 			CombineLocalPartition(ctx, global, global_part, parts[input.partition_id], input.partition_id);
 		}
 
-		SpillHashAggGlobalPartition(ctx, global_part, input.partition_id);
+		if (!cancelled)
+			SpillHashAggGlobalPartition(ctx, global_part, input.partition_id);
 	}
 	PG_CATCH();
 	{
@@ -1880,6 +1927,8 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	}
 	PG_END_TRY();
 	LWLockRelease(&global_part.mutex);
+	if (cancelled)
+		return SinkCombineResultType::FINISHED;
 
 	const uint32_t completed = pg_atomic_add_fetch_u32(
 		&global.payload->combine_partitions_done, 1);

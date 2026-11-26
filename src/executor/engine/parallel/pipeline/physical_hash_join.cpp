@@ -22,6 +22,7 @@ extern bool pg_yaap_hash_join_partition_probe;
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/physical_hash_join_combine.hpp"
@@ -54,12 +55,12 @@ static uint32_t
 EffectiveWorkerCount(const ExecCtx &ctx)
 {
 	if (ctx.control != nullptr && ctx.control->num_workers > 0)
-		return static_cast<uint32_t>(ctx.control->num_workers);
+		return ExecutionWorkerCount(ctx);
 	return static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
 }
 
 static uint32_t
-HashJoinChoosePartitionCount(uint32_t workers)
+HashJoinChoosePartitionCount(const ExecCtx &ctx, uint32_t workers)
 {
 	if (workers <= 1)
 		return 1;
@@ -69,6 +70,24 @@ HashJoinChoosePartitionCount(uint32_t workers)
 	uint32_t partitions = 1;
 	while (partitions < target)
 		partitions <<= 1;
+	/* A producer may hold a key and payload tail for every radix partition.
+	 * These are fixed-size shared segments even when few rows were inserted.
+	 * Bound that initial working set across all execution processes, leaving
+	 * space for aggregate/output breakers and finalize/probe directories. */
+	if (ctx.control != nullptr && DsaPointerIsValid(ctx.control->buffer_state_root))
+	{
+		auto *budget = static_cast<buffer::YaapBufferSharedState *>(
+			dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
+		auto *arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa,
+			ctx.control->large_shared_segment_arena_root);
+		if (budget != nullptr && arena != nullptr)
+		{
+			const uint64_t tail_bytes = static_cast<uint64_t>(workers) *
+				2u * arena->segment_size;
+			while (partitions > 2u && tail_bytes * partitions > budget->hard_limit / 2u)
+				partitions >>= 1;
+		}
+	}
 	return partitions;
 }
 
@@ -300,7 +319,7 @@ DirectHashJoinSegmentRows(const ExecCtx &ctx,
 	/* With a small query budget, partial partition tails must fill early
 	 * enough for the existing build spill policy to reclaim them. */
 	const uint64_t tail_bytes = static_cast<uint64_t>(EffectiveWorkerCount(ctx)) *
-		HashJoinChoosePartitionCount(EffectiveWorkerCount(ctx)) * 2u * arena->segment_size;
+		HashJoinChoosePartitionCount(ctx, EffectiveWorkerCount(ctx)) * 2u * arena->segment_size;
 	if (buffer_state->hard_limit < tail_bytes * 4u)
 	{
 		rows = std::min<uint32_t>(rows, 8192u);
@@ -1276,13 +1295,11 @@ UpdateHashJoinLocalBuildRegistry(ExecCtx &ctx,
 	                            HashJoinSharedPayload *payload,
 	                            HashJoinLocalSinkState &local)
 {
-	if (ctx.worker_index < 0)
-		return;
 	auto *registry = ResolveLocalBuildRegistry(ctx.dsa, payload);
-	if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= payload->local_state_slot_count)
+	if (registry == nullptr || ExecutionTaskSlot(ctx) >= payload->local_state_slot_count)
 		elog(ERROR, "pg_yaap: hash join local build registry missing during grow");
-	registry[ctx.worker_index].build_keys_dp = local.build_keys_dp;
-	registry[ctx.worker_index].build_rows_dp = local.build_rows_dp;
+	registry[ExecutionTaskSlot(ctx)].build_keys_dp = local.build_keys_dp;
+	registry[ExecutionTaskSlot(ctx)].build_rows_dp = local.build_rows_dp;
 }
 
 static void
@@ -2138,16 +2155,96 @@ InitializeHashJoinOutputState(ExecCtx &ctx, PhysicalHashJoin &join,
 
 } // namespace
 
+SinkTaskPlan
+PhysicalHashJoin::GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const
+{
+	dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(this);
+	if (!DsaPointerIsValid(payload_dp))
+		elog(ERROR, "pg_yaap: hash join payload missing during COMBINE scheduling");
+	auto *payload = static_cast<HashJoinSharedPayload *>(dsa_get_address(ctx.dsa, payload_dp));
+	/* Segmented writers finish publication within their complete RUN task.
+	 * Flat builds retain the RUN barrier before computing shared offsets. */
+	if (payload->direct_segmented_build)
+		return {0, 0, false};
+	if (payload->build_partition_count <= 1)
+		return {run_tasks, run_tasks, false};
+	return {payload->build_partition_count, run_tasks, true};
+}
+
+SinkTaskPlan
+PhysicalHashJoin::GetFinalizeTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const
+{
+	dsa_pointer payload_dp = LoadSharedPayloadFromDescriptor(this);
+	if (!DsaPointerIsValid(payload_dp))
+		elog(ERROR, "pg_yaap: hash join payload missing during FINALIZE scheduling");
+	auto *payload = static_cast<HashJoinSharedPayload *>(dsa_get_address(ctx.dsa, payload_dp));
+	if (!payload->direct_segmented_build || payload->build_partition_count <= 1 ||
+		payload->partition_probe_mode)
+		return {1, 1, false};
+
+	/* Each partition directory builder holds up to four segment leases.
+	 * Bound concurrent builders using the largest partition and headroom. */
+	uint64_t largest_rows = 0;
+	auto *registry = static_cast<const HashJoinLocalBuildRegistryEntry *>(
+		dsa_get_address(ctx.dsa, payload->local_build_registry_dp));
+	if (registry == nullptr)
+		elog(ERROR, "pg_yaap: hash join finalize registry missing");
+	for (uint32_t part = 0; part < payload->build_partition_count; ++part)
+	{
+		uint64_t rows = 0;
+		for (uint32_t slot = 0; slot < payload->local_state_slot_count; ++slot)
+		{
+			if (!DsaPointerIsValid(registry[slot].partition_state_dp))
+				continue;
+			const auto *parts = static_cast<const HashJoinLocalPartitionState *>(
+				dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
+			rows += parts[part].row_count;
+		}
+		largest_rows = std::max(largest_rows, rows);
+	}
+	uint64_t buckets = 1;
+	while (buckets < largest_rows * 2u)
+		buckets <<= 1;
+	auto *budget = static_cast<buffer::YaapBufferSharedState *>(
+		dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
+	auto *arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, payload->segment_arena_dp);
+	if (budget == nullptr || arena == nullptr)
+		elog(ERROR, "pg_yaap: hash join finalize memory budget missing");
+	const uint64_t task_bytes = buckets * sizeof(uint32_t) +
+		largest_rows * (sizeof(uint32_t) * 3u + sizeof(int64_t)) +
+		4u * static_cast<uint64_t>(arena->segment_size);
+	const uint64_t headroom = budget->hard_limit > budget->soft_limit
+		? budget->hard_limit - budget->soft_limit : budget->hard_limit / 4u;
+	const uint32_t workers = static_cast<uint32_t>(std::max<uint64_t>(1u,
+		std::min<uint64_t>(run_tasks, headroom / task_bytes)));
+	return {payload->build_partition_count, workers, true};
+}
+
 int
 PhysicalHashJoin::MaxThreads(ExecCtx &ctx) const
 {
-	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	dsa_pointer payload_dp = shared_payload_dp();
 	HashJoinSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (payload == nullptr)
 		return 1;
-	return std::max(1, static_cast<int>(payload->local_state_slot_count));
+	uint32_t workers = std::max(1u, payload->local_state_slot_count);
+	if (payload->direct_segmented_build && payload->build_partition_count > 1)
+	{
+		auto *budget = ResolveBufferState(ctx);
+		auto *arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, payload->segment_arena_dp);
+		if (budget != nullptr && arena != nullptr)
+		{
+			const uint64_t writers = payload->build_rows_use_keys ? 1u : 2u;
+			const uint64_t worker_bytes = static_cast<uint64_t>(payload->build_partition_count) *
+				writers * (arena->segment_size + sizeof(buffer::YaapSharedSegmentDesc));
+			/* Active tails cannot be evicted by another process. Keep their
+			 * worst-case footprint within half the budget, including when the
+			 * minimum two radix partitions already exceed the target fan-out. */
+			workers = static_cast<uint32_t>(std::max<uint64_t>(1u,
+				std::min<uint64_t>(workers, budget->hard_limit / 2u / worker_bytes)));
+		}
+	}
+	return static_cast<int>(workers);
 }
 
 void
@@ -2179,6 +2276,12 @@ PhysicalHashJoin::BuildPipelines(Pipeline &current, MetaPipeline &meta)
 	}
 }
 
+dsa_pointer
+PhysicalHashJoin::shared_payload_dp() const
+{
+	return desc_ != nullptr ? LoadSharedPayloadFromDescriptor(this) : shared_payload_dp_;
+}
+
 std::unique_ptr<GlobalSinkState>
 PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 {
@@ -2189,9 +2292,7 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 	state->build_key_layout_dp = right_key_layout_dp_;
 	state->output_columns_dp = output_columns_dp_;
 	state->build_layout_dp = right_payload_layout_dp_;
-	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	state->shared_payload_dp = shared_payload_dp();
 	if (!DsaPointerIsValid(state->probe_key_layout_dp) && desc_ != nullptr)
 		state->probe_key_layout_dp = desc_->body.hash_join.left_key_layout;
 	if (!DsaPointerIsValid(state->build_key_layout_dp) && desc_ != nullptr)
@@ -2214,16 +2315,23 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 	if (state->build_layout == nullptr)
 		elog(ERROR, "pg_yaap: hash join missing build-side payload layout");
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(HashJoinSharedPayload));
 		state->payload = ResolvePayload(ctx.dsa, state->shared_payload_dp);
 		state->payload->local_state_slot_count = EffectiveWorkerCount(ctx);
-		state->payload->build_partition_count = HashJoinChoosePartitionCount(
+		state->payload->build_partition_count = HashJoinChoosePartitionCount(ctx,
 			state->payload->local_state_slot_count);
 		const HashJoinMatchMode join_mode = desc_ != nullptr
 			? desc_->body.hash_join.join_mode : join_mode_;
-		if (HashJoinScansBuildResults(join_mode) && state->payload->build_partition_count < 2)
+		/* The worker has no planner-local probe_stage_. Its aliases retain the
+		 * selected probe path even when fewer workers start than requested. */
+		const bool has_partition_probe = probe_stage_ != nullptr ||
+			std::any_of(desc_list_.begin(), desc_list_.end(), [](const OpDescriptor *desc) {
+				return desc != nullptr && desc->kind == OpKind::HASH_JOIN_PROBE;
+			});
+		if ((has_partition_probe || HashJoinScansBuildResults(join_mode)) &&
+			state->payload->build_partition_count < 2)
 			state->payload->build_partition_count = 2;
 		state->payload->hash_table_capacity = 0;
 		state->payload->radix_bits = 64u - HashJoinPartitionShift(
@@ -2272,7 +2380,7 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 		state->payload->combined_row_count = 0;
 		state->payload->combined_key_heap_used = 0;
 		state->payload->combined_row_heap_used = 0;
-		SpinLockInit(&state->payload->mutex);
+		LWLockInitialize(&state->payload->mutex, LWTRANCHE_PARALLEL_QUERY_DSA);
 		state->payload->direct_segmented_build = false;
 		/* The DSA address of the shared payload is stable across attached
 		 * processes and uniquely identifies this join operator for eviction. */
@@ -2292,7 +2400,7 @@ PhysicalHashJoin::GetGlobalSinkState(ExecCtx &ctx)
 		 * worker owns one spillable segment chain per partition; the partition
 		 * directories are built independently after the producer barrier. */
 		state->payload->direct_segmented_build = CanUseDirectSegmentedHashJoin(ctx, *state);
-		state->payload->partition_probe_mode = probe_stage_ != nullptr &&
+		state->payload->partition_probe_mode = has_partition_probe &&
 			state->payload->direct_segmented_build && state->payload->build_partition_count > 1;
 		if (pg_yaap_trace_execution_path)
 			ereport(LOG,
@@ -2413,7 +2521,7 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	if (global.payload->direct_segmented_build &&
 		global.payload->build_partition_count > 1)
 	{
-		if (ctx.worker_index < 0 ||	static_cast<uint32_t>(ctx.worker_index) >=
+		if (ExecutionTaskSlot(ctx) >=
 			global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: partitioned segmented hash join requires a worker-local state slot");
 		const uint32_t partition_count = global.payload->build_partition_count;
@@ -2437,7 +2545,7 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
 		if (registry == nullptr)
 			elog(ERROR, "pg_yaap: segmented hash join local registry missing");
-		registry[ctx.worker_index].partition_state_dp = state->partition_state_dp;
+		registry[ExecutionTaskSlot(ctx)].partition_state_dp = state->partition_state_dp;
 		state->segmented_writer_initialized = true;
 		return state;
 	}
@@ -2463,7 +2571,7 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		const uint32_t key_heap = TupleDataCollectionDefaultHeapCapacity(state->build_key_layout,
 			segment_rows);
 		const auto key_handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa, buffer_state,
-			arena_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+			arena_dp, ExecutionTaskSlot(ctx),
 			global.payload->owner_tag);
 		auto *key_segment = buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, key_handle);
 		if (key_segment == nullptr)
@@ -2473,7 +2581,7 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		TupleDataCollectionInit(state->build_keys, segment_rows,
 			state->build_key_layout->row_width, global.build_key_layout_dp, key_heap);
 		buffer::YaapSegmentedTdcInit(&state->key_segmented, arena_dp, global.build_key_layout_dp,
-			static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+			ExecutionTaskSlot(ctx),
 				state->build_key_layout->row_width, segment_rows, key_heap,
 				0, "hash join local key writer");
 		state->key_segmented.owner_tag = global.payload->owner_tag;
@@ -2493,7 +2601,7 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 			const uint32_t row_heap = TupleDataCollectionDefaultHeapCapacity(state->build_layout,
 				segment_rows);
 			const auto row_handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa, buffer_state,
-				arena_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+				arena_dp, ExecutionTaskSlot(ctx),
 				global.payload->owner_tag);
 			auto *row_segment = buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, row_handle);
 			if (row_segment == nullptr)
@@ -2503,7 +2611,7 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 			TupleDataCollectionInit(state->build_rows, segment_rows,
 				state->build_layout->row_width, global.build_layout_dp, row_heap);
 			buffer::YaapSegmentedTdcInit(&state->row_segmented, arena_dp, global.build_layout_dp,
-				static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+				ExecutionTaskSlot(ctx),
 					state->build_layout->row_width, segment_rows, row_heap,
 					0, "hash join local payload writer");
 			state->row_segmented.owner_tag = global.payload->owner_tag;
@@ -2540,23 +2648,22 @@ PhysicalHashJoin::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 			heap_capacity);
 	}
 
-	if (ctx.worker_index >= 0)
 	{
 		auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
-		if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: hash join local build registry missing");
-		registry[ctx.worker_index].build_keys_dp = state->build_keys_dp;
-		registry[ctx.worker_index].build_rows_dp = state->build_rows_dp;
-		registry[ctx.worker_index].build_key_segment_desc_dp = InvalidDsaPointer;
-		registry[ctx.worker_index].build_row_segment_desc_dp = InvalidDsaPointer;
-		registry[ctx.worker_index].build_key_refs_dp = state->key_refs_dp;
-		registry[ctx.worker_index].build_row_refs_dp = state->row_refs_dp;
-		registry[ctx.worker_index].row_count = 0;
-		registry[ctx.worker_index].key_heap_used = 0;
-		registry[ctx.worker_index].row_heap_used = 0;
-		registry[ctx.worker_index].global_row_offset = 0;
-		registry[ctx.worker_index].global_key_heap_offset = 0;
-		registry[ctx.worker_index].global_row_heap_offset = 0;
+		registry[ExecutionTaskSlot(ctx)].build_keys_dp = state->build_keys_dp;
+		registry[ExecutionTaskSlot(ctx)].build_rows_dp = state->build_rows_dp;
+		registry[ExecutionTaskSlot(ctx)].build_key_segment_desc_dp = InvalidDsaPointer;
+		registry[ExecutionTaskSlot(ctx)].build_row_segment_desc_dp = InvalidDsaPointer;
+		registry[ExecutionTaskSlot(ctx)].build_key_refs_dp = state->key_refs_dp;
+		registry[ExecutionTaskSlot(ctx)].build_row_refs_dp = state->row_refs_dp;
+		registry[ExecutionTaskSlot(ctx)].row_count = 0;
+		registry[ExecutionTaskSlot(ctx)].key_heap_used = 0;
+		registry[ExecutionTaskSlot(ctx)].row_heap_used = 0;
+		registry[ExecutionTaskSlot(ctx)].global_row_offset = 0;
+		registry[ExecutionTaskSlot(ctx)].global_key_heap_offset = 0;
+		registry[ExecutionTaskSlot(ctx)].global_row_heap_offset = 0;
 		if (pg_yaap_trace_execution_path)
 			ereport(LOG,
 				(errmsg("pg_yaap hashjoin registry slot=%d keys=" UINT64_FORMAT " rows=" UINT64_FORMAT,
@@ -2655,7 +2762,7 @@ PhysicalHashJoin::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &
 				const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout,
 					segment_rows);
 				buffer::YaapSegmentedTdcInit(&writer, global.payload->segment_arena_dp,
-					layout_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
+					layout_dp, ExecutionTaskSlot(ctx),
 					layout->row_width, segment_rows, heap_capacity, 0, name);
 				writer.owner_tag = global.payload->owner_tag;
 			};
@@ -2851,7 +2958,7 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		global.payload->build_partition_count > 1)
 	{
 		if (input.partition_id != UINT32_MAX || input.local_state == nullptr ||
-			ctx.worker_index < 0)
+			ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: partitioned segmented hash join expects one producer Combine task per worker");
 		auto &local = static_cast<HashJoinLocalSinkState &>(*input.local_state);
 		auto *local_parts = DsaPointerIsValid(local.partition_state_dp)
@@ -2859,7 +2966,7 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 				local.partition_state_dp)) : nullptr;
 		auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
 		if (local_parts == nullptr || registry == nullptr ||
-			static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+			ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: partitioned segmented hash join Combine state missing");
 
 		for (uint32_t part_idx = 0; part_idx < global.payload->build_partition_count; ++part_idx)
@@ -2901,7 +3008,7 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 					&static_cast<buffer::YaapSegmentRowRefTable *>(
 						dsa_get_address(ctx.dsa, part.build_key_refs_dp))->count);
 		}
-		registry[ctx.worker_index].partition_state_dp = local.partition_state_dp;
+		registry[ExecutionTaskSlot(ctx)].partition_state_dp = local.partition_state_dp;
 		return SinkCombineResultType::FINISHED;
 	}
 	if (global.payload != nullptr && global.payload->build_partition_count > 1)
@@ -2991,9 +3098,26 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		pg_atomic_add_fetch_u32(&global.payload->combine_partitions_done, 1);
 		return SinkCombineResultType::FINISHED;
 	}
-	if (input.local_state == nullptr)
-		elog(ERROR, "pg_yaap: hash join combine local state missing");
-	auto &local = static_cast<HashJoinLocalSinkState &>(*input.local_state);
+	/* A flat single-partition COMBINE can be claimed by any executor.
+	 * Rebuild its producer view from DSA handles, not process-private RUN state. */
+	HashJoinLocalSinkState published;
+	LocalSinkState *local_state = input.local_state;
+	if (local_state == nullptr)
+	{
+		auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
+			elog(ERROR, "pg_yaap: hash join published producer slot missing");
+		const auto &entry = registry[ExecutionTaskSlot(ctx)];
+		published.build_keys_dp = entry.build_keys_dp;
+		published.build_rows_dp = global.payload->build_rows_use_keys
+			? entry.build_keys_dp : entry.build_rows_dp;
+		published.build_keys = ResolveTdc(ctx.dsa, published.build_keys_dp);
+		published.build_rows = ResolveTdc(ctx.dsa, published.build_rows_dp);
+		published.build_key_layout = global.build_key_layout;
+		published.build_layout = global.build_layout;
+		local_state = &published;
+	}
+	auto &local = static_cast<HashJoinLocalSinkState &>(*local_state);
 	if (local.build_keys == nullptr || local.build_rows == nullptr)
 		elog(ERROR, "pg_yaap: hash join combine local build rows missing");
 	if (global.payload->direct_segmented_build)
@@ -3002,9 +3126,9 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		if (!global.payload->build_rows_use_keys)
 			buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &local.row_segmented);
 		auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
-		if (registry == nullptr || ctx.worker_index < 0)
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: direct segmented hash join registry missing");
-		HashJoinLocalBuildRegistryEntry &entry = registry[ctx.worker_index];
+		HashJoinLocalBuildRegistryEntry &entry = registry[ExecutionTaskSlot(ctx)];
 		entry.build_key_segment_desc_dp = buffer::YaapSegmentedTdcPublishDesc(ctx.dsa,
 			local.key_segmented);
 		entry.build_row_segment_desc_dp = global.payload->build_rows_use_keys
@@ -3032,29 +3156,38 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 			if (PipelineCancelRequested(ctx))
 				return SinkCombineResultType::FINISHED;
 			const uint32_t batch_end = std::min(row_idx + 64u, local_row_count);
-			SpinLockAcquire(&global.payload->mutex);
-			for (; row_idx < batch_end; ++row_idx)
+			LWLockAcquire(&global.payload->mutex, LW_EXCLUSIVE);
+			PG_TRY();
 			{
-				const uint8_t *src_key_row = TupleDataCollectionGetRowConst(local.build_keys, row_idx);
-				const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
-				EnsureJoinGlobalCapacity(ctx,
-					global,
-					src_key_row,
-					local.build_keys,
-					src_row,
-					local.build_rows);
-				uint8_t *dst_key_row = nullptr;
-				uint8_t *dst_row = nullptr;
-				const uint32_t key_appended = TupleDataCollectionAppendRow(global.build_keys, &dst_key_row);
-				const uint32_t appended = TupleDataCollectionAppendRow(global.build_rows, &dst_row);
-				if (key_appended == TDC_INVALID_ROW_INDEX)
-					elog(ERROR, "pg_yaap: hash join global build key row capacity exceeded during combine");
-				if (appended == TDC_INVALID_ROW_INDEX)
-					elog(ERROR, "pg_yaap: hash join global build row capacity exceeded during combine");
-				CopyBuildRow(global.build_key_layout, local.build_keys, src_key_row, global.build_keys, dst_key_row);
-				CopyBuildRow(global.build_layout, local.build_rows, src_row, global.build_rows, dst_row);
+				for (; row_idx < batch_end; ++row_idx)
+				{
+					const uint8_t *src_key_row = TupleDataCollectionGetRowConst(local.build_keys, row_idx);
+					const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
+					EnsureJoinGlobalCapacity(ctx,
+						global,
+						src_key_row,
+						local.build_keys,
+						src_row,
+						local.build_rows);
+					uint8_t *dst_key_row = nullptr;
+					uint8_t *dst_row = nullptr;
+					const uint32_t key_appended = TupleDataCollectionAppendRow(global.build_keys, &dst_key_row);
+					const uint32_t appended = TupleDataCollectionAppendRow(global.build_rows, &dst_row);
+					if (key_appended == TDC_INVALID_ROW_INDEX)
+						elog(ERROR, "pg_yaap: hash join global build key row capacity exceeded during combine");
+					if (appended == TDC_INVALID_ROW_INDEX)
+						elog(ERROR, "pg_yaap: hash join global build row capacity exceeded during combine");
+					CopyBuildRow(global.build_key_layout, local.build_keys, src_key_row, global.build_keys, dst_key_row);
+					CopyBuildRow(global.build_layout, local.build_rows, src_row, global.build_rows, dst_row);
+				}
 			}
-			SpinLockRelease(&global.payload->mutex);
+			PG_CATCH();
+			{
+				LWLockRelease(&global.payload->mutex);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			LWLockRelease(&global.payload->mutex);
 		}
 
 		global.payload->combined = true;
@@ -3062,6 +3195,17 @@ PhysicalHashJoin::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	}
 
 	return ExecuteHashJoinCombine(ctx, global, local);
+}
+
+SinkCombineResultType
+PhysicalHashJoin::FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input)
+{
+	auto &global = static_cast<HashJoinGlobalSinkState &>(input.global_state);
+	if (global.payload != nullptr && global.payload->direct_segmented_build)
+		return Combine(ctx, input);
+	/* Flat DSA rows are already registered, including any growth. Their
+	 * shared offsets can only be prepared after every RUN has completed. */
+	return SinkCombineResultType::FINISHED;
 }
 
 SinkFinalizeType
@@ -3653,8 +3797,7 @@ void
 PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32_t partition_id)
 {
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, batch_dp));
-	auto *payload = ResolvePayload(ctx.dsa, DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_ : LoadSharedPayloadFromDescriptor(this));
+	auto *payload = ResolvePayload(ctx.dsa, shared_payload_dp());
 	if (payload == nullptr || !payload->partition_probe_mode || partition_id >= payload->build_partition_count || partition_id >= 64 ||
 		((batch->partition_mask >> partition_id) & 1u) == 0 || batch->hash_capacity == 0 ||
 		batch->bucket_offsets[partition_id] >= batch->hash_capacity)
@@ -3854,9 +3997,7 @@ PhysicalHashJoin::EmitBuildResultRow(ExecCtx &ctx, dsa_pointer batch_dp, uint32_
 void
 PhysicalHashJoin::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx)
 {
-	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	dsa_pointer payload_dp = shared_payload_dp();
 	HashJoinSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (payload == nullptr)
 		return;
@@ -4080,8 +4221,7 @@ PhysicalHashJoin::EvictUnusedBuildSegment(ExecCtx &ctx,
 void
 PhysicalHashJoin::ReleaseBuildPartitionAfterProbe(ExecCtx &ctx, uint32_t partition_id)
 {
-	auto *payload = ResolvePayload(ctx.dsa, DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_ : LoadSharedPayloadFromDescriptor(this));
+	auto *payload = ResolvePayload(ctx.dsa, shared_payload_dp());
 	if (payload == nullptr || !payload->partition_probe_mode)
 		return;
 	auto *parts = ResolveHashJoinPartitions(ctx.dsa, payload);
@@ -4132,9 +4272,7 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 		out.reset();
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
-	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	dsa_pointer payload_dp = shared_payload_dp();
 	HashJoinSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (payload == nullptr || !payload->finalized)
 		elog(ERROR, "pg_yaap: hash join probe ran before build/finalize completed");

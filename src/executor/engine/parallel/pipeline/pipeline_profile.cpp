@@ -213,6 +213,7 @@ OpKindName(OpKind kind)
 	{
 		case OpKind::SEQ_SCAN: return "SEQ_SCAN";
 		case OpKind::DELIM_SCAN: return "DELIM_SCAN";
+        case OpKind::MATERIALIZE: return "MATERIALIZE";
 		case OpKind::HASH_AGGREGATE: return "HASH_AGGREGATE";
 		case OpKind::PERFECT_HASH_AGGREGATE: return "PERFECT_HASH_AGGREGATE";
 		case OpKind::HASH_JOIN: return "HASH_JOIN";

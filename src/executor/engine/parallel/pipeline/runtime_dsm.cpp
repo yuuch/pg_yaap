@@ -65,13 +65,13 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 		? configured_soft_bytes
 		: runtime_dsa_limit * 3 / 4;
 
+	const int num_workers = std::max(1, pg_yaap_parallel_max_workers);
 	shm_toc_estimator estimator;
 	shm_toc_initialize_estimator(&estimator);
 	shm_toc_estimate_chunk(&estimator, sizeof(PipelineSharedControl));
 	shm_toc_estimate_chunk(&estimator, runtime_dsa_size);
 	shm_toc_estimate_chunk(&estimator,
-						   DsmTaskQueue::EstimateSize(kRuntimeTaskQueueCapacity));
-	const int num_workers = std::max(1, pg_yaap_parallel_max_workers);
+						   DsmTaskQueue::EstimateSize(kRuntimeTaskQueueCapacity, num_workers));
 	const Size worker_ready_bytes =
 		static_cast<Size>(num_workers) * sizeof(pg_atomic_uint32);
 	shm_toc_estimate_chunk(&estimator, worker_ready_bytes);
@@ -120,6 +120,7 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 	control->db_oid = MyDatabaseId;
 	control->num_workers = num_workers;
 	control->jit_deform = pg_yaap_jit_deform ? 1 : 0;
+	control->snapshot_root = InvalidDsaPointer;
 	pg_atomic_init_u32(&control->profile_enabled, 0);
 	pg_atomic_init_u32(&control->trace_execution_path, 0);
 	control->profile_records_root = InvalidDsaPointer;
@@ -165,8 +166,8 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 	SharedFileSetInit(&control->spill_fileset, seg);
 
 	void *queue_mem = shm_toc_allocate(toc,
-									   DsmTaskQueue::EstimateSize(kRuntimeTaskQueueCapacity));
-	(void) DsmTaskQueue::InitInPlace(queue_mem, kRuntimeTaskQueueCapacity);
+									   DsmTaskQueue::EstimateSize(kRuntimeTaskQueueCapacity, num_workers));
+	(void) DsmTaskQueue::InitInPlace(queue_mem, kRuntimeTaskQueueCapacity, num_workers);
 	shm_toc_insert(toc, PIPELINE_DSM_KEY_TASK_QUEUE, queue_mem);
 
 	state->runtime_dsm = seg;

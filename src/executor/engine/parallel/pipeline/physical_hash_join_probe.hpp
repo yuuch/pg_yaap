@@ -37,6 +37,10 @@ public:
 	std::unique_ptr<LocalSinkState> GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &global) override;
 	SinkResultType SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
 	SinkCombineResultType Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
+	SinkCombineResultType FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input) override {
+		return Combine(ctx, input);
+	}
+	bool CombineIsTrivial() const override { return true; }
 	SinkFinalizeType Finalize(ExecCtx &ctx, GlobalSinkState &state) override;
 	std::unique_ptr<GlobalSourceState> GetGlobalSourceState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSourceState> GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &state) override;

@@ -47,7 +47,6 @@ bool pg_yaap_jit_deform = true;
 bool pg_yaap_parallel = true;
 int pg_yaap_parallel_max_workers = 4;
 int pg_yaap_parallel_min_relation_blocks = 1024;
-bool pg_yaap_parallel_leader_participation = true;
 bool pg_yaap_parallel_experimental_hash_pipeline = false;
 bool pg_yaap_disable_jit_for_parallel_worker = false;
 bool pg_yaap_profile = false;
@@ -370,17 +369,6 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomBoolVariable("pg_yaap.parallel_leader_participation",
-							 "Allow the leader to participate in experimental YAAP block-pool execution.",
-							 NULL,
-							 &pg_yaap_parallel_leader_participation,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
 	DefineCustomBoolVariable("pg_yaap.parallel_experimental_hash_pipeline",
 							 "Enable the experimental leader-only HashBuild->Finalize->Probe pipeline DAG path.",
 							 NULL,
@@ -546,7 +534,11 @@ pg_yaap_planner_hook(Query *parse, const char *query_string,
 #endif
 	}
 
-	if (pg_yaap_skip_optimizer_for_query_string(query_string))
+	if (pg_yaap_skip_optimizer_for_query_string(query_string) ||
+		(cursorOptions & (CURSOR_OPT_SCROLL | CURSOR_OPT_NO_SCROLL |
+						  CURSOR_OPT_INSENSITIVE | CURSOR_OPT_ASENSITIVE |
+						  CURSOR_OPT_HOLD | CURSOR_OPT_BINARY |
+						  CURSOR_OPT_FAST_PLAN)) != 0)
 	{
 		if (prev_planner_hook)
 #if PG_VERSION_NUM >= 190000
@@ -796,6 +788,15 @@ pg_yaap_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			 plan != NULL ? (int) nodeTag(plan) : -1);
 
 	if (IsParallelWorker())
+		return;
+
+	if (optimizer_only &&
+		(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_REWIND | EXEC_FLAG_MARK)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_yaap: backward scan, rewind, and mark/restore are not supported")));
+
+	if (optimizer_only && (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
 
 	state = pg_yaap_try_build_query_state(queryDesc, eflags);

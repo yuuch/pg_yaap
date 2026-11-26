@@ -465,7 +465,7 @@ Gather(const TupleDataLayout *layout,
        uint16_t row_idx)
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
-	Assert(layout->column_count + layout->aggregate_count <= 16);
+	Assert(layout->aggregate_count == 0 || layout->column_count + layout->aggregate_count <= 16);
 
 	/* Group/payload columns: chunk col i = row col i. */
 	for (uint16_t i = 0; i < layout->column_count; ++i)

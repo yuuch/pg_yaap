@@ -81,6 +81,27 @@ pg_yaap_segment_selftest(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("pg_yaap segment self-test saw %u rows across %u segments",
 		 seen, tdc.segment_count)));
 	pg_yaap::buffer::YaapSegmentedTdcReaderClose(dsa, &reader);
+	/* A materialized input must be replayable by independent consumers. */
+	pg_yaap::buffer::YaapSegmentedTdcReader first_reader, second_reader;
+	pg_yaap::buffer::YaapSegmentedTdcReaderInitShared(&first_reader, dsa, shared_desc);
+	pg_yaap::buffer::YaapSegmentedTdcReaderInitShared(&second_reader, dsa, shared_desc);
+	for (uint32_t i = 0; i < 5; ++i)
+	{
+		for (auto *cursor : {&first_reader, &second_reader})
+		{
+			pg_yaap::buffer::YaapSegmentedRowHandle handle;
+			pg_yaap::pipeline::TupleDataCollection *store = nullptr;
+			const uint8_t *row = nullptr;
+			uint32_t value = UINT32_MAX;
+			if (!pg_yaap::buffer::YaapSegmentedTdcReaderNext(dsa, cursor, &handle, &store, &row) || !row)
+				ereport(ERROR, (errmsg("pg_yaap segment self-test replay failed")));
+			std::memcpy(&value, row, sizeof(value));
+			if (value != i)
+				ereport(ERROR, (errmsg("pg_yaap segment self-test replay mismatch")));
+		}
+	}
+	pg_yaap::buffer::YaapSegmentedTdcReaderClose(dsa, &first_reader);
+	pg_yaap::buffer::YaapSegmentedTdcReaderClose(dsa, &second_reader);
 	auto *first_segment = pg_yaap::buffer::YaapSharedSegmentResolve(dsa, arena_dp, tdc.first);
 	auto *first_store = first_segment != nullptr
 		? static_cast<pg_yaap::pipeline::TupleDataCollection *>(

@@ -235,22 +235,27 @@ TranslateHashJoinNode(const PhysicalHashJoin &join,
 	auto translate_children = [&](OptimizerNodeTranslation &left_out,
 								  OptimizerNodeTranslation &right_out) -> bool
 	{
-		if (!TranslateOptimizerNode(*join.children[0],
-				queryDesc,
-				state,
-				left_required_cols.empty() ? nullptr : &left_required_cols,
-				left_out) ||
-			!TranslateOptimizerNode(*join.children[1],
-				queryDesc,
-				state,
-				right_required_cols.empty() ? nullptr : &right_required_cols,
-				right_out) ||
-			left_out.op == nullptr || right_out.op == nullptr)
-		{
-			if (pg_yaap_trace_hooks)
-				elog(LOG, "pg_yaap: optimizer hash join rejected: child translation failed");
-			return false;
-		}
+
+        if (!TranslateOptimizerNode(*join.children[0], queryDesc, state,
+                left_required_cols.empty() ? nullptr : &left_required_cols, left_out) || !left_out.op)
+            return false;
+        pipeline::PhysicalMaterialize *producer = nullptr;
+        if (join.delim_join) {
+            TupleDataLayout layout{};
+            if (!BuildHashGroupLayout(left_out.cols,left_out.cols,left_out.schema,{}, {}, {},layout))
+                return false;
+            pipeline::TupleDataLayoutEnableValidity(&layout);
+            const auto layout_dp = SerializeTupleDataLayout(layout,state->runtime_dsa);
+            const auto payload_dp = pipeline::CreateMaterializeShared(state->runtime_dsa);
+            auto spool=std::make_unique<pipeline::PhysicalMaterialize>(layout_dp,payload_dp,nullptr,
+                pipeline::CreateMaterializeScan(state->runtime_dsa));
+            spool->AddChild(std::move(left_out.op));
+            producer=spool.get(); left_out.op=std::move(spool);
+        }
+        DelimMaterializeContext context(join.delim_join ? join.children[0].get() : nullptr,&left_out,producer);
+        if (!TranslateOptimizerNode(*join.children[1],queryDesc,state,
+                right_required_cols.empty() ? nullptr : &right_required_cols,right_out) || !right_out.op)
+            return false;
 		return true;
 	};
 

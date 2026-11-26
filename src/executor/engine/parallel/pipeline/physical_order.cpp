@@ -408,7 +408,7 @@ PhysicalOrder::GetGlobalSinkState(ExecCtx &ctx)
 	if (!DsaPointerIsValid(state->shared_payload_dp))
 		state->shared_payload_dp = LoadSharedPayloadFromDescriptor(this);
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(OrderSharedPayload));
 		state->shared_payload = static_cast<OrderSharedPayload *>(
@@ -456,24 +456,6 @@ PhysicalOrder::GetGlobalSinkState(ExecCtx &ctx)
 			row_width,
 			state->payload_layout_dp,
 			heap_capacity);
-		if (state->shared_payload->segment_backed)
-		{
-			auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
-				state->shared_payload->segment_arena_dp,
-				buffer::YaapSegmentHandle{1, state->shared_payload->segment_id,
-					state->shared_payload->segment_generation});
-			state->segmented_writer_initialized = segment != nullptr;
-			if (segment == nullptr)
-				ereport(ERROR, (errmsg("pg_yaap: order segment initialization failed")));
-			buffer::YaapSegmentedTdcInit(&state->segmented_writer,
-				state->shared_payload->segment_arena_dp, state->payload_layout_dp,
-				static_cast<uint32_t>(std::max(ctx.worker_index, 0)), row_width,
-					initial_rows, heap_capacity, 0, "order writer");
-			state->segmented_writer.first = {1, state->shared_payload->segment_id,
-				state->shared_payload->segment_generation};
-			state->segmented_writer.active = state->segmented_writer.first;
-			state->segmented_writer.segment_count = 1;
-		}
 		StoreSharedPayloadOnDescriptor(this, state->shared_payload_dp);
 	}
 	else if (DsaPointerIsValid(state->shared_payload_dp) ||
@@ -493,8 +475,25 @@ PhysicalOrder::GetGlobalSinkState(ExecCtx &ctx)
 std::unique_ptr<LocalSinkState>
 PhysicalOrder::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 {
-	(void) ctx;
-	(void) gstate;
+	auto &global = static_cast<OrderGlobalState &>(gstate);
+	if (global.shared_payload == nullptr || global.payload == nullptr)
+		elog(ERROR, "pg_yaap: order sink payload not initialized");
+	if (global.shared_payload->segment_backed)
+	{
+		/* The RUN task can start in a different backend from activation. */
+		const auto &payload = *global.shared_payload;
+		const buffer::YaapSegmentHandle tail{1, payload.segment_id, payload.segment_generation};
+		if (buffer::YaapSharedSegmentResolve(ctx.dsa, payload.segment_arena_dp, tail) == nullptr)
+			elog(ERROR, "pg_yaap: order sink segment not initialized");
+		auto &writer = global.segmented_writer;
+		buffer::YaapSegmentedTdcInit(&writer, payload.segment_arena_dp, global.payload_layout_dp,
+			static_cast<uint32_t>(ctx.worker_index), global.payload->row_width,
+			global.payload->row_capacity, global.payload->heap_capacity, 0, "order writer");
+		writer.first = tail;
+		writer.active = tail;
+		writer.segment_count = 1;
+		global.segmented_writer_initialized = true;
+	}
 	return std::make_unique<OrderLocalState>();
 }
 

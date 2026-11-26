@@ -162,3 +162,28 @@ scan_io_rules_test = executable('scan_io_rules_test',
   include_directories: include_directories('src/executor/engine'),
   cpp_args: ['-O2', '-UNDEBUG'], install: false)
 test('pg_yaap_scan_io_rules', scan_io_rules_test, timeout: 30)
+
+# The queue and error tests use the production PG atomics in fork/mmap memory.
+pipeline_task_queue_test = executable('pipeline_task_queue_test',
+  ['tests/pipeline_task_queue.cpp', 'src/executor/engine/parallel/pipeline/dsm_task_queue.cpp'],
+  include_directories: pg_yaap_inc,
+  cpp_args: ['-O2', '-UNDEBUG', '-I' + pg_includedir_server], install: false)
+test('pg_yaap_pipeline_task_queue', pipeline_task_queue_test, timeout: 40)
+
+pipeline_error_protocol_test = executable('pipeline_error_protocol_test',
+  'tests/pipeline_error_protocol.cpp',
+  include_directories: pg_yaap_inc,
+  cpp_args: ['-O2', '-UNDEBUG', '-I' + pg_includedir_server,
+             '-include', 'pg_yaap_postgres.h'], install: false)
+test('pg_yaap_pipeline_error_protocol', pipeline_error_protocol_test, timeout: 30)
+
+pipeline_event_dag_test = executable('pipeline_event_dag_test',
+  ['tests/pipeline_event_dag.cpp',
+   'src/executor/engine/parallel/pipeline/physical_operator.cpp',
+   'src/executor/engine/parallel/pipeline/meta_pipeline.cpp',
+   'src/executor/engine/parallel/pipeline/task_scheduler.cpp',
+   'src/executor/engine/parallel/pipeline/dsm_task_queue.cpp'],
+  include_directories: pg_yaap_inc,
+  cpp_args: ['-O2', '-UNDEBUG', '-I' + pg_includedir_server,
+             '-include', 'pg_yaap_postgres.h'], install: false)
+test('pg_yaap_pipeline_event_dag', pipeline_event_dag_test, timeout: 30)

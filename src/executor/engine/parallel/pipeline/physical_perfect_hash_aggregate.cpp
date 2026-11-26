@@ -12,6 +12,7 @@ extern int pg_yaap_parallel_max_workers;
 
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "buffer_manager/yaap_shared_segment_arena.hpp"
 #include "buffer_manager/yaap_spill_store.hpp"
@@ -203,6 +204,7 @@ GrowLocalTdc(ExecCtx &ctx, PerfectHashAggLocalSinkState &local)
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
 		CopyTdcRow(local.layout, old_tdc, src, new_tdc, dst);
 	}
+	dsa_free(ctx.dsa, local.local_tdc_dp);
 	local.local_tdc_dp = new_tdc_dp;
 	local.local_tdc = new_tdc;
 }
@@ -298,6 +300,16 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 
 }  /* namespace */
 
+SinkTaskPlan
+PhysicalPerfectHashAggregate::GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const
+{
+	(void) ctx; (void) run_tasks;
+	if (!DsaPointerIsValid(LoadSharedPayloadFromDescriptor(this)))
+		elog(ERROR, "pg_yaap: perfect hash aggregate payload missing during COMBINE scheduling");
+	/* One owner merges every producer's shared perfect-hash partial. */
+	return {1, 1, false};
+}
+
 std::unique_ptr<GlobalSinkState>
 PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 {
@@ -308,12 +320,12 @@ PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 	state->layout = ResolveLayout(ctx.dsa, state->layout_dp);
 	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp()) ? shared_payload_dp() : SharedPayloadDpFromDescriptor();
 	state->max_groups = MaxGroupsFromDescriptor();
-	state->local_state_slot_count = static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
+	state->local_state_slot_count = ExecutionWorkerCount(ctx);
 
 	if (state->layout == nullptr)
 		elog(ERROR, "pg_yaap: perfect hash aggregate missing TupleDataLayout");
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		const uint32_t perfect_capacity = PerfectHashCapacityFromDescriptor();
 		if (perfect_capacity == 0)
@@ -342,7 +354,7 @@ PhysicalPerfectHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		{
 			const auto handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa,
 				buffer_state, ctx.control->shared_segment_arena_root,
-				static_cast<uint32_t>(std::max(ctx.worker_index, 0)));
+				ExecutionTaskSlot(ctx));
 			auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
 				ctx.control->shared_segment_arena_root, handle);
 			if (segment == nullptr)
@@ -415,12 +427,11 @@ PhysicalPerfectHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &g
 		state->layout_dp,
 		heap_capacity);
 
-	if (ctx.worker_index >= 0)
 	{
 		auto *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
-		if (registry == nullptr || static_cast<uint32_t>(ctx.worker_index) >= global.payload->local_state_slot_count)
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
 			elog(ERROR, "pg_yaap: perfect hash local registry missing");
-		registry[ctx.worker_index] = state->local_tdc_dp;
+		registry[ExecutionTaskSlot(ctx)] = state->local_tdc_dp;
 	}
 
 	return state;
@@ -430,7 +441,16 @@ SinkResultType
 PhysicalPerfectHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
 	auto &local = static_cast<PerfectHashAggLocalSinkState &>(input.local_state);
+	const dsa_pointer before = local.local_tdc_dp;
 	SinkChunkPerfectHash(ctx, local, in);
+	if (local.local_tdc_dp != before)
+	{
+		auto &global = static_cast<PerfectHashAggGlobalSinkState &>(input.global_state);
+		auto *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
+			elog(ERROR, "pg_yaap: perfect hash local registry missing after grow");
+		registry[ExecutionTaskSlot(ctx)] = local.local_tdc_dp;
+	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -441,40 +461,10 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 	if (input.partition_id != UINT32_MAX)
 		return SinkCombineResultType::FINISHED;
 
-	if (input.local_state != nullptr)
-	{
-		auto &local = static_cast<PerfectHashAggLocalSinkState &>(*input.local_state);
-		const uint32_t local_row_count = pg_atomic_read_u32(&local.local_tdc->row_count);
-		for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
-		{
-			const uint8_t *src_row = TupleDataCollectionGetRowConst(local.local_tdc, row_idx);
-			uint32_t key = 0;
-			if (!EncodePerfectHashRowKey(global.layout, src_row, &key) ||
-				key >= global.payload->perfect_hash_capacity)
-			{
-				elog(ERROR, "pg_yaap: perfect hash combine row key out of domain");
-			}
-
-			uint32_t canonical_idx = global.global_index[key];
-			if (canonical_idx == TDC_INVALID_ROW_INDEX)
-			{
-				while (pg_atomic_read_u32(&global.global_tdc->row_count) >= global.global_tdc->row_capacity)
-					GrowGlobalTdc(ctx, global);
-				uint8_t *dst_row = nullptr;
-				canonical_idx = TupleDataCollectionAppendRow(global.global_tdc, &dst_row);
-				if (canonical_idx == TDC_INVALID_ROW_INDEX)
-					elog(ERROR, "pg_yaap: perfect hash global row capacity exceeded");
-				std::memcpy(dst_row, src_row, global.layout->row_width);
-				global.global_index[key] = canonical_idx;
-			}
-			else
-			{
-				uint8_t *dst_row = TupleDataCollectionGetRow(global.global_tdc, canonical_idx);
-				CombineAggregates(global.layout, dst_row, src_row);
-			}
-		}
-		return SinkCombineResultType::FINISHED;
-	}
+	/* This stage has one owner. Every producer has already completed RUN
+	 * and published its DSA partial, including the optional leader slot.
+	 * input.local_state is only this owner's private wrapper; merging it
+	 * alone would discard every other process's contribution. */
 
 	dsa_pointer *registry = ResolveLocalRegistry(ctx.dsa, global.payload);
 	if (registry == nullptr)
@@ -483,9 +473,10 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 	{
 		if (!DsaPointerIsValid(registry[slot]))
 			continue;
-		auto *local_tdc = ResolveTdc(ctx.dsa, registry[slot]);
+		const dsa_pointer local_dp = registry[slot];
+		auto *local_tdc = ResolveTdc(ctx.dsa, local_dp);
 		if (local_tdc == nullptr)
-			continue;
+			elog(ERROR, "pg_yaap: perfect hash registered local TDC missing");
 		const uint32_t local_row_count = pg_atomic_read_u32(&local_tdc->row_count);
 		for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
 		{
@@ -515,6 +506,16 @@ PhysicalPerfectHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &in
 				CombineAggregates(global.layout, dst_row, src_row);
 			}
 		}
+		/* RUN is behind the event barrier and no producer may touch these
+		 * rows again. Its private state owns only a non-owning DSA pointer. */
+		dsa_free(ctx.dsa, local_dp);
+		registry[slot] = InvalidDsaPointer;
+	}
+	if (input.local_state != nullptr)
+	{
+		auto &local = static_cast<PerfectHashAggLocalSinkState &>(*input.local_state);
+		local.local_tdc = nullptr;
+		local.local_tdc_dp = InvalidDsaPointer;
 	}
 
 	return SinkCombineResultType::FINISHED;

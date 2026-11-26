@@ -95,6 +95,8 @@ At a high level:
 3. YAAP executes columnar batches through parallel pipelines.
 4. Results are converted back to PostgreSQL's normal tuple interface.
 
+See [Pipeline runtime and process communication](docs/pipeline_runtime.md) for task scheduling, shared-state ownership, synchronization, and current limits.
+
 ---
 
 ## TPC-H snapshot 📊
@@ -102,6 +104,14 @@ At a high level:
 ![TPC-H median runtime chart](imgs/comparison.svg)
 
 > Benchmark numbers depend on hardware, PostgreSQL configuration, dataset scale factor, query coverage, and whether the query is fully supported by YAAP. Treat this chart as a snapshot, not a universal claim.
+
+### SF100 (100GB)
+
+![TPC-H SF100 comparison](imgs/comparison-sf100.svg)
+
+This run used the `tpch100g` database (about 125GB on disk) on a 24GB M4 Pro, with 2GB `shared_buffers`. YAAP used 12 workers, an 8GiB payload limit, and a 20GiB DSA limit. pg_duckdb used its default 4GiB memory limit and default scan parallelism. YAAP and pg_duckdb were interleaved by query; PostgreSQL ran separately. Each timeout counts as 600 seconds in the total.
+
+**Correctness note:** YAAP's SF100 Q1 `N|O` `sum_charge` differs from both PostgreSQL and pg_duckdb: YAAP returns a negative value while the other two return a positive value. The chart compares runtime; it does not imply matching results.
 
 ---
 

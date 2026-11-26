@@ -74,12 +74,23 @@ def validate(data, dropped_ok=False):
         if event['name'].endswith(' / run') or event['name'].endswith(' / combine'):
             sums[(args['pipeline_id'], event['tid'])] += event['dur'] * 1000
             repeated[(args['pipeline_id'], event['tid'], args['task_id'])] += 1
+    if meta['complete'] and not meta['dropped_events']:
+        identities = [(e['args']['event_id'], e['args']['task_id'])
+                      for e in data['traceEvents'] if e['ph'] == 'X']
+        assert len(identities) == len(set(identities)), 'logical tasks must finish exactly once'
+        assert all(e['args']['result'] == 'finished' for e in data['traceEvents'] if e['ph'] == 'X')
     if meta['complete']:
         expected_fragments = sum(p['task_count'] + sum(w['finalize_task_count'] for w in p['workers'])
                                  for p in meta['pipelines'])
         assert sum(e['ph'] == 'X' for e in data['traceEvents']) + meta['dropped_events'] == expected_fragments
     by_id = {p['pipeline_id']: p for p in meta['pipelines']}
     for pipeline in meta['pipelines']:
+        events = pipeline['events']
+        assert [event['event_id'] for event in events] == [
+            pipeline['pipeline_id'] * 3 + phase for phase in range(3)]
+        for event in events:
+            if event['completed_by'] >= 0 or meta['complete']:
+                assert event['activated_by'] >= 0 and event['completed_by'] >= 0, event
         if meta['complete']:
             for parent in pipeline['dependencies']:
                 assert by_id[parent]['finished_ns'] <= pipeline['ready_ns']
@@ -121,6 +132,10 @@ def main():
     scan = f'SELECT sum(id),count(*) FROM {SCHEMA}.a;'
     complex_sql = (f'SELECT a.k,sum(a.id+b.id),count(*) FROM {SCHEMA}.a a JOIN {SCHEMA}.b b ON a.id=b.id '
                    'GROUP BY a.k ORDER BY a.k;')
+    fan_in = (f'SELECT l.k,l.v,r.v FROM '
+              f'(SELECT k,sum(id) v FROM {SCHEMA}.a GROUP BY k) l JOIN '
+              f'(SELECT k,sum(id) v FROM {SCHEMA}.a WHERE id>10 GROUP BY k) r '
+              'ON l.k=r.k ORDER BY l.k;')
     try:
         for name, query, workers, mode, capacity, legacy in [
             ('single_pipeline', f'SELECT id FROM {SCHEMA}.a WHERE id<=10;', 1, 'trace', 8192, False),
@@ -128,8 +143,12 @@ def main():
             ('single', scan, 1, 'trace', 8192, False),
             ('multi', scan, 4, 'trace', 8192, False),
             ('dependencies', complex_sql, 4, 'trace', 8192, False),
+            ('fan_in_single', fan_in, 1, 'trace', 8192, False),
+            ('fan_in_multi', fan_in, 4, 'trace', 8192, False),
             ('parallel_finalize', complex_sql, 4, 'trace', 8192, False),
             ('empty', f'SELECT id FROM {SCHEMA}.a WHERE id<0;', 4, 'trace', 8192, False),
+            ('ordered_output', f'SELECT id,k FROM {SCHEMA}.a ORDER BY k DESC,id;', 4, 'trace', 8192, False),
+            ('ordered_empty', f'SELECT id,k FROM {SCHEMA}.a WHERE id<0 ORDER BY k DESC,id;', 4, 'trace', 8192, False),
             ('overflow', complex_sql, 4, 'trace', 1, False),
             ('basic', scan, 4, 'basic', 8192, False),
             ('off', scan, 4, 'off', 8192, False),
@@ -145,7 +164,10 @@ def main():
             result = run(config + query)
             (OUT / f'{name}.stderr').write_text(result.stderr)
             assert result.returncode == 0, result.stderr
-            assert sorted(result.stdout.splitlines()) == sorted(expected.splitlines()), (name, result.stdout, expected)
+            if ' ORDER BY ' in query:
+                assert result.stdout == expected, name
+            else:
+                assert sorted(result.stdout.splitlines()) == sorted(expected.splitlines()), name
             files = list(OUT.glob(prefix.name + '.*.json'))
             if mode == 'trace':
                 assert len(files) == 1, (name, files)
@@ -156,15 +178,21 @@ def main():
                     assert len(data['yaap']['pipelines']) == 1
                     assert data['yaap']['pipelines'][0]['worker_count'] == 1
                 if name == 'multi':
-                    assert any(p['worker_count'] == workers for p in data['yaap']['pipelines'])
+                    runs = collections.Counter(e['args']['pipeline_id'] for e in data['traceEvents']
+                                               if e['ph'] == 'X' and e['name'].endswith(' / run'))
+                    assert max(runs.values()) == workers
                 if name == 'single':
-                    assert max(repeats.values(), default=0) > 1, 'expected repeated Execute slices for one task'
+                    assert repeats and max(repeats.values()) == 1, 'a whole task must execute once'
                 if name == 'dependencies':
                     pipelines = data['yaap']['pipelines']
                     assert any(p['dependencies'] for p in pipelines)
                     assert any(p['finalize_end_ns'] > p['finalize_start_ns'] for p in pipelines)
                     counts = collections.Counter(w['slot_id'] for p in pipelines for w in p['workers'] if w['task_count'])
                     assert max(counts.values()) > 1
+                if name.startswith('fan_in_'):
+                    pipelines = data['yaap']['pipelines']
+                    assert sum(not p['dependencies'] for p in pipelines) >= 2, pipelines
+                    assert any(len(p['dependencies']) >= 2 for p in pipelines), pipelines
                 if name == 'overflow':
                     assert data['yaap']['dropped_events'] > 0
                 if name == 'parallel_finalize':
@@ -186,16 +214,35 @@ def main():
             results.append({'case': name, 'pass': True, 'files': [str(p) for p in files]})
         if args.abnormal:
             abnormal_checks(results, complex_sql)
-            prefix = OUT / f'startup-failure-{time.time_ns()}'
-            failure = run(setup(prefix, workers=64) + scan)
-            (OUT / 'startup-failure.stderr').write_text(failure.stderr)
-            assert failure.returncode != 0
-            files = list(OUT.glob(prefix.name + '.*.json'))
-            assert len(files) == 1
-            data = json.loads(files[0].read_text())
-            assert not data['yaap']['complete']
-            assert all(p['task_count'] == 0 for p in data['yaap']['pipelines'])
-            results.append({'case': 'startup-failure-no-tasks', 'pass': True, 'partial_files': [str(p) for p in files]})
+            zero = run(setup(OUT / 'startup-zero', workers=0) + scan)
+            assert zero.returncode != 0 and 'parallel_max_workers must be >= 1' in zero.stderr
+            results.append({'case': 'startup-zero-workers', 'pass': True})
+
+            slots = int(checked('SHOW max_worker_processes;'))
+            # This suite uses an isolated server. Cap the requested cohort so
+            # the slot-exhaustion case stays lightweight on large servers.
+            if 1 <= slots <= 16:
+                prefix = OUT / f'startup-partial-{time.time_ns()}'
+                requested = slots + 1
+                config = setup(prefix, workers=requested)
+                config += "SET pg_yaap.trace_execution_path=on; SET client_min_messages=log; "
+                partial = run(config + scan)
+                assert partial.returncode == 0, partial.stderr
+                assert partial.stdout == checked('SET pg_yaap.enabled=off; ' + scan)
+                files = list(OUT.glob(prefix.name + '.*.json'))
+                assert len(files) == 1
+                data = json.loads(files[0].read_text())
+                validate(data)
+                message = f'workers requested={requested} ready='
+                actual = [int(line.rsplit('=', 1)[1]) for line in partial.stderr.splitlines()
+                          if message in line]
+                assert len(actual) == 1 and 1 <= actual[0] <= slots, partial.stderr
+                cohorts = collections.Counter(
+                    e['args']['pipeline_id'] for e in data['traceEvents']
+                    if e['ph'] == 'X' and e['name'].endswith(' / run'))
+                assert max(cohorts.values()) == actual[0], cohorts
+                results.append({'case': 'startup-partial-workers', 'pass': True,
+                                'requested': requested, 'actual': actual[0]})
         export_checks(results, scan)
     finally:
         ddl(f'DROP SCHEMA {SCHEMA} CASCADE;')

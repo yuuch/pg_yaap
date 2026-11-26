@@ -72,6 +72,8 @@ public:
 		type_ = PhysicalOperatorType::PERFECT_HASH_AGGREGATE;
 	}
 
+	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+
 	std::unique_ptr<GlobalSinkState>   GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState>    GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	SinkResultType                     SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;

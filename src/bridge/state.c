@@ -34,6 +34,7 @@ struct PgYaapQueryState
 	void *parallel_scheduler;
 	struct dsm_segment *runtime_dsm;
 	dsa_area *runtime_dsa;
+	bool executed;
 };
 
 typedef struct StateEntry

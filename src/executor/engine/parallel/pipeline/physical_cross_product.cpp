@@ -12,6 +12,7 @@ extern bool pg_yaap_trace_execution_path;
 #include <cstring>
 
 #include "parallel/pipeline/cancel.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/meta_pipeline.hpp"
 #include "parallel/pipeline/physical_hash_join_fast_probe.hpp"
 #include "parallel/pipeline/pipeline.hpp"
@@ -32,7 +33,7 @@ static uint32_t
 EffectiveWorkerCount(const ExecCtx &ctx)
 {
 	if (ctx.control != nullptr && ctx.control->num_workers > 0)
-		return static_cast<uint32_t>(ctx.control->num_workers);
+		return ExecutionWorkerCount(ctx);
 	return static_cast<uint32_t>(std::max(1, pg_yaap_parallel_max_workers));
 }
 
@@ -102,7 +103,7 @@ InitCrossProductGlobalSegment(ExecCtx &ctx, CrossProductSharedPayload *payload,
 	if (state == nullptr || !CrossProductSegmentFits(ctx, layout, row_capacity, &arena_dp))
 		return;
 	const auto handle = buffer::YaapSharedSegmentArenaAllocate(ctx.dsa, state, arena_dp,
-		static_cast<uint32_t>(std::max(ctx.worker_index, 0)));
+		ExecutionTaskSlot(ctx));
 	auto *segment = buffer::YaapSharedSegmentResolve(ctx.dsa, arena_dp, handle);
 	if (segment == nullptr)
 		ereport(ERROR, (errmsg("pg_yaap: cross product segment allocation failed")));
@@ -247,7 +248,8 @@ GrowTdcCopyRows(ExecCtx &ctx,
 	           const TupleDataLayout *layout,
 	           dsa_pointer layout_dp,
 	           TupleDataCollection *old_tdc,
-	           uint32_t minimum_row_capacity)
+	           uint32_t minimum_row_capacity,
+	           dsa_pointer *root_dp)
 {
 	if (layout == nullptr || old_tdc == nullptr)
 		elog(ERROR, "pg_yaap: cross product grow TDC missing layout/state");
@@ -273,6 +275,8 @@ GrowTdcCopyRows(ExecCtx &ctx,
 			elog(ERROR, "pg_yaap: cross product grow TDC capacity copy failed");
 		CopyBuildRow(layout, old_tdc, src, new_tdc, dst);
 	}
+	dsa_free(ctx.dsa, *root_dp);
+	*root_dp = new_tdc_dp;
 	return new_tdc;
 }
 
@@ -289,12 +293,18 @@ public:
 
 }  // namespace
 
+SinkTaskPlan
+PhysicalCrossProduct::GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const
+{
+	(void) ctx; (void) run_tasks;
+	/* Each complete RUN merges its private rows before it reports completion. */
+	return {0, 0, false};
+}
+
 int
 PhysicalCrossProduct::MaxThreads(ExecCtx &ctx) const
 {
-	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	dsa_pointer payload_dp = shared_payload_dp();
 	CrossProductSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (payload == nullptr)
 		return 1;
@@ -314,6 +324,12 @@ PhysicalCrossProduct::BuildPipelines(Pipeline &current, MetaPipeline &meta)
 	meta.AddOperator(current, *this);
 }
 
+dsa_pointer
+PhysicalCrossProduct::shared_payload_dp() const
+{
+	return desc_ != nullptr ? LoadSharedPayloadFromDescriptor(this) : shared_payload_dp_;
+}
+
 std::unique_ptr<GlobalSinkState>
 PhysicalCrossProduct::GetGlobalSinkState(ExecCtx &ctx)
 {
@@ -321,16 +337,14 @@ PhysicalCrossProduct::GetGlobalSinkState(ExecCtx &ctx)
 	state->dsa = ctx.dsa;
 	state->desc = desc_;
 	state->right_layout_dp = right_payload_layout_dp_;
-	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	state->shared_payload_dp = shared_payload_dp();
 	if (!DsaPointerIsValid(state->right_layout_dp) && desc_ != nullptr)
 		state->right_layout_dp = desc_->body.cross_product.right_payload_layout;
 	state->right_layout = ResolveLayout(ctx.dsa, state->right_layout_dp);
 	if (state->right_layout == nullptr)
 		elog(ERROR, "pg_yaap: cross product missing build-side payload layout");
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(CrossProductSharedPayload));
 		state->payload = ResolvePayload(ctx.dsa, state->shared_payload_dp);
@@ -338,7 +352,7 @@ PhysicalCrossProduct::GetGlobalSinkState(ExecCtx &ctx)
 		state->payload->finalized = false;
 		pg_atomic_init_u32(&state->payload->release_state, 0);
 		state->payload->combined_row_count = 0;
-		SpinLockInit(&state->payload->mutex);
+		LWLockInitialize(&state->payload->mutex, LWTRANCHE_PARALLEL_QUERY_DSA);
 		state->payload->local_build_registry_dp = dsa_allocate0(ctx.dsa,
 			static_cast<size_t>(state->payload->local_state_slot_count) * sizeof(CrossProductLocalBuildRegistryEntry));
 		const uint32_t global_row_capacity = std::min<uint32_t>(
@@ -400,12 +414,11 @@ PhysicalCrossProduct::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	if (state->build_rows == nullptr)
 		elog(ERROR, "pg_yaap: cross product local build rows allocation failed");
 
-	if (ctx.worker_index >= 0 &&
-		static_cast<uint32_t>(ctx.worker_index) < global.payload->local_state_slot_count)
 	{
 		auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
-		if (registry != nullptr)
-			registry[ctx.worker_index].build_rows_dp = state->build_rows_dp;
+		if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
+			elog(ERROR, "pg_yaap: cross product local build registry missing");
+		registry[ExecutionTaskSlot(ctx)].build_rows_dp = state->build_rows_dp;
 	}
 	return state;
 }
@@ -421,7 +434,15 @@ PhysicalCrossProduct::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInp
 	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
 	{
 		if (TdcNeedsGrowForChunkRow(local.build_layout, local.build_rows, in, row_idx))
-			local.build_rows = GrowTdcCopyRows(ctx, local.build_layout, local.build_layout_dp, local.build_rows, local.build_rows->row_capacity + 1u);
+		{
+			local.build_rows = GrowTdcCopyRows(ctx, local.build_layout, local.build_layout_dp,
+				local.build_rows, local.build_rows->row_capacity + 1u, &local.build_rows_dp);
+			auto &global = static_cast<CrossProductGlobalSinkState &>(input.global_state);
+			auto *registry = ResolveLocalBuildRegistry(ctx.dsa, global.payload);
+			if (registry == nullptr || ExecutionTaskSlot(ctx) >= global.payload->local_state_slot_count)
+				elog(ERROR, "pg_yaap: cross product local registry missing after growth");
+			registry[ExecutionTaskSlot(ctx)].build_rows_dp = local.build_rows_dp;
+		}
 		uint8_t *row_ptr = nullptr;
 		if (TupleDataCollectionAppendRow(local.build_rows, &row_ptr) == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_yaap: cross product local build row capacity exceeded");
@@ -447,46 +468,52 @@ PhysicalCrossProduct::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	{
 		if (local_row_count == 0)
 			return SinkCombineResultType::FINISHED;
-		SpinLockAcquire(&global.payload->mutex);
-		auto *first = static_cast<buffer::YaapSharedSegmentDesc *>(
-			dsa_get_address(ctx.dsa, global.payload->segment_first_desc_dp));
-		auto *tail = static_cast<buffer::YaapSharedSegmentDesc *>(
-			dsa_get_address(ctx.dsa, global.payload->segment_desc_dp));
-		if (first == nullptr || tail == nullptr || !DsaPointerIsValid(tail->payload_dp))
-			elog(ERROR, "pg_yaap: cross product segment chain missing");
-		auto *tail_store = static_cast<TupleDataCollection *>(
-			dsa_get_address(ctx.dsa, tail->payload_dp));
-		buffer::YaapSegmentedTdc writer;
-		buffer::YaapSegmentedTdcInit(&writer, global.payload->segment_arena_dp,
-			global.right_layout_dp, static_cast<uint32_t>(std::max(ctx.worker_index, 0)),
-			tail_store->row_width, tail_store->row_capacity, tail_store->heap_capacity);
-		writer.first = {first->arena_id, first->segment_id, first->generation};
-		writer.active = {tail->arena_id, tail->segment_id, tail->generation};
-		writer.segment_count = 1;
-		writer.row_count = global.payload->segment_row_count;
-		for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
+		LWLockAcquire(&global.payload->mutex, LW_EXCLUSIVE);
+		PG_TRY();
 		{
-			const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
-			buffer::YaapSegmentedRowHandle handle;
-			TupleDataCollection *dst_store = nullptr;
-			uint8_t *dst_row = nullptr;
-			if (!buffer::YaapSegmentedTdcAppendWithHeap(ctx.dsa, ResolveBufferState(ctx),
-				&writer, TupleDataCollectionRequiredHeapBytesForRow(global.right_layout,
-					local.build_rows, src_row), &handle, &dst_store, &dst_row))
+			auto *first = static_cast<buffer::YaapSharedSegmentDesc *>(
+				dsa_get_address(ctx.dsa, global.payload->segment_first_desc_dp));
+			auto *tail = static_cast<buffer::YaapSharedSegmentDesc *>(
+				dsa_get_address(ctx.dsa, global.payload->segment_desc_dp));
+			if (first == nullptr || tail == nullptr || !DsaPointerIsValid(tail->payload_dp))
+				elog(ERROR, "pg_yaap: cross product segment chain missing");
+			auto *tail_store = static_cast<TupleDataCollection *>(
+				dsa_get_address(ctx.dsa, tail->payload_dp));
+			buffer::YaapSegmentedTdc writer;
+			buffer::YaapSegmentedTdcInit(&writer, global.payload->segment_arena_dp,
+				global.right_layout_dp, ExecutionTaskSlot(ctx),
+				tail_store->row_width, tail_store->row_capacity, tail_store->heap_capacity);
+			writer.first = {first->arena_id, first->segment_id, first->generation};
+			writer.active = {tail->arena_id, tail->segment_id, tail->generation};
+			writer.segment_count = 1;
+			writer.row_count = global.payload->segment_row_count;
+			for (uint32_t row_idx = 0; row_idx < local_row_count; ++row_idx)
 			{
-				SpinLockRelease(&global.payload->mutex);
-				ereport(ERROR, (errmsg("pg_yaap: cross product segmented build append failed")));
+				const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
+				buffer::YaapSegmentedRowHandle handle;
+				TupleDataCollection *dst_store = nullptr;
+				uint8_t *dst_row = nullptr;
+				if (!buffer::YaapSegmentedTdcAppendWithHeap(ctx.dsa, ResolveBufferState(ctx),
+					&writer, TupleDataCollectionRequiredHeapBytesForRow(global.right_layout,
+						local.build_rows, src_row), &handle, &dst_store, &dst_row))
+					ereport(ERROR, (errmsg("pg_yaap: cross product segmented build append failed")));
+				CopyBuildRow(global.right_layout, local.build_rows, src_row, dst_store, dst_row);
+				++global.payload->segment_row_count;
 			}
-			CopyBuildRow(global.right_layout, local.build_rows, src_row, dst_store, dst_row);
-			++global.payload->segment_row_count;
+			buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
+			auto *new_tail = buffer::YaapSharedSegmentResolve(ctx.dsa,
+				global.payload->segment_arena_dp, writer.active);
+			global.payload->segment_desc_dp = new_tail->self_dp;
+			global.payload->segment_id = new_tail->segment_id;
+			global.payload->segment_generation = new_tail->generation;
 		}
-		buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
-		auto *new_tail = buffer::YaapSharedSegmentResolve(ctx.dsa,
-			global.payload->segment_arena_dp, writer.active);
-		global.payload->segment_desc_dp = new_tail->self_dp;
-		global.payload->segment_id = new_tail->segment_id;
-		global.payload->segment_generation = new_tail->generation;
-		SpinLockRelease(&global.payload->mutex);
+		PG_CATCH();
+		{
+			LWLockRelease(&global.payload->mutex);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		LWLockRelease(&global.payload->mutex);
 		return SinkCombineResultType::FINISHED;
 	}
 	uint32_t row_idx = 0;
@@ -495,23 +522,42 @@ PhysicalCrossProduct::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		if (PipelineCancelRequested(ctx))
 			return SinkCombineResultType::FINISHED;
 		const uint32_t batch_end = std::min(row_idx + 64u, local_row_count);
-		SpinLockAcquire(&global.payload->mutex);
-		for (; row_idx < batch_end; ++row_idx)
+		LWLockAcquire(&global.payload->mutex, LW_EXCLUSIVE);
+		PG_TRY();
 		{
-			const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
-			while (TdcNeedsGrowForStoredRow(global.right_layout,
-					global.build_rows,
-					local.build_rows,
-					src_row))
-				global.build_rows = GrowTdcCopyRows(ctx, global.right_layout, global.right_layout_dp, global.build_rows, global.build_rows->row_capacity + 1u);
-			uint8_t *dst_row = nullptr;
-			if (TupleDataCollectionAppendRow(global.build_rows, &dst_row) == TDC_INVALID_ROW_INDEX)
-				elog(ERROR, "pg_yaap: cross product global build row capacity exceeded during combine");
-			CopyBuildRow(global.right_layout, local.build_rows, src_row, global.build_rows, dst_row);
+			/* Another completed RUN may have grown the shared TDC. The shared
+			 * root is authoritative, not this task's earlier wrapper snapshot. */
+			global.build_rows = ResolveTdc(ctx.dsa, global.payload->build_rows_dp);
+			for (; row_idx < batch_end; ++row_idx)
+			{
+				const uint8_t *src_row = TupleDataCollectionGetRowConst(local.build_rows, row_idx);
+				while (TdcNeedsGrowForStoredRow(global.right_layout,
+						global.build_rows,
+						local.build_rows,
+						src_row))
+					global.build_rows = GrowTdcCopyRows(ctx, global.right_layout, global.right_layout_dp,
+						global.build_rows, global.build_rows->row_capacity + 1u, &global.payload->build_rows_dp);
+				uint8_t *dst_row = nullptr;
+				if (TupleDataCollectionAppendRow(global.build_rows, &dst_row) == TDC_INVALID_ROW_INDEX)
+					elog(ERROR, "pg_yaap: cross product global build row capacity exceeded during combine");
+				CopyBuildRow(global.right_layout, local.build_rows, src_row, global.build_rows, dst_row);
+			}
 		}
-		SpinLockRelease(&global.payload->mutex);
+		PG_CATCH();
+		{
+			LWLockRelease(&global.payload->mutex);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		LWLockRelease(&global.payload->mutex);
 	}
 	return SinkCombineResultType::FINISHED;
+}
+
+SinkCombineResultType
+PhysicalCrossProduct::FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input)
+{
+	return Combine(ctx, input);
 }
 
 SinkFinalizeType
@@ -607,9 +653,7 @@ PhysicalCrossProduct::GetOperatorState(ExecCtx &ctx)
 void
 PhysicalCrossProduct::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &ctx)
 {
-	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	dsa_pointer payload_dp = shared_payload_dp();
 	CrossProductSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (payload == nullptr)
 		return;
@@ -662,9 +706,7 @@ PhysicalCrossProduct::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &ou
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
-		? shared_payload_dp_
-		: LoadSharedPayloadFromDescriptor(this);
+	dsa_pointer payload_dp = shared_payload_dp();
 	CrossProductSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
 	if (payload == nullptr || !payload->finalized)
 		elog(ERROR, "pg_yaap: cross product probe ran before build/finalize completed");

@@ -197,7 +197,6 @@ All defined in `pg_yaap.c::_PG_init`. All are `PGC_USERSET`.
 | `pg_yaap.parallel` | bool | `on` | **Must be on** for pipeline execution. Off → `initialize_plan` returns false. |
 | `pg_yaap.parallel_max_workers` | int | 4 (0–1024) | Max bgworkers per query. |
 | `pg_yaap.parallel_min_relation_blocks` | int | 1024 (0–INT_MAX) | Min relation size before parallel lowering. |
-| `pg_yaap.parallel_leader_participation` | bool | `on` | Leader runs pipeline tasks alongside workers. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | bool | `off` | Legacy GUC — registered but has no effect. |
 | `pg_yaap.profile` | bool | `off` | Emit per-stage pipeline timing after each query. |
 | `pg_yaap.profile_scan` | enum | `off` | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |
@@ -291,10 +290,6 @@ pg_yaap/
 │           ├── task.cpp
 │           ├── pipeline_worker_main.cpp     # BG worker entry point
 │           ├── pipeline_descriptor.hpp/.cpp
-│           ├── pipeline_run_event.hpp/.cpp
-│           ├── pipeline_combine_event.hpp/.cpp
-│           ├── pipeline_finalize_event.hpp/.cpp
-│           ├── event.hpp/.cpp
 │           ├── meta_pipeline.hpp/.cpp
 │           ├── operator.hpp / source.hpp / sink.hpp
 │           ├── types.hpp / cancel.hpp

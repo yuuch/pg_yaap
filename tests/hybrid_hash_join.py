@@ -158,6 +158,7 @@ def main():
              and c['probe_chains'] > 0 and c['prefetch_calls'] > 0),
         ):
             check_case(tag, profile_query, 4, memory,
+                       # Four workers keep the radix and profile expectations stable.
                        f"SET pg_yaap.profile=on; SET pg_yaap.memory_soft_limit='{soft}'; ", predicate)
         # Both paths retain probe strings: mixed chunks copy those strings
         # into a bounded private arena before downstream resumable output.

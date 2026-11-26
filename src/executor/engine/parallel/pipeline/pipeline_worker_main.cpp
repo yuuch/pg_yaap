@@ -6,6 +6,8 @@ extern "C" {
 #include "postgres.h"
 #include "access/xact.h"
 #include "miscadmin.h"
+#include "libpq/pqsignal.h"
+#include "tcop/tcopprot.h"
 #include "pgstat.h"  // IWYU pragma: keep
 #include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
@@ -19,6 +21,7 @@ extern "C" {
 #include "utils/elog.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/inval.h"
 #include "storage/sharedfileset.h"
 }
 
@@ -36,7 +39,9 @@ extern "C" {
 #include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/pipeline_timeline.hpp"
 #include "parallel/pipeline/task.hpp"
+#include "parallel/pipeline/task_scheduler.hpp"
 #include "parallel/pipeline/types.hpp"
+#include "parallel/pipeline/worker_error.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -52,25 +57,18 @@ WorkerShutdownRequested(PipelineSharedControl *ctl)
 {
 	if (pg_atomic_read_u32(&ctl->shutdown_requested) != 0)
 		return true;
-	if (pg_atomic_read_u32(&ctl->worker_error) != 0)
+	if (WorkerErrorPending(ctl))
 		return true;
 	return ctl->leader_pid != 0 && BackendPidGetProc(ctl->leader_pid) == nullptr;
 }
 
 static void
-ReportWorkerStartupError(PipelineSharedControl *ctl, const char *message)
+ReportWorkerFailure(PipelineSharedControl *ctl, const char *message)
 {
 	if (ctl == nullptr)
 		return;
 
-	uint32 expected = 0;
-	if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
-	{
-		snprintf(ctl->worker_error_msg,
-		         PIPELINE_WORKER_ERROR_MSG_LEN,
-		         "%s",
-		         message != nullptr ? message : "(no message)");
-	}
+	ReportWorkerError(ctl, "%s", message != nullptr ? message : "(no message)");
 	pg_atomic_write_u32(&ctl->shutdown_requested, 1u);
 	PGPROC *leader = BackendPidGetProc(ctl->leader_pid);
 	if (leader != nullptr)
@@ -82,6 +80,9 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 {
 	static uint32 wait_event_extension = 0;
 
+	/* Match PostgreSQL parallel workers. Defer termination to an interrupt
+	 * check so DSM teardown cannot start inside an LWLock wait. */
+	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 	before_shmem_exit(pg_yaap_proc_exit_release_jit_contexts, (Datum) 0);
 	dsm_handle handle = DatumGetUInt32(main_arg);
@@ -112,9 +113,18 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 	{
 		BackgroundWorkerInitializeConnectionByOid(ctl->db_oid, InvalidOid, 0);
 		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-
 		dsa_area *dsa = dsa_attach_in_place(dsa_buf, seg);
+		if (!DsaPointerIsValid(ctl->snapshot_root))
+			ereport(ERROR, (errmsg("pg_yaap worker has no serialized leader snapshot")));
+		Snapshot worker_snapshot = RestoreSnapshot(
+			static_cast<char *>(dsa_get_address(dsa, ctl->snapshot_root)));
+		PGPROC *leader_proc = BackendPidGetProc(ctl->leader_pid);
+		if (leader_proc == nullptr)
+			ereport(ERROR, (errmsg("pg_yaap worker could not find leader process for snapshot restore")));
+		RestoreTransactionSnapshot(worker_snapshot, leader_proc);
+		PushActiveSnapshot(worker_snapshot);
+		InvalidateSystemCaches();
+
 		DsmTaskQueue *queue = DsmTaskQueue::AttachInPlace(queue_buf);
 		SharedFileSetAttach(&ctl->spill_fileset, seg);
 
@@ -122,22 +132,6 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 		/* TODO(Step 11c): finalize worker_index handoff via bgw_extra layout. */
 		std::memcpy(&worker_index, MyBgworkerEntry->bgw_extra, sizeof(int32_t));
 		Assert(worker_index >= 0);
-
-		/*
-		 * Publish startup-ready signal for the leader (Oracle race-fix). PGPROC is
-		 * now in ProcArray because BackgroundWorkerInitializeConnectionByOid has
-		 * returned, which internally drove InitPostgres -> InitProcessPhase2.
-		 * BackendPidGetProc(MyProcPid) is therefore safe from this point forward.
-		 */
-		{
-			auto *ready_array = static_cast<pg_atomic_uint32 *>(
-				shm_toc_lookup(toc, PIPELINE_DSM_KEY_WORKER_READY, false));
-			Assert(worker_index < ctl->num_workers);
-			pg_atomic_write_u32(&ready_array[worker_index], 1);
-			PGPROC *leader_proc = BackendPidGetProc(ctl->leader_pid);
-			if (leader_proc != nullptr)
-				SetLatch(&leader_proc->procLatch);
-		}
 
 		MemoryContext worker_mcxt = AllocSetContextCreate(TopMemoryContext,
 		                                                 "pg_yaap worker",
@@ -149,12 +143,8 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 		WorkerTaskRuntime rt;
 		rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index, ctl, INVALID_EVENT_ID};
 		rt.control = ctl;
-		rt.event_shm = static_cast<EventShmState *>(dsa_get_address(dsa, ctl->event_states_root));
 		PipelineProfileRegisterProcess(ctl, dsa, worker_index, MyProcPid);
 		PipelineDsmLookup<Pipeline> lookup(worker_mcxt);
-		rt.pipelines = &lookup;
-		rt.leader_qd = nullptr;
-		rt.final_output = nullptr;
 
 		PgVector<std::unique_ptr<Pipeline>> owned_pipelines{
 			PgMemoryContextAllocator<std::unique_ptr<Pipeline>>(worker_mcxt)};
@@ -162,14 +152,31 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 		for (auto &pipeline : owned_pipelines)
 			lookup.Register(pipeline->id, pipeline.get());
 
+		TaskScheduler scheduler(rt.exec_ctx, *queue, lookup);
+
+		/* A ready worker has a PGPROC and can resolve every pipeline. */
+		auto *ready_array = static_cast<pg_atomic_uint32 *>(
+			shm_toc_lookup(toc, PIPELINE_DSM_KEY_WORKER_READY, false));
+		Assert(worker_index < ctl->num_workers);
+		pg_atomic_write_membarrier_u32(&ready_array[worker_index], 1);
+		SetLatch(&leader_proc->procLatch);
+
 		for (;;)
 		{
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
 			if (WorkerShutdownRequested(ctl))
 				break;
 
+			const bool advanced = scheduler.Advance();
 			TaskDescriptor desc;
-			if (!queue->TryPopForWorker(worker_index, &desc))
+			if (!queue->TryPop(&desc))
 			{
+				/* If the bounded queue was full during the first Advance() and
+				 * just drained before TryPop(), publish pending cursor tasks
+				 * immediately instead of waiting for the Latch timeout. */
+				if (advanced || scheduler.Advance())
+					continue;
 				instr_time wait_start;
 				if (pg_atomic_read_u32(&ctl->profile_enabled) != 0)
 					INSTR_TIME_SET_CURRENT(wait_start);
@@ -190,7 +197,6 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 									  PipelineProfileStage::WORKER_WAIT_TASK,
 									  elapsed);
 				}
-				ResetLatch(MyLatch);
 				if (rc & WL_POSTMASTER_DEATH)
 					break;
 				if (WorkerShutdownRequested(ctl))
@@ -203,17 +209,10 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			Pipeline *pipeline = lookup.Resolve(desc.pipeline_id);
 			if (pipeline == nullptr)
 			{
-				uint32 expected = 0;
-				if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
-				{
-					snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
-					         "pg_yaap worker %d: unknown pipeline_id %u",
-					         worker_index, desc.pipeline_id);
-				}
+				ReportWorkerError(ctl, "pg_yaap worker %d: unknown pipeline_id %u",
+					worker_index, desc.pipeline_id);
 				break;
 			}
-
-			EventShmState *event_shm = &rt.event_shm[desc.event_id];
 
 			std::unique_ptr<Task> task;
 			switch (static_cast<TaskKind>(desc.kind))
@@ -222,62 +221,40 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 					task = std::make_unique<PipelineRunTask>(desc.event_id,
 					                                        pipeline,
 					                                        &rt,
-					                                        desc.worker_index);
+					                                        desc.task_index);
 					break;
 				case TaskKind::COMBINE:
 					task = std::make_unique<PipelineCombineTask>(desc.event_id,
 					                                            pipeline,
 					                                            &rt,
-					                                            desc.worker_index,
+					                                            desc.task_index,
 					                                            desc.partition_id);
 					break;
 				case TaskKind::FINALIZE:
-						if (desc.partition_id == UINT32_MAX)
-						{
-							uint32 expected = 0;
-							if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
-							{
-								snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
-										 "pg_yaap worker %d: received unpartitioned FINALIZE descriptor",
-									 worker_index);
-							}
-							goto cleanup_and_exit;
-						}
-						task = std::make_unique<PipelineFinalizeTask>(desc.event_id,
-							pipeline, &rt, desc.worker_index, desc.partition_id);
-						break;
+					task = std::make_unique<PipelineFinalizeTask>(desc.event_id,
+						pipeline, &rt, desc.task_index, desc.partition_id);
+					break;
 			}
 
 			PG_TRY();
 			{
-				/* Keep the resumable task on its owning worker. Re-enqueueing
-				 * could deadlock when the bounded queue is full, or fail a
-				 * healthy query. Execute checks cancellation each chunk. */
-				while (task->Execute() == TaskExecutionResult::TASK_NOT_FINISHED)
-					CHECK_FOR_INTERRUPTS();
-				uint32 remaining = pg_atomic_sub_fetch_u32(&event_shm->tasks_remaining, 1);
-				if (remaining == 0)
-				{
-					PGPROC *leader = BackendPidGetProc(ctl->leader_pid);
-					if (leader != nullptr)
-						SetLatch(&leader->procLatch);
-				}
+				if (task->Execute() != TaskExecutionResult::TASK_FINISHED)
+					ereport(ERROR, (errmsg("pg_yaap: whole pipeline task did not finish")));
+				CHECK_FOR_INTERRUPTS();
+				if (!WorkerShutdownRequested(ctl))
+					scheduler.CompleteTask(desc.event_id);
 			}
 			PG_CATCH();
 			{
 				ErrorData *edata = CopyErrorData();
 				PipelineTimelineAbortProcess(ctl, dsa, worker_index,
 					edata->sqlerrcode == ERRCODE_QUERY_CANCELED);
-				uint32 expected = 0;
-				if (pg_atomic_compare_exchange_u32(&ctl->worker_error, &expected, 1u))
-				{
-					snprintf(ctl->worker_error_msg, PIPELINE_WORKER_ERROR_MSG_LEN,
-					         "worker=%d kind=%u pipeline=%u partition=%u: %s%s%s",
-					         worker_index, desc.kind, desc.pipeline_id, desc.partition_id,
-					         edata->message ? edata->message : "(no message)",
-					         edata->detail ? " | " : "",
-					         edata->detail ? edata->detail : "");
-				}
+				ReportWorkerError(ctl,
+					"worker=%d kind=%u pipeline=%u partition=%u: %s%s%s",
+					worker_index, desc.kind, desc.pipeline_id, desc.partition_id,
+					edata->message ? edata->message : "(no message)",
+					edata->detail ? " | " : "",
+					edata->detail ? edata->detail : "");
 				FreeErrorData(edata);
 				pg_atomic_write_u32(&ctl->shutdown_requested, 1u);
 				PGPROC *leader = BackendPidGetProc(ctl->leader_pid);
@@ -288,16 +265,17 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			PG_END_TRY();
 		}
 
-cleanup_and_exit:
 		rt.per_pipeline.clear();
 		owned_pipelines.clear();
+		dsa_detach(dsa);
+		dsm_detach(seg);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
 	PG_CATCH();
 	{
 		ErrorData *edata = CopyErrorData();
-		ReportWorkerStartupError(ctl, edata->message);
+		ReportWorkerFailure(ctl, edata->message);
 		FreeErrorData(edata);
 		FlushErrorState();
 		/* Drain the YAAP registry while its ResourceOwner is still alive.

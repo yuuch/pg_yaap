@@ -198,6 +198,18 @@ uint64_t limit_count = 0;
 uint32_t estimated_groups = 0;
 };
 
+struct DelimMaterializeContext {
+ const yaap::PhysicalOperator *outer = nullptr;
+ OptimizerNodeTranslation *translation = nullptr;
+ pipeline::PhysicalMaterialize *producer = nullptr;
+ DelimMaterializeContext *previous = nullptr;
+ inline static thread_local DelimMaterializeContext *current = nullptr;
+ DelimMaterializeContext(const yaap::PhysicalOperator *outer, OptimizerNodeTranslation *translation,
+                         pipeline::PhysicalMaterialize *producer)
+  : outer(outer), translation(translation), producer(producer), previous(current) { current=this; }
+ ~DelimMaterializeContext() { current=previous; }
+};
+
 std::string
 CurrentSupportPath(const SupportContext &ctx);
 

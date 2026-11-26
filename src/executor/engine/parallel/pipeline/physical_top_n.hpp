@@ -2,7 +2,7 @@
 
 extern "C" {
 #include "postgres.h"
-#include "storage/spin.h"
+#include "storage/lwlock.h"
 #include "utils/dsa.h"
 }
 
@@ -19,7 +19,7 @@ struct OpDescriptor;
 
 struct TopNSharedPayload
 {
-	slock_t     mutex;
+	LWLock      mutex;
 	dsa_pointer tdc_dp;
 	dsa_pointer sort_indices_dp;
 	bool        finalized;
@@ -45,6 +45,10 @@ public:
 };
 
 class TopNLocalSinkState final : public LocalSinkState {
+public:
+	TupleDataCollection *local_tdc = nullptr;
+	uint32_t             worst_idx = UINT32_MAX;
+	bool                 use_local = false;
 };
 
 class TopNLocalSourceState final : public LocalSourceState {
@@ -79,6 +83,7 @@ public:
 	std::unique_ptr<GlobalSinkState>   GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState>    GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	SinkResultType                     SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
+	SinkCombineResultType              FinishLocalSink(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
 	SinkCombineResultType              Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
 	SinkFinalizeType                   Finalize(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	bool                               CombineIsTrivial() const override { return true; }

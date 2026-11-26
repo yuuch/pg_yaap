@@ -120,6 +120,8 @@ public:
 	bool IsPipelineBreaker() const override { return true; }
 	int  MaxThreads(ExecCtx &ctx) const override;
 
+	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
+
 	std::unique_ptr<GlobalSinkState>   GetGlobalSinkState(ExecCtx &ctx) override;
 	std::unique_ptr<LocalSinkState>    GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	SinkResultType                     SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input) override;
@@ -156,8 +158,8 @@ public:
 	 * desc_list_ (push_back, never overwrite), and StoreSharedPayloadOnDescriptor
 	 * iterates desc_list_ to publish the shared payload pointer into ALL
 	 * slots — so workers reading from EITHER pipeline's slot see the same
-	 * leader-allocated AHT/TDC. desc_ retains the last-attached slot for
-	 * single-attach Resolve helpers (worker side attaches once → list size 1).
+	 * shared AHT/TDC. Workers attach all aliases and retain their own role
+	 * descriptor as the primary slot for reads.
 	 *
 	 * Without per-slot fan-out, the leader writes to the LAST attach (P2.sink
 	 * slot) but workers running P1.source read from the P1 slot → mismatch →

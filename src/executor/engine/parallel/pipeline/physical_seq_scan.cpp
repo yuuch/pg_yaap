@@ -1,4 +1,5 @@
 #include "parallel/pipeline/physical_seq_scan.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/scan_io_profile.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
@@ -184,13 +185,13 @@ ResolveFilterSteps(dsa_area *dsa, dsa_pointer dp)
 }
 
 static uint32
-ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared)
+ComputeMaxThreadsFromPayload(const SeqScanSharedPayload *shared, const ExecCtx &ctx)
 {
 	if (shared == nullptr || shared->total_blocks == 0)
 		return 1;
 
 	uint32 want = (uint32) std::min<uint64>(shared->total_blocks, (uint64) UINT32_MAX);
-	return (uint32) std::max(1, std::min(pg_yaap_parallel_max_workers, (int) want));
+	return (uint32) std::max(1, std::min(static_cast<int>(ExecutionWorkerCount(ctx)), (int) want));
 }
 
 /*
@@ -1054,22 +1055,12 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 	state->dsa = ctx.dsa;
 	state->desc = desc_;
 
-	/*
-	 * Bug B fix — mirror HashAgg pattern (physical_hash_aggregate.cpp:94-129).
-	 *
-	 * SeqScan ctor receives shared_payload_dp = InvalidDsaPointer from the
-	 * translator. The leader must self-allocate the SeqScanSharedPayload in
-	 * DSA (one per relation, contains the morsel cursor) and publish it back
-	 * through StoreSharedPayloadOnDescriptor so worker pipelines can resolve
-	 * it via LoadSharedPayloadFromDescriptor. PipelineRunEvent::Schedule
-	 * pre-invokes this on the leader before EnqueueTasks (DuckDB-faithful
-	 * Pipeline::ResetSource), so when workers later call this method the
-	 * descriptor is already populated.
-	 */
+	/* Activation publishes the shared block cursor before any RUN task
+	 * attaches its own scan and stream state. */
 	state->shared_payload_dp = DsaPointerIsValid(shared_payload_dp_) ? shared_payload_dp_ :
 		LoadSharedPayloadFromDescriptor(this);
 
-	if (ctx.worker_index == LEADER_WORKER_INDEX && !DsaPointerIsValid(state->shared_payload_dp))
+	if (ctx.initialize_shared_state && !DsaPointerIsValid(state->shared_payload_dp))
 	{
 		Relation rel = relation_open(relid_, AccessShareLock);
 		BlockNumber total = RelationGetNumberOfBlocks(rel);
@@ -1084,7 +1075,9 @@ PhysicalSeqScan::GetGlobalSourceState(ExecCtx &ctx)
 	}
 
 	state->shared = ResolveSeqScanPayload(ctx, state->shared_payload_dp);
-	state->max_threads = ComputeMaxThreadsFromPayload(state->shared);
+	if (state->shared == nullptr)
+		elog(ERROR, "pg_yaap: seq scan shared payload not initialized");
+	state->max_threads = ComputeMaxThreadsFromPayload(state->shared, ctx);
 	return state;
 }
 
@@ -1104,11 +1097,11 @@ PhysicalSeqScan::GetLocalSourceState(ExecCtx &ctx, GlobalSourceState &gstate)
 		0,
 		nullptr,
 		global.shared != nullptr ? (ParallelTableScanDesc) &global.shared->pbscan : nullptr,
-		SO_TYPE_SEQSCAN | SO_ALLOW_PAGEMODE);
+		SO_TYPE_SEQSCAN | SO_ALLOW_PAGEMODE | SO_ALLOW_STRAT);
 	if (local->scan_desc->rs_base.rs_parallel != nullptr)
 		InstallParallelSeqScanReadStream(local->scan_desc, local->rel,
 			local->read_stream_state, ctx.worker_index,
-			ctx.control != nullptr ? ctx.control->num_workers : 1u, SeqScanTraceEnabled(ctx));
+			ExecutionWorkerCount(ctx), SeqScanTraceEnabled(ctx));
 	local->read_stream = local->scan_desc->rs_read_stream;
 	if (local->read_stream == nullptr)
 		elog(ERROR, "pg_yaap: SeqScan failed to initialize read stream");
@@ -1523,7 +1516,7 @@ PhysicalSeqScan::MaxThreads(ExecCtx &ctx) const
 		? shared_payload_dp_
 		: LoadSharedPayloadFromDescriptor(this);
 	SeqScanSharedPayload *shared = ResolveSeqScanPayload(ctx, dp);
-	return (int) ComputeMaxThreadsFromPayload(shared);
+	return (int) ComputeMaxThreadsFromPayload(shared, ctx);
 }
 
 }  /* namespace pipeline */

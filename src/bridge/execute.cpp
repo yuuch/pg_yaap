@@ -186,11 +186,21 @@ pg_yaap_execute_query(QueryDesc *queryDesc, PgYaapQueryState *state_ptr,
 	auto *state = reinterpret_cast<pg_yaap::PgYaapQueryState *>(state_ptr);
 	const char *failure_reason = nullptr;
 
-	(void) direction;
-	(void) count;
-
 	if (state == nullptr)
 		return false;
+	if (direction == NoMovementScanDirection)
+		return true;
+	if (direction != ForwardScanDirection)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_yaap: only forward scan direction is supported")));
+	if (count > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_yaap: bounded or incremental portal fetch (count=" UINT64_FORMAT ") is not supported",
+						count)));
+	if (state->executed)
+		return true;
 	if (state->parallel_scheduler == nullptr)
 		ereport(ERROR,
 				(errmsg("pg_yaap: executor state is registered without a scheduler")));
@@ -206,6 +216,7 @@ pg_yaap_execute_query(QueryDesc *queryDesc, PgYaapQueryState *state_ptr,
 				(errmsg("pg_yaap: optimizer pipeline execution failed: %s",
 						failure_reason != nullptr ? failure_reason : "no reason recorded")));
 	}
+	state->executed = true;
 
 	if (pg_yaap_trace_execution_path)
 		elog(LOG, "pg_yaap_path: path=pipeline detail=yaap_pipeline");

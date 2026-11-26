@@ -41,6 +41,15 @@ struct OperatorSinkCombineInput {
 	uint32_t         partition_id = UINT32_MAX;
 };
 
+/* Leader-side stage expansion. Every task consumes shared state and may be
+ * claimed by any executor. A zero-task stage is already finished by RUN-local
+ * publication. */
+struct SinkTaskPlan {
+	uint32_t task_count;
+	uint32_t worker_count;
+	bool partitioned;
+};
+
 class Sink {
 public:
 	virtual ~Sink() = default;
@@ -58,13 +67,12 @@ public:
 	virtual SinkCombineResultType
 	Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) = 0;
 
-	/* Leader-only. Returning NO_OUTPUT_POSSIBLE cancels dependent pipelines. */
+	/* Runs after all COMBINE tasks have published their shared state. */
 	virtual SinkFinalizeType
 	Finalize(ExecCtx &ctx, GlobalSinkState &gstate) = 0;
 
 	virtual bool ParallelSink() const { return true; }
 	virtual bool CombineIsTrivial() const { return false; }
-	virtual bool FinalizeIsTrivial() const { return false; }
 };
 
 }  /* namespace pipeline */

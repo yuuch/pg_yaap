@@ -8,8 +8,6 @@ extern "C" {
 #include "utils/dsa.h"
 }
 
-#include <vector>
-
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
@@ -71,7 +69,6 @@ public:
 	           uint16_t n_final_sort_keys,
 	           dsa_pointer shared_payload_dp,
 	           uint32_t tdc_max_rows,
-	           std::vector<SortKeyDesc> final_sort_keys = {},
 	           uint64 max_emit_rows = 0,
 	           OpDescriptor *desc = nullptr)
 		: PhysicalOperator(PhysicalOperatorType::OUTPUT)
@@ -84,7 +81,6 @@ public:
 		, n_final_sort_keys_(n_final_sort_keys)
 		, shared_payload_dp_(shared_payload_dp)
 		, tdc_max_rows_(tdc_max_rows)
-		, final_sort_keys_(std::move(final_sort_keys))
 		, max_emit_rows_(max_emit_rows)
 		, desc_(desc)
 	{}
@@ -109,7 +105,6 @@ public:
 		, n_final_sort_keys_(n_final_sort_keys)
 		, shared_payload_dp_(shared_payload_dp)
 		, tdc_max_rows_(tdc_max_rows)
-		, final_sort_keys_()
 		, max_emit_rows_(max_emit_rows)
 		, desc_(desc)
 	{}
@@ -136,7 +131,6 @@ public:
 	SinkCombineResultType            Combine(ExecCtx &ctx, OperatorSinkCombineInput &input) override;
 	SinkFinalizeType                 Finalize(ExecCtx &ctx, GlobalSinkState &gstate) override;
 	bool                             CombineIsTrivial() const override { return true; }
-	bool                             FinalizeIsTrivial() const override { return true; }
 
 	/* Leader-only post-FINALIZE drain. Walks shared TDC → encodes columns
 	 * via input_schema → forwards to dest_. No-op when dest_ is nullptr. */
@@ -164,7 +158,6 @@ private:
 	uint16_t      n_final_sort_keys_;
 	dsa_pointer   shared_payload_dp_;
 	uint32_t      tdc_max_rows_;
-	std::vector<SortKeyDesc> final_sort_keys_;
 	uint64        max_emit_rows_;
 	OpDescriptor *desc_;
 	PgVector<OpDescriptor *> desc_list_;

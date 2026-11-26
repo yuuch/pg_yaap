@@ -11,6 +11,7 @@ extern "C" {
 
 #include "core/data_chunk.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
+#include "parallel/pipeline/execution_slots.hpp"
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
@@ -116,9 +117,7 @@ buffer::YaapBufferSharedState *Budget(ExecCtx &ctx) {
 		dsa_get_address(ctx.dsa, ctx.control->buffer_state_root));
 }
 HashJoinSharedPayload *BuildPayload(ExecCtx &ctx, PhysicalHashJoin &join) {
-	dsa_pointer dp = join.shared_payload_dp();
-	if (!DsaPointerIsValid(dp) && join.desc() != nullptr)
-		dp = join.desc()->body.hash_join.shared_payload;
+	const dsa_pointer dp = join.shared_payload_dp();
 	return DsaPointerIsValid(dp) ? static_cast<HashJoinSharedPayload *>(dsa_get_address(ctx.dsa, dp)) : nullptr;
 }
 ProbePayload *Payload(ExecCtx &ctx, const PhysicalHashJoinProbe &op) {
@@ -687,7 +686,7 @@ void PrepareBatch(ExecCtx &ctx, PhysicalHashJoinProbe &op, HybridProbeState &sta
 	auto *batch = static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, dp));
 	auto *segments = batch->segment_count ? static_cast<HashJoinBatchSegment *>(dsa_get_address(ctx.dsa, batch->segments_dp)) : nullptr;
 	/* All key and value segments are pinned before any table entry is built. */
-	const uint32_t worker = ctx.worker_index < 0 ? p->participants - 1 : static_cast<uint32_t>(ctx.worker_index);
+	const uint32_t worker = ctx.task_index;
 	const uint32_t start = batch->segment_count ? static_cast<uint64_t>(batch->segment_count) * worker / p->participants : 0;
 	{
 		PipelineProfileScope pin(ctx, PipelineProfileStage::HASH_JOIN_BATCH_PIN);
@@ -822,11 +821,11 @@ std::unique_ptr<GlobalSinkState> PhysicalHashJoinProbe::GetGlobalSinkState(ExecC
 	if (!global->build->direct_segmented_build || global->build->build_partition_count <= 1)
 		elog(ERROR, "pg_yaap: partition probe requires a radix-segmented equality-key build");
 	global->payload = Payload(ctx, *this);
-	if (global->payload == nullptr && ctx.worker_index == LEADER_WORKER_INDEX) {
+	if (global->payload == nullptr && ctx.initialize_shared_state) {
 		dsa_pointer dp = dsa_allocate0(ctx.dsa, sizeof(ProbePayload));
 		auto *p = static_cast<ProbePayload *>(dsa_get_address(ctx.dsa, dp));
 		SpinLockInit(&p->mutex);
-		p->slots = ctx.control->num_workers + 1;
+		p->slots = ExecutionWorkerCount(ctx);
 		p->partitions = global->build->build_partition_count;
 		const uint64_t tail_page_budget = Budget(ctx)->hard_limit /
 			(static_cast<uint64_t>(p->slots) * p->partitions * 8u);
@@ -859,7 +858,7 @@ std::unique_ptr<LocalSinkState> PhysicalHashJoinProbe::GetLocalSinkState(ExecCtx
 	local->writers = PgVector<buffer::YaapSegmentedTdc>(global.payload->partitions,
 		buffer::YaapSegmentedTdc{}, PgMemoryContextAllocator<buffer::YaapSegmentedTdc>(ctx.mcxt));
 	local->last_used = PgVector<uint64_t>(global.payload->partitions, 0, PgMemoryContextAllocator<uint64_t>(ctx.mcxt));
-	local->slot = ctx.worker_index < 0 ? global.payload->slots - 1 : ctx.worker_index;
+	local->slot = ExecutionTaskSlot(ctx);
 	return local;
 }
 
@@ -1034,8 +1033,7 @@ SourceResultType PhysicalHashJoinProbe::GetData(ExecCtx &ctx, PipelineChunk &out
 	if (!HybridLive(ctx, global.payload))
 		return SourceResultType::FINISHED;
 	if (!local.unmatched_scan_initialized) {
-		const uint32_t worker = ctx.worker_index < 0
-			? global.payload->participants - 1 : static_cast<uint32_t>(ctx.worker_index);
+		const uint32_t worker = ctx.task_index;
 		local.unmatched_cursor = static_cast<uint64_t>(batch->row_count) * worker /
 			global.payload->participants;
 		local.unmatched_end = static_cast<uint64_t>(batch->row_count) * (worker + 1) /
@@ -1222,8 +1220,7 @@ OperatorResultType PhysicalHashJoinProbe::FinalExecute(ExecCtx &ctx, PipelineChu
 			if (HashJoinScansBuildResults(join_->join_mode())) {
 				auto *batch = DsaPointerIsValid(p->initial_batch_dp)
 					? static_cast<HashJoinBatch *>(dsa_get_address(ctx.dsa, p->initial_batch_dp)) : nullptr;
-				const uint32_t worker = ctx.worker_index < 0 ? p->participants - 1
-					: static_cast<uint32_t>(ctx.worker_index);
+				const uint32_t worker = ctx.task_index;
 				const uint32_t rows = batch != nullptr ? batch->row_count : 0;
 				state.initial_unmatched_cursor = static_cast<uint64_t>(rows) * worker / p->participants;
 				state.initial_unmatched_end = static_cast<uint64_t>(rows) * (worker + 1) / p->participants;
@@ -1356,7 +1353,7 @@ void PhysicalHashJoinProbe::ReleaseAfterConsumerRun(ExecCtx &ctx) {
 	p->arena_dp = InvalidDsaPointer;
 	join_->ReleaseBuildPayloadAfterConsumerRun(ctx);
 	/* Keep the small descriptor/layout metadata until query DSA teardown:
-	 * leader FINALIZE can reconstruct this source's GlobalState after RUN. */
+	 * FINALIZE can reconstruct this source's GlobalState after RUN. */
 }
 
 } // namespace pipeline

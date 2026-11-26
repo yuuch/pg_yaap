@@ -1,0 +1,929 @@
+diff --git a/src/backend/storage/aio/aio.c b/src/backend/storage/aio/aio.c
+index e64afe68b2b..006c1f8f527 100644
+--- a/src/backend/storage/aio/aio.c
++++ b/src/backend/storage/aio/aio.c
+@@ -219,8 +219,11 @@ pgaio_io_acquire_nb(struct ResourceOwnerData *resowner, PgAioReturn *ret)
+ 		if (resowner)
+ 			pgaio_io_resowner_register(ioh, resowner);
+ 
++		/* Never inherit timing from a recycled handle or return slot. */
++		ioh->timing.enabled = false;
+ 		if (ret)
+ 		{
++			ret->timing.enabled = false;
+ 			ioh->report_return = ret;
+ 			ret->result.status = PGAIO_RS_UNKNOWN;
+ 		}
+@@ -231,6 +234,15 @@ pgaio_io_acquire_nb(struct ResourceOwnerData *resowner, PgAioReturn *ret)
+ 	return ioh;
+ }
+ 
++/* Must be enabled before the handle is staged and becomes cross-process. */
++void
++pgaio_io_enable_read_timing(PgAioHandle *ioh)
++{
++	Assert(ioh->state == PGAIO_HS_HANDED_OUT);
++	memset(&ioh->timing, 0, sizeof(ioh->timing));
++	ioh->timing.enabled = true;
++}
++
+ /*
+  * Release IO handle that turned out to not be required.
+  *
+@@ -472,6 +484,8 @@ pgaio_io_stage(PgAioHandle *ioh, PgAioOp op)
+ 	}
+ 	else
+ 	{
++		if (ioh->timing.enabled)
++			ioh->timing.execution = PGAIO_TIMING_FORCED_SYNC;
+ 		pgaio_io_prepare_submit(ioh);
+ 		pgaio_io_perform_synchronously(ioh);
+ 	}
+@@ -537,8 +551,13 @@ pgaio_io_process_completion(PgAioHandle *ioh, int result)
+ 
+ 	INJECTION_POINT("aio-process-completion-before-shared", ioh);
+ 
++	if (ioh->timing.enabled)
++		ioh->timing.shared_begin_ns = pgaio_timing_now_ns();
+ 	pgaio_io_call_complete_shared(ioh);
++	if (ioh->timing.enabled)
++		ioh->timing.shared_end_ns = pgaio_timing_now_ns();
+ 
++	/* Publish all timing before the owner can reclaim this handle. */
+ 	pgaio_io_update_state(ioh, PGAIO_HS_COMPLETED_SHARED);
+ 
+ 	/* condition variable broadcast ensures state is visible before wakeup */
+@@ -697,6 +716,33 @@ pgaio_io_reclaim(PgAioHandle *ioh)
+ 		{
+ 			ioh->report_return->result = local_result;
+ 			ioh->report_return->target_data = ioh->target_data;
++			if (ioh->timing.enabled)
++			{
++				const PgAioHandleTiming *t = &ioh->timing;
++				PgAioReadTiming *r = &ioh->report_return->timing;
++
++				memset(r, 0, sizeof(*r));
++				r->enabled = true;
++				r->executor_pid = t->executor_pid;
++				r->requests = 1;
++				r->requested_bytes = t->requested_bytes;
++				r->completed_bytes = t->completed_bytes;
++				r->queued_requests = t->enqueue_ns != 0;
++				r->worker_requests = t->execution == PGAIO_TIMING_WORKER;
++				r->queue_full_sync_requests = t->execution == PGAIO_TIMING_QUEUE_FULL_SYNC;
++				r->forced_sync_requests = t->execution == PGAIO_TIMING_FORCED_SYNC;
++				r->unclassified_requests = t->execution == PGAIO_TIMING_UNCLASSIFIED;
++				r->failed_requests = local_result.status == PGAIO_RS_ERROR;
++				r->timed_read_requests = t->read_observed;
++				if (t->enqueue_ns && t->dequeue_ns >= t->enqueue_ns)
++					r->queue_ns = t->dequeue_ns - t->enqueue_ns;
++				r->reopen_ns = t->reopen_ns;
++				if (t->read_observed)
++					r->read_ns = t->read_end_ns - t->read_begin_ns;
++				r->shared_complete_ns = t->shared_end_ns - t->shared_begin_ns;
++				if (t->enqueue_ns && t->shared_end_ns >= t->enqueue_ns)
++					r->enqueue_to_shared_ns = t->shared_end_ns - t->enqueue_ns;
++			}
+ 		}
+ 	}
+ 
+diff --git a/src/backend/storage/aio/aio_io.c b/src/backend/storage/aio/aio_io.c
+index 7d11d40284a..cc42e772524 100644
+--- a/src/backend/storage/aio/aio_io.c
++++ b/src/backend/storage/aio/aio_io.c
+@@ -116,6 +116,7 @@ void
+ pgaio_io_perform_synchronously(PgAioHandle *ioh)
+ {
+ 	ssize_t		result = 0;
++	int			save_errno = 0;
+ 	struct iovec *iov = &pgaio_ctl->iovecs[ioh->iovec_off];
+ 
+ 	START_CRIT_SECTION();
+@@ -125,9 +126,24 @@ pgaio_io_perform_synchronously(PgAioHandle *ioh)
+ 	{
+ 		case PGAIO_OP_READV:
+ 			pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_READ);
++			if (ioh->timing.enabled)
++			{
++				for (int i = 0; i < ioh->op_data.read.iov_length; i++)
++					ioh->timing.requested_bytes += iov[i].iov_len;
++				ioh->timing.executor_pid = MyProcPid;
++				ioh->timing.read_begin_ns = pgaio_timing_now_ns();
++			}
+ 			result = pg_preadv(ioh->op_data.read.fd, iov,
+ 							   ioh->op_data.read.iov_length,
+ 							   ioh->op_data.read.offset);
++			/* A clock read may modify errno: preserve the syscall's first. */
++			save_errno = errno;
++			if (ioh->timing.enabled)
++			{
++				ioh->timing.read_end_ns = pgaio_timing_now_ns();
++				ioh->timing.read_observed = true;
++				ioh->timing.completed_bytes = result > 0 ? result : 0;
++			}
+ 			pgstat_report_wait_end();
+ 			break;
+ 		case PGAIO_OP_WRITEV:
+@@ -135,13 +151,14 @@ pgaio_io_perform_synchronously(PgAioHandle *ioh)
+ 			result = pg_pwritev(ioh->op_data.write.fd, iov,
+ 								ioh->op_data.write.iov_length,
+ 								ioh->op_data.write.offset);
++			save_errno = errno;
+ 			pgstat_report_wait_end();
+ 			break;
+ 		case PGAIO_OP_INVALID:
+ 			elog(ERROR, "trying to execute invalid IO operation");
+ 	}
+ 
+-	ioh->result = result < 0 ? -errno : result;
++	ioh->result = result < 0 ? -save_errno : result;
+ 
+ 	pgaio_io_process_completion(ioh, ioh->result);
+ 
+diff --git a/src/backend/storage/aio/method_worker.c b/src/backend/storage/aio/method_worker.c
+index b5ac073a910..19e935cafba 100644
+--- a/src/backend/storage/aio/method_worker.c
++++ b/src/backend/storage/aio/method_worker.c
+@@ -194,6 +194,8 @@ pgaio_worker_submission_queue_insert(PgAioHandle *ioh)
+ 
+ 	queue->sqes[queue->head] = pgaio_io_get_id(ioh);
+ 	queue->head = new_head;
++	if (ioh->timing.enabled)
++		ioh->timing.enqueue_ns = pgaio_timing_now_ns();
+ 
+ 	return true;
+ }
+@@ -210,6 +212,13 @@ pgaio_worker_submission_queue_consume(void)
+ 
+ 	result = queue->sqes[queue->tail];
+ 	queue->tail = (queue->tail + 1) & (queue->size - 1);
++	if (pgaio_ctl->io_handles[result].timing.enabled)
++	{
++		PgAioHandleTiming *t = &pgaio_ctl->io_handles[result].timing;
++
++		t->dequeue_ns = pgaio_timing_now_ns();
++		t->execution = PGAIO_TIMING_WORKER;
++	}
+ 
+ 	return result;
+ }
+@@ -260,6 +269,8 @@ pgaio_worker_submit_internal(int num_staged_ios, PgAioHandle **staged_ios)
+ 			 * We'll do it synchronously, but only after we've sent as many as
+ 			 * we can to workers, to maximize concurrency.
+ 			 */
++			if (staged_ios[i]->timing.enabled)
++				staged_ios[i]->timing.execution = PGAIO_TIMING_QUEUE_FULL_SYNC;
+ 			synchronous_ios[nsync++] = staged_ios[i];
+ 			continue;
+ 		}
+@@ -527,7 +538,15 @@ IoWorkerMain(const void *startup_data, size_t startup_data_len)
+ 			 * There's not really a good errno we can report here.
+ 			 */
+ 			error_errno = ENOENT;
+-			pgaio_io_reopen(ioh);
++			if (ioh->timing.enabled)
++			{
++				uint64 begin = pgaio_timing_now_ns();
++
++				pgaio_io_reopen(ioh);
++				ioh->timing.reopen_ns = pgaio_timing_now_ns() - begin;
++			}
++			else
++				pgaio_io_reopen(ioh);
+ 
+ 			/*
+ 			 * To be able to exercise the reopen-fails path, allow injection
+diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
+index 6ba5e207534..ca6075d677d 100644
+--- a/src/backend/storage/buffer/bufmgr.c
++++ b/src/backend/storage/buffer/bufmgr.c
+@@ -529,10 +529,12 @@ static inline BufferDesc *BufferAlloc(SMgrRelation smgr,
+ 									  ForkNumber forkNum,
+ 									  BlockNumber blockNum,
+ 									  BufferAccessStrategy strategy,
+-									  bool *foundPtr, IOContext io_context);
++									  bool *foundPtr, IOContext io_context,
++									  PgReadBufferProfile *profile);
+ static bool AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress);
+ static void CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete);
+-static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
++static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context,
++							  PgReadBufferProfile *profile);
+ static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
+ 						IOObject io_object, IOContext io_context);
+ static void FindAndDropRelationBuffers(RelFileLocator rlocator,
+@@ -1113,7 +1115,7 @@ PinBufferForBlock(Relation rel,
+ 				  ForkNumber forkNum,
+ 				  BlockNumber blockNum,
+ 				  BufferAccessStrategy strategy,
+-				  bool *foundPtr)
++				  bool *foundPtr, PgReadBufferProfile *profile)
+ {
+ 	BufferDesc *bufHdr;
+ 	IOContext	io_context;
+@@ -1151,8 +1153,16 @@ PinBufferForBlock(Relation rel,
+ 	}
+ 	else
+ 	{
++		uint64 begin = BufferProfileNow(profile);
++
++		if (profile) {
++			++profile->alloc_calls;
++			if (profile->sampled) ++profile->sampled_pages;
++		}
+ 		bufHdr = BufferAlloc(smgr, persistence, forkNum, blockNum,
+-							 strategy, foundPtr, io_context);
++							 strategy, foundPtr, io_context, profile);
++		if (profile && profile->sampled)
++			profile->alloc_total_ns += BufferProfileNow(profile) - begin;
+ 		if (*foundPtr)
+ 			pgBufferUsage.shared_blks_hit++;
+ 	}
+@@ -1231,7 +1241,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
+ 		bool		found;
+ 
+ 		buffer = PinBufferForBlock(rel, smgr, persistence,
+-								   forkNum, blockNum, strategy, &found);
++								   forkNum, blockNum, strategy, &found, NULL);
+ 		ZeroAndLockBuffer(buffer, mode, found);
+ 		return buffer;
+ 	}
+@@ -1270,6 +1280,27 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
+ 	int			maxcombine = 0;
+ 	bool		did_start_io;
+ 
++	operation->flags = flags;
++	if (flags & READ_BUFFERS_PROFILE_BUFFER)
++	{
++		static uint64 rng = 0;
++		PgReadBufferProfile *profile = &operation->buffer_profile;
++
++		if (!rng) rng = ((uint64) MyProcPid << 32) ^ UINT64CONST(0x9e3779b97f4a7c15);
++		rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
++		memset(profile, 0, sizeof(*profile));
++		profile->enabled = operation->persistence != RELPERSISTENCE_TEMP;
++		profile->sampled = ((rng * UINT64CONST(2685821657736338717)) >> 58) == 0;
++		profile->sampled = profile->sampled && profile->enabled;
++		profile->profiled_start_calls = profile->enabled;
++		profile->sampled_start_calls = profile->sampled;
++	}
++	if (flags & READ_BUFFERS_PROFILE_TIMING)
++	{
++		memset(&operation->io_timing, 0, sizeof(operation->io_timing));
++		operation->io_timing.enabled = true;
++	}
++
+ 	Assert(*nblocks == 1 || allow_forwarding);
+ 	Assert(*nblocks > 0);
+ 	Assert(*nblocks <= MAX_IO_COMBINE_LIMIT);
+@@ -1322,7 +1353,9 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
+ 										   operation->forknum,
+ 										   blockNum + i,
+ 										   operation->strategy,
+-										   &found);
++										   &found,
++										   (flags & READ_BUFFERS_PROFILE_BUFFER) && operation->buffer_profile.enabled ?
++										   &operation->buffer_profile : NULL);
+ 		}
+ 
+ 		if (found)
+@@ -1599,6 +1632,34 @@ ProcessReadBuffersResult(ReadBuffersOperation *operation)
+ 	Assert(pgaio_wref_valid(&operation->io_wref));
+ 	Assert(aio_ret->result.status != PGAIO_RS_UNKNOWN);
+ 
++	if ((operation->flags & READ_BUFFERS_PROFILE_TIMING) && aio_ret->timing.enabled)
++	{
++		/* A partial operation can be executed by different worker processes. */
++		if (operation->io_timing.requests == 0)
++			operation->io_timing.executor_pid = aio_ret->timing.executor_pid;
++		else if (operation->io_timing.executor_pid != aio_ret->timing.executor_pid)
++			operation->io_timing.mixed_executors = true;
++		if (operation->io_timing.mixed_executors)
++			operation->io_timing.executor_pid = 0;
++#define ADD_TIMING(field) operation->io_timing.field += aio_ret->timing.field
++		ADD_TIMING(requests);
++		ADD_TIMING(requested_bytes);
++		ADD_TIMING(completed_bytes);
++		ADD_TIMING(queued_requests);
++		ADD_TIMING(worker_requests);
++		ADD_TIMING(queue_full_sync_requests);
++		ADD_TIMING(forced_sync_requests);
++		ADD_TIMING(queue_ns);
++		ADD_TIMING(reopen_ns);
++		ADD_TIMING(read_ns);
++		ADD_TIMING(shared_complete_ns);
++		ADD_TIMING(enqueue_to_shared_ns);
++		ADD_TIMING(timed_read_requests);
++		ADD_TIMING(failed_requests);
++		ADD_TIMING(unclassified_requests);
++#undef ADD_TIMING
++	}
++
+ 	/*
+ 	 * SMGR reports the number of blocks successfully read as the result of
+ 	 * the IO operation. Thus we can simply add that to ->nblocks_done.
+@@ -1628,6 +1689,24 @@ ProcessReadBuffersResult(ReadBuffersOperation *operation)
+ 	Assert(operation->nblocks_done <= operation->nblocks);
+ }
+ 
++const PgReadBufferProfile *
++ReadBuffersGetBufferProfile(const ReadBuffersOperation *operation)
++{
++	return (operation->flags & READ_BUFFERS_PROFILE_BUFFER)
++		? &operation->buffer_profile : NULL;
++}
++
++/*
++ * Stable owner-local result; never exposes a recycled shared handle. Call after
++ * StartReadBuffers returned false, or after successful WaitReadBuffers.
++ */
++const PgAioReadTiming *
++ReadBuffersGetTiming(const ReadBuffersOperation *operation)
++{
++	return (operation->flags & READ_BUFFERS_PROFILE_TIMING)
++		? &operation->io_timing : NULL;
++}
++
+ void
+ WaitReadBuffers(ReadBuffersOperation *operation)
+ {
+@@ -1852,6 +1931,9 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
+ 		ioh = pgaio_io_acquire(CurrentResourceOwner, &operation->io_return);
+ 	}
+ 
++	if (flags & READ_BUFFERS_PROFILE_TIMING)
++		pgaio_io_enable_read_timing(ioh);
++
+ 	/*
+ 	 * Check if we can start IO on the first to-be-read buffer.
+ 	 *
+@@ -1937,7 +2019,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
+ 									persistence == RELPERSISTENCE_TEMP ?
+ 									PGAIO_HCB_LOCAL_BUFFER_READV :
+ 									PGAIO_HCB_SHARED_BUFFER_READV,
+-									flags);
++									flags & ~(READ_BUFFERS_PROFILE_TIMING | READ_BUFFERS_PROFILE_BUFFER));
+ 
+ 		pgaio_io_set_flag(ioh, ioh_flags);
+ 
+@@ -2000,7 +2082,7 @@ static pg_attribute_always_inline BufferDesc *
+ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 			BlockNumber blockNum,
+ 			BufferAccessStrategy strategy,
+-			bool *foundPtr, IOContext io_context)
++			bool *foundPtr, IOContext io_context, PgReadBufferProfile *profile)
+ {
+ 	BufferTag	newTag;			/* identity of requested block */
+ 	uint32		newHash;		/* hash value for newTag */
+@@ -2009,6 +2091,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 	Buffer		victim_buffer;
+ 	BufferDesc *victim_buf_hdr;
+ 	uint32		victim_buf_state;
++	uint64		phase_begin;
+ 
+ 	/* Make sure we will have room to remember the buffer pin */
+ 	ResourceOwnerEnlarge(CurrentResourceOwner);
+@@ -2022,8 +2105,17 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 	newPartitionLock = BufMappingPartitionLock(newHash);
+ 
+ 	/* see if the block is in the buffer pool already */
++	phase_begin = BufferProfileNow(profile);
+ 	LWLockAcquire(newPartitionLock, LW_SHARED);
++	if (profile && profile->sampled)
++		profile->mapping_lock_ns += BufferProfileNow(profile) - phase_begin;
++	phase_begin = BufferProfileNow(profile);
+ 	existing_buf_id = BufTableLookup(&newTag, newHash);
++	if (profile) {
++		if (existing_buf_id >= 0) ++profile->lookup_hits;
++		else ++profile->lookup_misses;
++		if (profile->sampled) profile->lookup_ns += BufferProfileNow(profile) - phase_begin;
++	}
+ 	if (existing_buf_id >= 0)
+ 	{
+ 		BufferDesc *buf;
+@@ -2036,7 +2128,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 		 */
+ 		buf = GetBufferDescriptor(existing_buf_id);
+ 
++		phase_begin = BufferProfileNow(profile);
+ 		valid = PinBuffer(buf, strategy);
++		if (profile && profile->sampled)
++			profile->pin_ns += BufferProfileNow(profile) - phase_begin;
+ 
+ 		/* Can release the mapping lock as soon as we've pinned it */
+ 		LWLockRelease(newPartitionLock);
+@@ -2067,7 +2162,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 	 * don't hold any conflicting locks. If so we'll have to undo our work
+ 	 * later.
+ 	 */
+-	victim_buffer = GetVictimBuffer(strategy, io_context);
++	phase_begin = BufferProfileNow(profile);
++	victim_buffer = GetVictimBuffer(strategy, io_context, profile);
++	if (profile && profile->sampled)
++		profile->victim_ns += BufferProfileNow(profile) - phase_begin;
+ 	victim_buf_hdr = GetBufferDescriptor(victim_buffer - 1);
+ 
+ 	/*
+@@ -2075,7 +2173,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 	 * somebody else inserted another buffer for the tag, we'll release the
+ 	 * victim buffer we acquired and use the already inserted one.
+ 	 */
++	phase_begin = BufferProfileNow(profile);
+ 	LWLockAcquire(newPartitionLock, LW_EXCLUSIVE);
++	if (profile && profile->sampled)
++		profile->mapping_lock_ns += BufferProfileNow(profile) - phase_begin;
+ 	existing_buf_id = BufTableInsert(&newTag, newHash, victim_buf_hdr->buf_id);
+ 	if (existing_buf_id >= 0)
+ 	{
+@@ -2104,7 +2205,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 
+ 		existing_buf_hdr = GetBufferDescriptor(existing_buf_id);
+ 
++		phase_begin = BufferProfileNow(profile);
+ 		valid = PinBuffer(existing_buf_hdr, strategy);
++		if (profile && profile->sampled)
++			profile->pin_ns += BufferProfileNow(profile) - phase_begin;
+ 
+ 		/* Can release the mapping lock as soon as we've pinned it */
+ 		LWLockRelease(newPartitionLock);
+@@ -2274,12 +2378,13 @@ retry:
+  * pinned by this backend and marked as invalid, false otherwise.
+  */
+ static bool
+-InvalidateVictimBuffer(BufferDesc *buf_hdr)
++InvalidateVictimBuffer(BufferDesc *buf_hdr, PgReadBufferProfile *profile)
+ {
+ 	uint32		buf_state;
+ 	uint32		hash;
+ 	LWLock	   *partition_lock;
+ 	BufferTag	tag;
++	uint64		lock_begin;
+ 
+ 	Assert(GetPrivateRefCount(BufferDescriptorGetBuffer(buf_hdr)) == 1);
+ 
+@@ -2289,7 +2394,10 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
+ 	hash = BufTableHashCode(&tag);
+ 	partition_lock = BufMappingPartitionLock(hash);
+ 
++	lock_begin = BufferProfileNow(profile);
+ 	LWLockAcquire(partition_lock, LW_EXCLUSIVE);
++	if (profile && profile->sampled)
++		profile->mapping_lock_ns += BufferProfileNow(profile) - lock_begin;
+ 
+ 	/* lock the buffer header */
+ 	buf_state = LockBufHdr(buf_hdr);
+@@ -2342,12 +2450,14 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
+ }
+ 
+ static Buffer
+-GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
++GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context,
++				PgReadBufferProfile *profile)
+ {
+ 	BufferDesc *buf_hdr;
+ 	Buffer		buf;
+ 	uint32		buf_state;
+ 	bool		from_ring;
++	uint64		phase_begin;
+ 
+ 	/*
+ 	 * Ensure, while the spinlock's not yet held, that there's a free refcount
+@@ -2363,13 +2473,19 @@ again:
+ 	 * Select a victim buffer.  The buffer is returned with its header
+ 	 * spinlock still held!
+ 	 */
+-	buf_hdr = StrategyGetBuffer(strategy, &buf_state, &from_ring);
++	phase_begin = BufferProfileNow(profile);
++	buf_hdr = StrategyGetBufferWithProfile(strategy, &buf_state, &from_ring, profile);
++	if (profile && profile->sampled)
++		profile->strategy_ns += BufferProfileNow(profile) - phase_begin;
+ 	buf = BufferDescriptorGetBuffer(buf_hdr);
+ 
+ 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
+ 
+ 	/* Pin the buffer and then release the buffer spinlock */
++	phase_begin = BufferProfileNow(profile);
+ 	PinBuffer_Locked(buf_hdr);
++	if (profile && profile->sampled)
++		profile->pin_ns += BufferProfileNow(profile) - phase_begin;
+ 
+ 	/*
+ 	 * We shouldn't have any other pins for this buffer.
+@@ -2412,6 +2528,7 @@ again:
+ 			 * to get another one.
+ 			 */
+ 			UnpinBuffer(buf_hdr);
++			if (profile) ++profile->victim_retries;
+ 			goto again;
+ 		}
+ 
+@@ -2436,12 +2553,17 @@ again:
+ 			{
+ 				LWLockRelease(content_lock);
+ 				UnpinBuffer(buf_hdr);
++				if (profile) ++profile->victim_retries;
+ 				goto again;
+ 			}
+ 		}
+ 
+ 		/* OK, do the I/O */
++		if (profile) ++profile->dirty_writebacks;
++		phase_begin = BufferProfileNow(profile);
+ 		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
++		if (profile && profile->sampled)
++			profile->dirty_write_ns += BufferProfileNow(profile) - phase_begin;
+ 		LWLockRelease(content_lock);
+ 
+ 		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+@@ -2476,10 +2598,19 @@ again:
+ 	 * can fail because another backend could have pinned or dirtied the
+ 	 * buffer.
+ 	 */
+-	if ((buf_state & BM_TAG_VALID) && !InvalidateVictimBuffer(buf_hdr))
++	if (buf_state & BM_TAG_VALID)
+ 	{
+-		UnpinBuffer(buf_hdr);
+-		goto again;
++		bool invalidated;
++
++		phase_begin = BufferProfileNow(profile);
++		invalidated = InvalidateVictimBuffer(buf_hdr, profile);
++		if (profile && profile->sampled)
++			profile->invalidate_ns += BufferProfileNow(profile) - phase_begin;
++		if (!invalidated) {
++			UnpinBuffer(buf_hdr);
++			if (profile) ++profile->victim_retries;
++			goto again;
++		}
+ 	}
+ 
+ 	/* a final set of sanity checks */
+@@ -2631,7 +2762,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
+ 	{
+ 		Block		buf_block;
+ 
+-		buffers[i] = GetVictimBuffer(strategy, io_context);
++		buffers[i] = GetVictimBuffer(strategy, io_context, NULL);
+ 		buf_block = BufHdrGetBlock(GetBufferDescriptor(buffers[i] - 1));
+ 
+ 		/* new buffers are zero-filled */
+@@ -6612,7 +6743,7 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
+ 	}
+ 
+ 	/* This will return false if it becomes dirty or someone else pins it. */
+-	result = InvalidateVictimBuffer(desc);
++	result = InvalidateVictimBuffer(desc, NULL);
+ 
+ 	UnpinBuffer(desc);
+ 
+diff --git a/src/backend/storage/buffer/freelist.c b/src/backend/storage/buffer/freelist.c
+index 01909be0272..7f8828ff21b 100644
+--- a/src/backend/storage/buffer/freelist.c
++++ b/src/backend/storage/buffer/freelist.c
+@@ -194,11 +194,19 @@ have_free_buffer(void)
+  */
+ BufferDesc *
+ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_ring)
++{
++	return StrategyGetBufferWithProfile(strategy, buf_state, from_ring, NULL);
++}
++
++BufferDesc *
++StrategyGetBufferWithProfile(BufferAccessStrategy strategy, uint32 *buf_state,
++							 bool *from_ring, PgReadBufferProfile *profile)
+ {
+ 	BufferDesc *buf;
+ 	int			bgwprocno;
+ 	int			trycounter;
+ 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
++	uint64		phase_begin;
+ 
+ 	*from_ring = false;
+ 
+@@ -208,10 +216,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
+ 	 */
+ 	if (strategy != NULL)
+ 	{
++		if (profile) ++profile->ring_attempts;
++		phase_begin = BufferProfileNow(profile);
+ 		buf = GetBufferFromRing(strategy, buf_state);
++		if (profile && profile->sampled)
++			profile->ring_ns += BufferProfileNow(profile) - phase_begin;
+ 		if (buf != NULL)
+ 		{
+ 			*from_ring = true;
++			if (profile) ++profile->ring_hits;
+ 			return buf;
+ 		}
+ 	}
+@@ -267,6 +280,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
+ 	 */
+ 	if (StrategyControl->firstFreeBuffer >= 0)
+ 	{
++		phase_begin = BufferProfileNow(profile);
+ 		while (true)
+ 		{
+ 			/* Acquire the spinlock to remove element from the freelist */
+@@ -278,6 +292,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
+ 				break;
+ 			}
+ 
++			if (profile) ++profile->freelist_candidates;
+ 			buf = GetBufferDescriptor(StrategyControl->firstFreeBuffer);
+ 			Assert(buf->freeNext != FREENEXT_NOT_IN_LIST);
+ 
+@@ -305,16 +320,25 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
+ 				if (strategy != NULL)
+ 					AddBufferToRing(strategy, buf);
+ 				*buf_state = local_buf_state;
++				if (profile) {
++					++profile->freelist_hits;
++					if (profile->sampled)
++						profile->freelist_ns += BufferProfileNow(profile) - phase_begin;
++				}
+ 				return buf;
+ 			}
+ 			UnlockBufHdr(buf, local_buf_state);
+ 		}
++		if (profile && profile->sampled)
++			profile->freelist_ns += BufferProfileNow(profile) - phase_begin;
+ 	}
+ 
+ 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
++	phase_begin = BufferProfileNow(profile);
+ 	trycounter = NBuffers;
+ 	for (;;)
+ 	{
++		if (profile) ++profile->clock_candidates;
+ 		buf = GetBufferDescriptor(ClockSweepTick());
+ 
+ 		/*
+@@ -327,6 +351,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
+ 		{
+ 			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+ 			{
++				if (profile) ++profile->clock_usage_decrements;
+ 				local_buf_state -= BUF_USAGECOUNT_ONE;
+ 
+ 				trycounter = NBuffers;
+@@ -337,20 +362,26 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
+ 				if (strategy != NULL)
+ 					AddBufferToRing(strategy, buf);
+ 				*buf_state = local_buf_state;
++				if (profile && profile->sampled)
++					profile->clock_ns += BufferProfileNow(profile) - phase_begin;
+ 				return buf;
+ 			}
+ 		}
+-		else if (--trycounter == 0)
++		else
+ 		{
+-			/*
+-			 * We've scanned all the buffers without making any state changes,
+-			 * so all the buffers are pinned (or were when we looked at them).
+-			 * We could hope that someone will free one eventually, but it's
+-			 * probably better to fail than to risk getting stuck in an
+-			 * infinite loop.
+-			 */
+-			UnlockBufHdr(buf, local_buf_state);
+-			elog(ERROR, "no unpinned buffers available");
++			if (profile) ++profile->clock_pinned_skips;
++			if (--trycounter == 0)
++			{
++				/*
++				 * We've scanned all the buffers without making any state changes,
++				 * so all the buffers are pinned (or were when we looked at them).
++				 * We could hope that someone will free one eventually, but it's
++				 * probably better to fail than to risk getting stuck in an
++				 * infinite loop.
++				 */
++				UnlockBufHdr(buf, local_buf_state);
++				elog(ERROR, "no unpinned buffers available");
++			}
+ 		}
+ 		UnlockBufHdr(buf, local_buf_state);
+ 	}
+diff --git a/src/include/storage/aio.h b/src/include/storage/aio.h
+index 2933eea0649..d5f14680915 100644
+--- a/src/include/storage/aio.h
++++ b/src/include/storage/aio.h
+@@ -283,6 +283,7 @@ struct dlist_node;
+ extern void pgaio_io_release_resowner(struct dlist_node *ioh_node, bool on_error);
+ 
+ extern void pgaio_io_set_flag(PgAioHandle *ioh, PgAioHandleFlags flag);
++extern void pgaio_io_enable_read_timing(PgAioHandle *ioh);
+ 
+ extern int	pgaio_io_get_id(PgAioHandle *ioh);
+ extern ProcNumber pgaio_io_get_owner(PgAioHandle *ioh);
+diff --git a/src/include/storage/aio_internal.h b/src/include/storage/aio_internal.h
+index b4de30f2ec1..479c94444a7 100644
+--- a/src/include/storage/aio_internal.h
++++ b/src/include/storage/aio_internal.h
+@@ -18,6 +18,7 @@
+ 
+ #include "lib/ilist.h"
+ #include "port/pg_iovec.h"
++#include "portability/instr_time.h"
+ #include "storage/aio.h"
+ #include "storage/condition_variable.h"
+ 
+@@ -99,6 +100,41 @@ struct ResourceOwnerData;
+  * space. We tried using bitfields, but several compilers generate rather
+  * horrid code for that.
+  */
++typedef enum PgAioTimingExecution
++{
++	PGAIO_TIMING_UNCLASSIFIED = 0,
++	PGAIO_TIMING_WORKER,
++	PGAIO_TIMING_QUEUE_FULL_SYNC,
++	PGAIO_TIMING_FORCED_SYNC
++} PgAioTimingExecution;
++
++/* Written by issuer, then executor, then read by owner after completion. */
++typedef struct PgAioHandleTiming
++{
++	bool		enabled;
++	bool		read_observed;
++	uint8		execution;
++	int32		executor_pid;
++	uint64		enqueue_ns;
++	uint64		dequeue_ns;
++	uint64		reopen_ns;
++	uint64		read_begin_ns;
++	uint64		read_end_ns;
++	uint64		shared_begin_ns;
++	uint64		shared_end_ns;
++	uint64		requested_bytes;
++	uint64		completed_bytes;
++} PgAioHandleTiming;
++
++static inline uint64
++pgaio_timing_now_ns(void)
++{
++	instr_time now;
++
++	INSTR_TIME_SET_CURRENT(now);
++	return INSTR_TIME_GET_NANOSEC(now);
++}
++
+ struct PgAioHandle
+ {
+ 	/* all state updates should go through pgaio_io_update_state() */
+@@ -176,6 +212,8 @@ struct PgAioHandle
+ 	 */
+ 	PgAioReturn *report_return;
+ 
++	PgAioHandleTiming timing;
++
+ 	/* Data necessary for the IO to be performed */
+ 	PgAioOpData op_data;
+ 
+diff --git a/src/include/storage/aio_types.h b/src/include/storage/aio_types.h
+index afee85c787b..e2c40764a47 100644
+--- a/src/include/storage/aio_types.h
++++ b/src/include/storage/aio_types.h
+@@ -121,6 +121,33 @@ StaticAssertDecl(PGAIO_RESULT_ID_BITS +
+ StaticAssertDecl(sizeof(PgAioResult) == 8,
+ 				 "PgAioResult has unexpected size");
+ 
++/*
++ * Opt-in read timing, accumulated across physical reads of a buffer operation.
++ * All times are elapsed nanoseconds. read_ns includes OS scheduling/cache costs,
++ * not just device service. No process-private pointers cross shared memory.
++ */
++typedef struct PgAioReadTiming
++{
++	bool		enabled;
++	bool		mixed_executors;
++	int32		executor_pid;
++	uint64		requests;
++	uint64		requested_bytes;
++	uint64		completed_bytes;
++	uint64		queued_requests;
++	uint64		worker_requests;
++	uint64		queue_full_sync_requests;
++	uint64		forced_sync_requests;
++	uint64		queue_ns;
++	uint64		reopen_ns;
++	uint64		read_ns;
++	uint64		shared_complete_ns;
++	uint64		enqueue_to_shared_ns;
++	uint64		timed_read_requests;
++	uint64		failed_requests;
++	uint64		unclassified_requests;
++} PgAioReadTiming;
++
+ /*
+  * Combination of PgAioResult with minimal metadata about the IO.
+  *
+@@ -131,6 +158,7 @@ typedef struct PgAioReturn
+ {
+ 	PgAioResult result;
+ 	PgAioTargetData target_data;
++	PgAioReadTiming timing;
+ } PgAioReturn;
+ 
+ 
+diff --git a/src/include/storage/buf_internals.h b/src/include/storage/buf_internals.h
+index 0dec7d93b3b..21a0eab0d0a 100644
+--- a/src/include/storage/buf_internals.h
++++ b/src/include/storage/buf_internals.h
+@@ -17,6 +17,7 @@
+ 
+ #include "pgstat.h"
+ #include "port/atomics.h"
++#include "portability/instr_time.h"
+ #include "storage/aio_types.h"
+ #include "storage/buf.h"
+ #include "storage/bufmgr.h"
+@@ -444,6 +445,22 @@ extern void TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag
+ extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
+ extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
+ 									 uint32 *buf_state, bool *from_ring);
++extern BufferDesc *StrategyGetBufferWithProfile(BufferAccessStrategy strategy,
++						  uint32 *buf_state, bool *from_ring,
++						  PgReadBufferProfile *profile);
++
++/* Disabled requests do not read the clock. Backend-private profile only. */
++static inline uint64
++BufferProfileNow(PgReadBufferProfile *profile)
++{
++	instr_time now;
++
++	if (!profile || !profile->sampled)
++		return 0;
++	INSTR_TIME_SET_CURRENT(now);
++	return INSTR_TIME_GET_NANOSEC(now);
++}
++
+ extern void StrategyFreeBuffer(BufferDesc *buf);
+ extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
+ 								 BufferDesc *buf, bool from_ring);
+diff --git a/src/include/storage/bufmgr.h b/src/include/storage/bufmgr.h
+index 41fdc1e7693..632a62827aa 100644
+--- a/src/include/storage/bufmgr.h
++++ b/src/include/storage/bufmgr.h
+@@ -116,6 +116,47 @@ typedef struct BufferManagerRelation
+ #define READ_BUFFERS_IGNORE_CHECKSUM_FAILURES (1 << 2)
+ /* IO will immediately be waited for */
+ #define READ_BUFFERS_SYNCHRONOUSLY (1 << 3)
++/* Collect bounded, per-request timing without changing read behavior. */
++#define READ_BUFFERS_PROFILE_TIMING (1 << 4)
++#define YAAP_PG_AIO_TIMING_VERSION 1
++/* Source-side buffer selection counters and sampled elapsed time. */
++#define READ_BUFFERS_PROFILE_BUFFER (1 << 5)
++#define YAAP_PG_BUFFER_PROFILE_VERSION 1
++#define PG_BUFFER_PROFILE_SAMPLE_RATE 64
++
++/* Timings are sampled, inclusive nanoseconds; nested phases must not be added. */
++typedef struct PgReadBufferProfile
++{
++	bool		enabled;
++	bool		sampled;
++	uint64		alloc_calls;
++	uint64		lookup_hits;
++	uint64		lookup_misses;
++	uint64		ring_attempts;
++	uint64		ring_hits;
++	uint64		freelist_candidates;
++	uint64		freelist_hits;
++	uint64		clock_candidates;
++	uint64		clock_usage_decrements;
++	uint64		clock_pinned_skips;
++	uint64		victim_retries;
++	uint64		dirty_writebacks;
++	uint64		profiled_start_calls;
++	uint64		sampled_start_calls;
++	uint64		sampled_pages;
++	uint64		alloc_total_ns;
++	uint64		lookup_ns;
++	uint64		mapping_lock_ns;
++	uint64		victim_ns;
++	uint64		strategy_ns;
++	uint64		ring_ns;
++	uint64		freelist_ns;
++	uint64		clock_ns;
++	uint64		dirty_write_ns;
++	uint64		invalidate_ns;
++	uint64		pin_ns;
++} PgReadBufferProfile;
++
+ 
+ 
+ struct ReadBuffersOperation
+@@ -139,10 +180,15 @@ struct ReadBuffersOperation
+ 	int16		nblocks_done;
+ 	PgAioWaitRef io_wref;
+ 	PgAioReturn io_return;
++	PgAioReadTiming io_timing;
++	PgReadBufferProfile buffer_profile;
+ };
+ 
+ typedef struct ReadBuffersOperation ReadBuffersOperation;
+ 
++extern const PgAioReadTiming *ReadBuffersGetTiming(const ReadBuffersOperation *operation);
++extern const PgReadBufferProfile *ReadBuffersGetBufferProfile(const ReadBuffersOperation *operation);
++
+ /* forward declared, to avoid having to expose buf_internals.h here */
+ struct WritebackContext;
+ 

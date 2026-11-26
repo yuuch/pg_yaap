@@ -62,6 +62,10 @@ struct ExecCtx {
 	int            worker_index;
 	PipelineSharedControl *control = nullptr;
 	EventId        profile_event_id = INVALID_EVENT_ID;
+	/* Logical task/partial identity, independent of the executing process. */
+	uint32_t       task_index = UINT32_MAX;
+	/* Only the elected scheduler may initialize a missing shared payload. */
+	bool           initialize_shared_state = false;
 };
 
 }

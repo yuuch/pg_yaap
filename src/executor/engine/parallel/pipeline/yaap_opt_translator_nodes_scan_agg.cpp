@@ -864,15 +864,19 @@ TranslateDelimScanNode(const PhysicalDelimScan &scan,
 		[&](const std::vector<ColumnRef> *required_ptr) -> bool
 	{
 		OptimizerNodeTranslation candidate;
-		if (!TranslateOptimizerNode(*scan.delim_outer_child,
-				queryDesc,
-				state,
-				required_ptr,
-				candidate) ||
-			candidate.op == nullptr ||
-			candidate.cols.empty() ||
-			candidate.cols.size() != candidate.schema.size())
-			return false;
+
+        auto *context=DelimMaterializeContext::current;
+        while(context && (context->outer != scan.delim_outer_child || !context->producer)) context=context->previous;
+        if (!context) elog(ERROR,"pg_yaap: DELIM_SCAN has no materialized outer input");
+        candidate.cols=context->translation->cols;
+        candidate.schema=context->translation->schema;
+        candidate.outputs=context->translation->outputs;
+        candidate.estimated_groups=context->translation->estimated_groups;
+        candidate.op=std::make_unique<pipeline::PhysicalMaterialize>(context->producer->layout_dp,
+                         context->producer->payload_dp,context->producer,
+                         pipeline::CreateMaterializeScan(state->runtime_dsa));
+        if(candidate.cols.empty() || candidate.cols.size()!=candidate.schema.size()) return false;
+
 		std::vector<ColumnRef> candidate_cols;
 		std::vector<ColumnSchema> candidate_schema;
 		std::vector<yaap::PhysicalOperator::OutputColumn> candidate_outputs;

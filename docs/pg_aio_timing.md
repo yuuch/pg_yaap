@@ -12,4 +12,4 @@ unavailable rather than reporting those measurements as zero.
 Applying the patch changes PostgreSQL internal structure layouts. PostgreSQL
 and YAAP must both be rebuilt against matching patched headers and binaries;
 the patch is not ABI compatible with an unmodified server. No PostgreSQL core
-changes are needed for the normal YAAP ReadStream or ringless scan path.
+changes are needed for the normal YAAP ReadStream scan path.

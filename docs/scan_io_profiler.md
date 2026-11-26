@@ -41,11 +41,9 @@ trace in Perfetto. No per-page trace is collected by normal scan profiling.
 
 ## Buffer strategy
 
-YAAP creates heap scans without `SO_ALLOW_STRAT` and passes a null
-`BufferAccessStrategy` to PostgreSQL's parallel ReadStream. YAAP therefore does
-not use a BAS_BULKREAD ring. PG's normal shared-buffer replacement policy still
-applies; removing the ring does not pin a relation in memory or prevent normal
-eviction under pressure.
+YAAP allows `SO_ALLOW_STRAT` and passes PostgreSQL's selected
+`BufferAccessStrategy` to its parallel ReadStream. Large heap scans can use a
+`BAS_BULKREAD` ring under PostgreSQL's normal selection rules.
 
 For external stack samples, see [scan_io_stacks.md](scan_io_stacks.md). A
 sample can show which code path was active, but it is not an event count, wait

@@ -21,7 +21,7 @@ extern char *pg_yaap_profile_trace_file;
 #include <unistd.h>
 
 #include "parallel/pipeline/dsm_control.hpp"
-#include "parallel/pipeline/pipeline_descriptor.hpp"
+#include "core/memory.hpp"
 #include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/scan_profile.hpp"
 #include "parallel/pipeline/scan_io_profile.hpp"
@@ -164,7 +164,7 @@ bool Begin(const ExecCtx &ctx, EventId event, uint32 partition) {
 	if (pg_atomic_read_u32(&slot->active)) { ++slot->nested_starts; return false; }
 	slot->event_id = event;
 	slot->partition_id = partition;
-	slot->task_id = (static_cast<uint64>(event) << 32) | (partition == UINT32_MAX ? slot_id : partition);
+	slot->task_id = (static_cast<uint64>(event) << 32) | (partition == UINT32_MAX ? (ctx.task_index == UINT32_MAX ? slot_id : ctx.task_index) : partition);
 	slot->scan_start = ScanCosts(ctx.control, ctx.dsa, ctx.worker_index, event);
 	slot->start_ns = Relative(shared);
 	pg_write_barrier();
@@ -286,7 +286,16 @@ void Report(PipelineSharedControl *control, dsa_area *dsa, TimelineShared *share
 	appendStringInfo(&json, "{\"displayTimeUnit\":\"ms\",\"yaap\":{\"schema_version\":1,\"complete\":%s,\"query_origin_ns\":" UINT64_FORMAT ",\"query_end_ns\":" UINT64_FORMAT ",\"dropped_events\":" UINT64_FORMAT ",\"incomplete_tasks\":" UINT64_FORMAT ",\"trace_capacity_per_worker\":%u,\"pipelines\":[",
 		success ? "true" : "false", shared->origin_ns, end, dropped, incomplete, shared->capacity);
 	auto *phases = static_cast<TimelinePhase *>(dsa_get_address(dsa, shared->phases_dp));
-	auto *descriptors = static_cast<PipelineDescriptor *>(dsa_get_address(dsa, control->pipelines_root));
+	const auto *events = static_cast<const EventShmState *>(
+		dsa_get_address(dsa, control->event_states_root));
+	const auto *successors = static_cast<const EventId *>(
+		dsa_get_address(dsa, control->event_successors_root));
+	PgVector<PgVector<uint32_t>> dependencies(shared->pipelines);
+	for (uint32 source = 0; source < shared->pipelines; ++source) {
+		const auto &finalize = events[source * kPhases + 2];
+		for (uint32 e = 0; e < finalize.successor_count; ++e)
+			dependencies[successors[finalize.successor_offset + e] / kPhases].push_back(source);
+	}
 	for (uint32 p = 0; p < shared->pipelines; ++p) {
 		WorkerTotals total;
 		uint32 workers = 0;
@@ -314,12 +323,13 @@ void Report(PipelineSharedControl *control, dsa_area *dsa, TimelineShared *share
 		appendStringInfo(&json, ",\"first_start_ns\":" UINT64_FORMAT ",\"last_end_ns\":" UINT64_FORMAT ",\"wall_span_ns\":" UINT64_FORMAT ",\"worker_count\":%u,\"total_worker_active_ns\":" UINT64_FORMAT ",\"task_count\":" UINT64_FORMAT ",\"finalize_start_ns\":" UINT64_FORMAT ",\"finalize_end_ns\":" UINT64_FORMAT ",\"finalize_active_ns\":" UINT64_FORMAT ",\"ready_ns\":" UINT64_FORMAT ",\"finished_ns\":" UINT64_FORMAT ",\"aborted\":%s,\"dependencies\":[",
 			total.first, total.last, span, workers, total.active, total.tasks, total.finalize_first, total.finalize_last,
 			total.finalize_active, phases[p].ready_ns, phases[p].finished_ns, phases[p].aborted ? "true" : "false");
-		const auto &pd = descriptors[p];
-		bool first_dependency = true;
-		for (uint32 j = 0; j < std::min<uint32>(64, shared->pipelines); ++j) {
-			if (!(pd.dependency_mask & (UINT64CONST(1) << j))) continue;
-			appendStringInfo(&json, "%s%u", first_dependency ? "" : ",", j);
-			first_dependency = false;
+		for (size_t j = 0; j < dependencies[p].size(); ++j)
+			appendStringInfo(&json, "%s%u", j == 0 ? "" : ",", dependencies[p][j]);
+		appendStringInfoString(&json, "],\"events\":[");
+		for (uint32 phase = 0; phase < kPhases; ++phase) {
+			const EventId id = p * kPhases + phase;
+			appendStringInfo(&json, "%s{\"event_id\":%u,\"activated_by\":%d,\"completed_by\":%d}",
+				phase == 0 ? "" : ",", id, events[id].activated_by, events[id].completed_by);
 		}
 		appendStringInfoString(&json, "],\"workers\":[");
 		bool first_worker = true;
