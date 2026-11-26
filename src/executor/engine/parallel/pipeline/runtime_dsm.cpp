@@ -121,13 +121,9 @@ CreateRuntimeDsm(PgYaapQueryState *state, const char **error_out)
 	control->num_workers = num_workers;
 	control->jit_deform = pg_yaap_jit_deform ? 1 : 0;
 	control->snapshot_root = InvalidDsaPointer;
-	pg_atomic_init_u32(&control->profile_enabled, 0);
+	pg_atomic_init_u32(&control->trace_enabled, 0);
 	pg_atomic_init_u32(&control->trace_execution_path, 0);
-	control->profile_records_root = InvalidDsaPointer;
-	control->profile_event_count = 0;
-	control->profile_worker_slots = 0;
-	control->timeline_mode = 0;
-	control->timeline_root = InvalidDsaPointer;
+	control->trace_root = InvalidDsaPointer;
 	control->buffer_state_root = InvalidDsaPointer;
 	control->shared_segment_arena_root = InvalidDsaPointer;
 	control->large_shared_segment_arena_root = InvalidDsaPointer;

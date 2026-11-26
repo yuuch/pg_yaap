@@ -28,7 +28,6 @@ extern bool pg_yaap_hash_join_partition_probe;
 #include "parallel/pipeline/physical_hash_join_combine.hpp"
 #include "parallel/pipeline/physical_hash_join_fast_probe.hpp"
 #include "parallel/pipeline/physical_seq_scan.hpp"
-#include "parallel/pipeline/pipeline_profile.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
 #include "buffer_manager/yaap_segment_row_refs.hpp"
@@ -751,50 +750,6 @@ ReleaseHashJoinReadWindow(int, Datum arg)
 	reinterpret_cast<HashJoinReadWindow *>(DatumGetPointer(arg))->Release();
 }
 
-static void
-AddHashJoinProfileCount(const ExecCtx &ctx,
-						bool enabled,
-						PipelineProfileStage stage)
-{
-	if (!enabled)
-		return;
-	instr_time zero;
-	INSTR_TIME_SET_ZERO(zero);
-	PipelineProfileAddElapsed(ctx.control, ctx.dsa, ctx.worker_index,
-		ctx.profile_event_id, stage, zero);
-}
-
-class HashJoinProfileScopeIfEnabled
-{
-public:
-	HashJoinProfileScopeIfEnabled(const ExecCtx &ctx,
-								 PipelineProfileStage stage,
-								 bool enabled)
-		: ctx_(ctx), stage_(stage), active_(enabled)
-	{
-		if (active_)
-			INSTR_TIME_SET_CURRENT(start_);
-	}
-
-	~HashJoinProfileScopeIfEnabled()
-	{
-		if (!active_)
-			return;
-		instr_time end;
-		INSTR_TIME_SET_CURRENT(end);
-		PipelineProfileAddDiff(ctx_, stage_, end, start_);
-	}
-
-	HashJoinProfileScopeIfEnabled(const HashJoinProfileScopeIfEnabled &) = delete;
-	HashJoinProfileScopeIfEnabled &operator=(const HashJoinProfileScopeIfEnabled &) = delete;
-
-private:
-	const ExecCtx &ctx_;
-	PipelineProfileStage stage_;
-	instr_time start_{};
-	bool active_;
-};
-
 static bool
 SameHashJoinSpillExtent(const buffer::YaapSpillExtent &left,
 						const buffer::YaapSpillExtent &right)
@@ -812,27 +767,14 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 									HashJoinReadWindow *window,
 									bool key_row,
 									TupleDataCollection **store,
-									bool profile_probe = false)
+									bool direct_reload_lease = false)
 {
 	if (payload == nullptr || window == nullptr || store == nullptr ||
 		!DsaPointerIsValid(refs_dp) || !DsaPointerIsValid(payload->segment_arena_dp))
 		return nullptr;
-	const bool profile = profile_probe && PipelineProfileEnabled(ctx);
-	const buffer::YaapSegmentRowRef *ref = nullptr;
-	if (profile)
-	{
-		PipelineProfileScope ref_lookup_scope(ctx,
-			PipelineProfileStage::HASH_JOIN_SEGMENT_REF_LOOKUP);
-		auto *refs = static_cast<const buffer::YaapSegmentRowRefTable *>(
-			dsa_get_address(ctx.dsa, refs_dp));
-		ref = buffer::YaapSegmentRowRefGet(ctx.dsa, refs, row_idx);
-	}
-	else
-	{
-		auto *refs = static_cast<const buffer::YaapSegmentRowRefTable *>(
-			dsa_get_address(ctx.dsa, refs_dp));
-		ref = buffer::YaapSegmentRowRefGet(ctx.dsa, refs, row_idx);
-	}
+	auto *refs = static_cast<const buffer::YaapSegmentRowRefTable *>(
+		dsa_get_address(ctx.dsa, refs_dp));
+	const buffer::YaapSegmentRowRef *ref = buffer::YaapSegmentRowRefGet(ctx.dsa, refs, row_idx);
 	if (ref == nullptr)
 		return nullptr;
 	auto *lease = window->Lease(key_row, ref->segment);
@@ -842,22 +784,13 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 		lease->handle.segment_id == ref->segment.segment_id &&
 		lease->handle.generation == ref->segment.generation)
 	{
-		HashJoinProfileScopeIfEnabled hit_scope(ctx,
-			PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_HIT, profile);
 		*store = const_cast<TupleDataCollection *>(
 			static_cast<const TupleDataCollection *>(lease->data));
 		return TupleDataCollectionGetRowConst(*store, ref->row_index);
 	}
-	HashJoinProfileScopeIfEnabled miss_scope(ctx,
-		PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_MISS, profile);
-	buffer::YaapSharedSegmentDesc *segment = nullptr;
-	{
-		HashJoinProfileScopeIfEnabled resolve_scope(ctx,
-			PipelineProfileStage::HASH_JOIN_SEGMENT_RESOLVE, profile);
-		buffer::YaapSharedSegmentReleaseRead(ctx.dsa, payload->segment_arena_dp, lease);
-		segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
-			payload->segment_arena_dp, ref->segment);
-	}
+	buffer::YaapSharedSegmentReleaseRead(ctx.dsa, payload->segment_arena_dp, lease);
+	buffer::YaapSharedSegmentDesc *segment = buffer::YaapSharedSegmentResolve(ctx.dsa,
+		payload->segment_arena_dp, ref->segment);
 	if (segment == nullptr)
 		return nullptr;
 	for (uint32_t attempt = 0; attempt < 10000; ++attempt)
@@ -865,17 +798,8 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 		const uint32_t state = pg_atomic_read_u32(&segment->state);
 		if (state == static_cast<uint32_t>(buffer::YaapSharedSegmentState::PUBLISHED))
 		{
-			bool acquired = false;
-			if (profile)
-			{
-				PipelineProfileScope lease_acquire_scope(ctx,
-					PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_ACQUIRE);
-				acquired = buffer::YaapSharedSegmentAcquireRead(ctx.dsa,
-					payload->segment_arena_dp, ref->segment, lease);
-			}
-			else
-				acquired = buffer::YaapSharedSegmentAcquireRead(ctx.dsa,
-					payload->segment_arena_dp, ref->segment, lease);
+			const bool acquired = buffer::YaapSharedSegmentAcquireRead(ctx.dsa,
+				payload->segment_arena_dp, ref->segment, lease);
 			if (acquired)
 			{
 				*store = static_cast<TupleDataCollection *>(dsa_get_address(ctx.dsa,
@@ -891,8 +815,6 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 				return row;
 			}
 			/* A spiller may have claimed the segment just before this reader. */
-			AddHashJoinProfileCount(ctx, profile,
-				PipelineProfileStage::HASH_JOIN_SEGMENT_LEASE_ACQUIRE_RETRY);
 			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
@@ -906,14 +828,7 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 			state == static_cast<uint32_t>(buffer::YaapSharedSegmentState::RELOADING))
 		{
 			CHECK_FOR_INTERRUPTS();
-			if (profile)
-			{
-				PipelineProfileScope wait_scope(ctx,
-					PipelineProfileStage::HASH_JOIN_SEGMENT_WAIT);
-				pg_usleep(kHashJoinSegmentWaitPollUs);
-			}
-			else
-				pg_usleep(kHashJoinSegmentWaitPollUs);
+			pg_usleep(kHashJoinSegmentWaitPollUs);
 			continue;
 		}
 		if (state != static_cast<uint32_t>(buffer::YaapSharedSegmentState::SPILLED))
@@ -921,27 +836,13 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 		if (ctx.control == nullptr)
 			return nullptr;
 		const buffer::YaapSpillExtent spill_extent = segment->spill_extent;
-		instr_time reload_start;
-		const bool profile_reload = profile_probe && PipelineProfileEnabled(ctx);
-		if (profile_reload)
-			INSTR_TIME_SET_CURRENT(reload_start);
 		const bool reloaded = buffer::YaapSharedSegmentReload(ctx.dsa,
 			ResolveBufferState(ctx), ref->segment,
 			payload->segment_arena_dp, &window->spill_store, spill_extent,
-			profile_probe ? lease : nullptr);
-		if (profile_reload)
-		{
-			instr_time reload_end;
-			INSTR_TIME_SET_CURRENT(reload_end);
-			PipelineProfileAddDiff(ctx,
-				PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD,
-				reload_end, reload_start);
-		}
+			direct_reload_lease ? lease : nullptr);
 		if (reloaded)
 		{
-			AddHashJoinProfileCount(ctx, profile,
-				PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD_OK);
-			if (profile_probe)
+			if (direct_reload_lease)
 			{
 				*store = const_cast<TupleDataCollection *>(
 					static_cast<const TupleDataCollection *>(lease->data));
@@ -953,41 +854,20 @@ AcquireSegmentedHashJoinRowFromRefs(ExecCtx &ctx,
 			}
 			continue;
 		}
-		AddHashJoinProfileCount(ctx, profile,
-			PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD_RETRY);
 		const uint32_t retry_state = pg_atomic_read_u32(&segment->state);
 		if (retry_state != static_cast<uint32_t>(buffer::YaapSharedSegmentState::SPILLED))
-		{
-			AddHashJoinProfileCount(ctx, profile,
-				PipelineProfileStage::HASH_JOIN_SEGMENT_RELOAD_RACE);
 			continue; /* Another reader already owns or completed this reload. */
-		}
 		if (!SameHashJoinSpillExtent(spill_extent, segment->spill_extent))
 			continue; /* The segment was re-spilled to a different extent. */
 		/* A reload can fail because other segments are pinned by this chunk's
 		 * locality cache. Drop those leases before asking the arena to evict a
 		 * victim, otherwise our own cache can make the retry impossible. */
 		window->ReleaseLeases();
-		bool evicted = false;
-		{
-			HashJoinProfileScopeIfEnabled evict_scope(ctx,
-				PipelineProfileStage::HASH_JOIN_SEGMENT_EVICT, profile);
-			evicted = EvictOneHashJoinSegment(ctx, ref->segment, 0);
-		}
-		AddHashJoinProfileCount(ctx, profile, evicted
-			? PipelineProfileStage::HASH_JOIN_SEGMENT_EVICT_OK
-			: PipelineProfileStage::HASH_JOIN_SEGMENT_EVICT_NO_VICTIM);
+		const bool evicted = EvictOneHashJoinSegment(ctx, ref->segment, 0);
 		if (evicted)
 			continue; /* Retry now that a resident victim has been spilled. */
 		CHECK_FOR_INTERRUPTS();
-		if (profile)
-		{
-			PipelineProfileScope wait_scope(ctx,
-				PipelineProfileStage::HASH_JOIN_SEGMENT_WAIT);
-			pg_usleep(kHashJoinSegmentWaitPollUs);
-		}
-		else
-			pg_usleep(kHashJoinSegmentWaitPollUs);
+		pg_usleep(kHashJoinSegmentWaitPollUs);
 	}
 	ereport(ERROR, (errmsg("pg_yaap: hash join timed out waiting for segment %u to become readable; state=%u",
 		segment->segment_id, pg_atomic_read_u32(&segment->state))));
@@ -1003,49 +883,35 @@ AcquireSegmentedHashJoinPartitionRow(ExecCtx &ctx,
 									uint32_t row_idx,
 									HashJoinReadWindow *window,
 									TupleDataCollection **store,
-									bool profile_probe = false)
+									bool direct_reload_lease = false)
 {
 	if (payload == nullptr || partition == nullptr || row_idx >= partition->row_count ||
 		!DsaPointerIsValid(partition->build_row_slots_dp) ||
 		!DsaPointerIsValid(partition->build_row_local_idxs_dp))
 		return nullptr;
-	dsa_pointer refs_dp = InvalidDsaPointer;
-	uint32_t local_idx = 0;
-	auto resolve_mapping = [&]() {
-		auto *registry = ResolveLocalBuildRegistry(ctx.dsa,
-			const_cast<HashJoinSharedPayload *>(payload));
-		if (registry == nullptr)
-			return false;
-		auto *slots = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa,
-			partition->build_row_slots_dp));
-		auto *local_idxs = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa,
-			partition->build_row_local_idxs_dp));
-		const uint32_t slot = slots[row_idx];
-		if (slot >= payload->local_state_slot_count ||
-			!DsaPointerIsValid(registry[slot].partition_state_dp) ||
-			partition_id >= payload->build_partition_count)
-			return false;
-		auto *local_parts = static_cast<const HashJoinLocalPartitionState *>(
-			dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
-		const auto &local_part = local_parts[partition_id];
-		refs_dp = key_row ? local_part.build_key_refs_dp :
-			local_part.build_row_refs_dp;
-		local_idx = local_idxs[row_idx];
-		return DsaPointerIsValid(refs_dp);
-	};
-	bool mapping_resolved = false;
-	if (profile_probe)
-	{
-		PipelineProfileScope mapping_scope(ctx,
-			PipelineProfileStage::HASH_JOIN_PARTITION_ROW_MAP);
-		mapping_resolved = resolve_mapping();
-	}
-	else
-		mapping_resolved = resolve_mapping();
-	if (!mapping_resolved)
+	auto *registry = ResolveLocalBuildRegistry(ctx.dsa,
+		const_cast<HashJoinSharedPayload *>(payload));
+	if (registry == nullptr)
+		return nullptr;
+	auto *slots = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa,
+		partition->build_row_slots_dp));
+	auto *local_idxs = static_cast<const uint32_t *>(dsa_get_address(ctx.dsa,
+		partition->build_row_local_idxs_dp));
+	const uint32_t slot = slots[row_idx];
+	if (slot >= payload->local_state_slot_count ||
+		!DsaPointerIsValid(registry[slot].partition_state_dp) ||
+		partition_id >= payload->build_partition_count)
+		return nullptr;
+	auto *local_parts = static_cast<const HashJoinLocalPartitionState *>(
+		dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
+	const auto &local_part = local_parts[partition_id];
+	const dsa_pointer refs_dp = key_row ? local_part.build_key_refs_dp :
+		local_part.build_row_refs_dp;
+	const uint32_t local_idx = local_idxs[row_idx];
+	if (!DsaPointerIsValid(refs_dp))
 		return nullptr;
 	return AcquireSegmentedHashJoinRowFromRefs(ctx, payload, refs_dp,
-		local_idx, window, key_row, store, profile_probe);
+		local_idx, window, key_row, store, direct_reload_lease);
 }
 
 static void
@@ -3901,8 +3767,6 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 	for (uint32_t next = partition_id + 1; next < payload->build_partition_count && next < 64; ++next)
 		if ((batch->partition_mask >> next) & 1u) { row_end = batch->partition_offsets[next]; break; }
 	uint64_t expected_rows = 0;
-	uint64_t collisions = 0;
-	const bool profile_build = PipelineProfileEnabled(ctx);
 	for (uint32_t slot = 0; slot < payload->local_state_slot_count; ++slot) {
 		if (!DsaPointerIsValid(registry[slot].partition_state_dp)) continue;
 		auto *parts = static_cast<HashJoinLocalPartitionState *>(dsa_get_address(ctx.dsa, registry[slot].partition_state_dp));
@@ -3917,11 +3781,6 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 			if ((local_idx & 1023u) == 0) CHECK_FOR_INTERRUPTS();
 			if (row_idx >= row_end || row_idx >= batch->row_count)
 				elog(ERROR, "pg_yaap: batch hash join global row out of bounds");
-			/* Sample one row per 1024, staggered by partition/slot. These
-			 * counters contain sampled time, never extrapolated time. */
-			const bool sample = profile_build && ((local_idx + partition_id * 31u + slot * 17u) & 1023u) == 0;
-			instr_time ref_start{}, hash_start{}, insert_start{}, insert_end{};
-			if (sample) INSTR_TIME_SET_CURRENT(ref_start);
 			buffer::YaapSegmentRowRef key_ref, row_ref;
 			if (!next_ref(keys, &key_ref))
 				elog(ERROR, "pg_yaap: batch hash join key chain ended early");
@@ -3933,12 +3792,10 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 			}
 			TupleDataCollection *key_store = nullptr;
 			const uint8_t *key = ResolveBatchRow(ctx.dsa, batch, key_refs, row_idx, &key_store);
-			if (sample) INSTR_TIME_SET_CURRENT(hash_start);
 			uint64_t hash = 0;
 			if (!TryHashSingleJoinKeyRow(layout, key_store, key, hash)) hash = HashGroupRow(layout, key_store, key);
 			if (HashJoinPartitionIndex(hash, payload) != partition_id)
 				elog(ERROR, "pg_yaap: batch hash join row assigned to wrong radix partition");
-			if (sample) INSTR_TIME_SET_CURRENT(insert_start);
 			salts[row_idx] = HashJoinSalt(hash);
 			const uint32_t bucket = batch->bucket_offsets[partition_id] +
 				(static_cast<uint32_t>(hash) & batch->bucket_masks[partition_id]);
@@ -3947,13 +3804,6 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 			const uint32_t previous = pg_atomic_read_u32(&heads[bucket]);
 			pg_atomic_write_u32(&heads[bucket], row_idx);
 			links[row_idx] = previous;
-			collisions += previous != HASH_JOIN_INVALID_ROW;
-			if (sample) {
-				INSTR_TIME_SET_CURRENT(insert_end);
-				PipelineProfileAddDiff(ctx, PipelineProfileStage::HASH_JOIN_BATCH_REF_SAMPLE, hash_start, ref_start, 1);
-				PipelineProfileAddDiff(ctx, PipelineProfileStage::HASH_JOIN_BATCH_HASH_SAMPLE, insert_start, hash_start, 1);
-				PipelineProfileAddDiff(ctx, PipelineProfileStage::HASH_JOIN_BATCH_INSERT_SAMPLE, insert_end, insert_start, 1);
-			}
 		}
 		buffer::YaapSegmentRowRef extra;
 		if (next_ref(keys, &extra) || (row_refs != key_refs && next_ref(rows, &extra)))
@@ -3961,8 +3811,6 @@ PhysicalHashJoin::BuildBatchPartition(ExecCtx &ctx, dsa_pointer batch_dp, uint32
 	}
 	if (static_cast<uint64_t>(batch->partition_offsets[partition_id]) + expected_rows != row_idx || row_idx != row_end)
 		elog(ERROR, "pg_yaap: batch hash join partition row count mismatch");
-	PipelineProfileScope collision_scope(ctx, PipelineProfileStage::HASH_JOIN_BATCH_COLLISIONS);
-	collision_scope.AddRows(collisions);
 }
 
 bool
@@ -4557,8 +4405,6 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 						continue;
 					}
 				}
-				PipelineProfileScope lookup_scope(ctx,
-					PipelineProfileStage::HASH_JOIN_LOOKUP);
 				uint64_t hash = 0;
 				if (partitioned_build && payload->segmented_build)
 					hash = op_state.probe_hashes[probe_row_idx];
@@ -4598,14 +4444,10 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 			while (op_state.cursor.build_row_idx != HASH_JOIN_INVALID_ROW)
 			{
 				const uint32_t build_row_idx = op_state.cursor.build_row_idx;
-				{
-					PipelineProfileScope lookup_scope(ctx,
-						PipelineProfileStage::HASH_JOIN_LOOKUP);
-					op_state.cursor.build_row_idx = links[build_row_idx];
-					while (op_state.cursor.build_row_idx != HASH_JOIN_INVALID_ROW &&
-						!candidate_matches(op_state.cursor.build_row_idx, probe_row_idx))
-						op_state.cursor.build_row_idx = links[op_state.cursor.build_row_idx];
-				}
+				op_state.cursor.build_row_idx = links[build_row_idx];
+				while (op_state.cursor.build_row_idx != HASH_JOIN_INVALID_ROW &&
+					!candidate_matches(op_state.cursor.build_row_idx, probe_row_idx))
+					op_state.cursor.build_row_idx = links[op_state.cursor.build_row_idx];
 				bool key_match = scalar_key_values != nullptr && !mark_mode;
 				if (!key_match)
 				{
@@ -4618,8 +4460,6 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 					}
 					else if (payload->segmented_build)
 					{
-						PipelineProfileScope segment_read_scope(ctx,
-							PipelineProfileStage::HASH_JOIN_SEGMENT_READ);
 						build_key_row = payload->direct_segmented_build && partitioned_build
 							? AcquireSegmentedHashJoinPartitionRow(ctx, payload,
 								selected_partition, selected_partition_id, true,
@@ -4658,8 +4498,6 @@ PhysicalHashJoin::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, O
 								&build_row_tdc);
 						else if (payload->segmented_build)
 						{
-							PipelineProfileScope segment_read_scope(ctx,
-								PipelineProfileStage::HASH_JOIN_SEGMENT_READ);
 							build_row = payload->direct_segmented_build && partitioned_build
 								? AcquireSegmentedHashJoinPartitionRow(ctx, payload,
 									selected_partition, selected_partition_id, false,

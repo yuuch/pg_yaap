@@ -19,7 +19,7 @@ extern "C" {
 #include "parallel/pipeline/physical_hash_join.hpp"
 #include "parallel/pipeline/physical_hash_join_probe.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
-#include "parallel/pipeline/pipeline_timeline.hpp"
+#include "parallel/pipeline/execution_trace.hpp"
 #include "parallel/pipeline/worker_error.hpp"
 
 namespace pg_yaap::pipeline {
@@ -173,7 +173,6 @@ TaskScheduler::Activate(EventId id)
 	Assert(pipeline != nullptr && pipeline->source != nullptr && pipeline->sink != nullptr);
 	const TaskKind kind = EventKind(id);
 	ExecCtx stage_ctx = ctx_;
-	stage_ctx.profile_event_id = id;
 	stage_ctx.initialize_shared_state = true;
 	SinkTaskPlan plan{0, 0, false};
 	switch (kind)
@@ -209,7 +208,9 @@ TaskScheduler::Activate(EventId id)
 					if (op->type() == PhysicalOperatorType::HASH_JOIN_PROBE)
 						static_cast<PhysicalHashJoinProbe *>(op)->InitializeHybrid(stage_ctx, tasks);
 			}
-			PipelineTimelineReady(ctx_.control, ctx_.dsa, pid);
+			YAAP_TRACE_INSTANT(YaapTraceEventType::PIPELINE_READY,
+			                   YaapTraceCategory::EXECUTION,
+			                   pid, YAAP_TRACE_INVALID_ID, 0);
 			break;
 		}
 		case TaskKind::COMBINE:
@@ -231,6 +232,16 @@ TaskScheduler::Activate(EventId id)
 	event.activated_by = ctx_.worker_index;
 	/* The complete logical count precedes publication of the first task. */
 	pg_atomic_write_u32(&event.tasks_remaining, plan.task_count);
+	YAAP_TRACE_INSTANT(YaapTraceEventType::EVENT_SCHEDULE,
+	                   YaapTraceCategory::SCHEDULER,
+	                   pid, id,
+	                   YaapTracePackEventArg(static_cast<uint8_t>(kind), plan.task_count));
+	if (kind == TaskKind::RUN)
+	{
+		YAAP_TRACE_INSTANT(YaapTraceEventType::PIPELINE_SCHEDULE,
+		                   YaapTraceCategory::SCHEDULER,
+		                   pid, YAAP_TRACE_INVALID_ID, plan.task_count);
+	}
 	return true;
 }
 
@@ -239,20 +250,29 @@ TaskScheduler::FinishEvent(EventId id)
 {
 	auto &event = events_[id];
 	const PipelineId pid = EventPipeline(id);
-	if (EventKind(id) == TaskKind::RUN)
+	const TaskKind kind = EventKind(id);
+	if (kind == TaskKind::RUN)
 	{
 		ReleaseRunInputs(ctx_, *pipelines_.Resolve(pid));
 		if (ctx_.control->active_probe_run == id)
 			ctx_.control->active_probe_run = INVALID_EVENT_ID;
 		dsa_trim(ctx_.dsa);
 	}
-	else if (EventKind(id) == TaskKind::FINALIZE)
-		PipelineTimelineFinished(ctx_.control, ctx_.dsa, pid);
 
 	if (Stopping(ctx_.control))
 		return;
 	event.phase = SharedEventPhase::FINISHED;
 	event.completed_by = ctx_.worker_index;
+	YAAP_TRACE_INSTANT(YaapTraceEventType::EVENT_FINISH,
+	                   YaapTraceCategory::SCHEDULER,
+	                   pid, id,
+	                   YaapTracePackEventArg(static_cast<uint8_t>(kind), event.task_count));
+	if (kind == TaskKind::FINALIZE)
+	{
+		YAAP_TRACE_INSTANT(YaapTraceEventType::PIPELINE_FINISH,
+		                   YaapTraceCategory::EXECUTION,
+		                   pid, YAAP_TRACE_INVALID_ID, 0);
+	}
 	for (uint32_t j = 0; j < event.successor_count; ++j)
 	{
 		auto &next = events_[successors_[event.successor_offset + j]];
@@ -271,29 +291,45 @@ bool
 TaskScheduler::DispatchReadyTasks()
 {
 	bool progress = false;
-	for (EventId id = 0; id < ctx_.control->event_count && !Stopping(ctx_.control); ++id)
+	/* Prioritize barrier-completing work (FINALIZE -> COMBINE -> RUN) so
+	 * lightweight completions never queue behind heavy parallel scans. */
+	static constexpr TaskKind kDispatchOrder[3] = {
+		TaskKind::FINALIZE,
+		TaskKind::COMBINE,
+		TaskKind::RUN,
+	};
+	for (TaskKind want_kind : kDispatchOrder)
 	{
-		auto &event = events_[id];
-		if (event.phase != SharedEventPhase::RUNNING)
-			continue;
-		while (event.next_task < event.task_count &&
-		       pg_atomic_read_membarrier_u32(&event.tasks_in_flight) < event.max_concurrency)
+		for (EventId id = 0; id < ctx_.control->event_count && !Stopping(ctx_.control); ++id)
 		{
-			const uint32_t index = event.next_task;
-			TaskDescriptor desc{};
-			desc.pipeline_id = EventPipeline(id);
-			desc.event_id = id;
-			desc.partition_id = event.partitioned ? index : UINT32_MAX;
-			desc.task_index = index;
-			desc.kind = static_cast<uint8_t>(EventKind(id));
-			pg_atomic_add_fetch_u32(&event.tasks_in_flight, 1);
-			if (!queue_.TryPush(desc))
+			if (EventKind(id) != want_kind)
+				continue;
+			auto &event = events_[id];
+			if (event.phase != SharedEventPhase::RUNNING)
+				continue;
+			while (event.next_task < event.task_count &&
+			       pg_atomic_read_membarrier_u32(&event.tasks_in_flight) < event.max_concurrency)
 			{
-				pg_atomic_sub_fetch_u32(&event.tasks_in_flight, 1);
-				return progress;
+				const uint32_t index = event.next_task;
+				TaskDescriptor desc{};
+				desc.pipeline_id = EventPipeline(id);
+				desc.event_id = id;
+				desc.partition_id = event.partitioned ? index : UINT32_MAX;
+				desc.task_index = index;
+				desc.kind = static_cast<uint8_t>(want_kind);
+				pg_atomic_add_fetch_u32(&event.tasks_in_flight, 1);
+				if (!queue_.TryPush(desc))
+				{
+					pg_atomic_sub_fetch_u32(&event.tasks_in_flight, 1);
+					return progress;
+				}
+				YAAP_TRACE_INSTANT(YaapTraceEventType::TASK_ENQUEUE,
+				                   YaapTraceCategory::SCHEDULER,
+				                   desc.pipeline_id, desc.task_index,
+				                   YaapTracePackTaskArg(desc.event_id, desc.kind, desc.partition_id));
+				++event.next_task;
+				progress = true;
 			}
-			++event.next_task;
-			progress = true;
 		}
 	}
 	return progress;

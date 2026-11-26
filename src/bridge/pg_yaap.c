@@ -49,36 +49,12 @@ int pg_yaap_parallel_max_workers = 4;
 int pg_yaap_parallel_min_relation_blocks = 1024;
 bool pg_yaap_parallel_experimental_hash_pipeline = false;
 bool pg_yaap_disable_jit_for_parallel_worker = false;
-bool pg_yaap_profile = false;
-extern int pg_yaap_profile_scan_io;
-extern int pg_yaap_profile_scan_io_wait_pct;
-extern int pg_yaap_profile_scan_io_min_pages;
-int pg_yaap_profile_scan_io = 0;
-int pg_yaap_profile_scan_io_wait_pct = 20;
-int pg_yaap_profile_scan_io_min_pages = 128;
-static const struct config_enum_entry pg_yaap_profile_scan_io_options[] = {
-    {"off", 0, false}, {"summary", 1, false}, {"detail", 2, false}, {NULL, 0, false}
-};
-extern int pg_yaap_profile_scan;
-int pg_yaap_profile_scan = 0;
-static const struct config_enum_entry pg_yaap_profile_scan_options[] = {
-	{"off", 0, false},
-	{"sample", 1, false},
-	{"exact", 2, false},
-	{NULL, 0, false}
-};
-extern int pg_yaap_profile_timeline;
-extern int pg_yaap_profile_trace_capacity;
-extern char *pg_yaap_profile_trace_file;
-int pg_yaap_profile_timeline = 0;
-int pg_yaap_profile_trace_capacity = 8192;
-char *pg_yaap_profile_trace_file = NULL;
-static const struct config_enum_entry pg_yaap_profile_timeline_options[] = {
-	{"off", 0, false},
-	{"basic", 1, false},
-	{"trace", 2, false},
-	{NULL, 0, false}
-};
+extern bool pg_yaap_trace_enabled;
+extern int pg_yaap_trace_buffer_mb;
+extern char *pg_yaap_trace_output_dir;
+bool pg_yaap_trace_enabled = false;
+int pg_yaap_trace_buffer_mb = 1;
+char *pg_yaap_trace_output_dir = NULL;
 extern bool pg_yaap_hash_join_partition_probe;
 bool pg_yaap_hash_join_partition_probe = true;
 /* GUC storage is in MB so an int-valued PostgreSQL GUC can express query
@@ -91,18 +67,25 @@ char pg_yaap_bgworker_library_path[MAXPGPATH] = "pg_yaap";
 static int pg_yaap_utility_nesting = 0;
 
 static bool
-pg_yaap_check_profile_trace_file(char **newval, void **extra, GucSource source)
+pg_yaap_check_trace_output_dir(char **newval, void **extra, GucSource source)
 {
+	(void) extra;
+	(void) source;
 	if (**newval == '\0')
 		return true;
 	if (!is_absolute_path(*newval))
 	{
-		GUC_check_errdetail("Trace file prefix must be an absolute path or empty.");
+		GUC_check_errdetail("Trace output directory must be an absolute path or empty.");
 		return false;
 	}
-	if (strlen(*newval) + 80 >= MAXPGPATH)
+	if (strstr(*newval, "..") != NULL)
 	{
-		GUC_check_errdetail("Trace file prefix is too long to append the query suffix.");
+		GUC_check_errdetail("Trace output directory must not contain '..' path segments.");
+		return false;
+	}
+	if (strlen(*newval) + 96 >= MAXPGPATH)
+	{
+		GUC_check_errdetail("Trace output directory path is too long.");
 		return false;
 	}
 	return true;
@@ -380,44 +363,40 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomBoolVariable("pg_yaap.profile",
-							 "Emit YAAP per-stage pipeline timing after each offloaded query.",
+	DefineCustomBoolVariable("pg_yaap.trace_enabled",
+							 "Enable lightweight per-process Execution Trace recording.",
 							 NULL,
-							 &pg_yaap_profile,
+							 &pg_yaap_trace_enabled,
 							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,
-																 NULL,
-																 NULL);
-    DefineCustomEnumVariable("pg_yaap.profile_scan_io",
-        "Extension-only scan I/O observations and conservative diagnoses.", NULL,
-        &pg_yaap_profile_scan_io, 0, pg_yaap_profile_scan_io_options, PGC_USERSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("pg_yaap.profile_scan_io_wait_pct",
-        "Wait API envelope threshold for diagnostic heuristics, not a readiness detector.", NULL,
-        &pg_yaap_profile_scan_io_wait_pct, 20, 0, 100, PGC_USERSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("pg_yaap.profile_scan_io_min_pages",
-        "Minimum consumed pages before surfacing heuristic scan I/O findings.", NULL,
-        &pg_yaap_profile_scan_io_min_pages, 128, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+							 NULL,
+							 NULL);
 
-	DefineCustomEnumVariable("pg_yaap.profile_scan",
-							 "Attribute PostgreSQL input and row-to-column scan costs; sample estimates tuple stages.",
-							 NULL, &pg_yaap_profile_scan, 0,
-							 pg_yaap_profile_scan_options, PGC_USERSET, 0,
-							 NULL, NULL, NULL);
-	DefineCustomEnumVariable("pg_yaap.profile_timeline",
-							 "Record pipeline and worker task execution intervals.",
-							 NULL, &pg_yaap_profile_timeline, 0,
-							 pg_yaap_profile_timeline_options, PGC_USERSET, 0,
-							 NULL, NULL, NULL);
-	DefineCustomIntVariable("pg_yaap.profile_trace_capacity",
-							"Maximum detailed timeline events recorded per process.",
-							NULL, &pg_yaap_profile_trace_capacity, 8192, 1, 65536,
-							PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomStringVariable("pg_yaap.profile_trace_file",
-							   "Absolute file prefix for uniquely named Perfetto timeline exports.",
-							   NULL, &pg_yaap_profile_trace_file, "", PGC_SUSET, 0,
-							   pg_yaap_check_profile_trace_file, NULL, NULL);
+	DefineCustomIntVariable("pg_yaap.trace_buffer_mb",
+							"Per-process Execution Trace buffer size in MB (leader and each worker).",
+							NULL,
+							&pg_yaap_trace_buffer_mb,
+							1,
+							1,
+							16,
+							PGC_USERSET,
+							GUC_UNIT_MB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomStringVariable("pg_yaap.trace_output_dir",
+							   "Absolute server directory for exported Chrome Trace JSON files.",
+							   NULL,
+							   &pg_yaap_trace_output_dir,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   pg_yaap_check_trace_output_dir,
+							   NULL,
+							   NULL);
 	DefineCustomBoolVariable("pg_yaap.hash_join_partition_probe",
 							 "Stream probe rows against budgeted resident hash partitions and defer the remainder.",
 							 NULL, &pg_yaap_hash_join_partition_probe, true,

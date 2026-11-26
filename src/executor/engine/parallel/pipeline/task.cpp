@@ -13,8 +13,6 @@ extern "C" {
 #include "parallel/pipeline/physical_hash_join_probe.hpp"
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
-#include "parallel/pipeline/pipeline_profile.hpp"
-#include "parallel/pipeline/pipeline_timeline.hpp"
 
 namespace pg_yaap {
 namespace pipeline {
@@ -114,28 +112,25 @@ TrimLocalScratchIfUnderPressure(WorkerTaskRuntime &rt)
 		rt.chunk_pool.TrimStringArenas(256u * 1024u);
 }
 
-class TaskProfileEventGuard
+class TaskIndexGuard
 {
 public:
-	TaskProfileEventGuard(ExecCtx &ctx, EventId event_id, uint32_t task_index)
-		: ctx_(ctx), previous_(ctx.profile_event_id), previous_task_(ctx.task_index)
+	TaskIndexGuard(ExecCtx &ctx, uint32_t task_index)
+		: ctx_(ctx), previous_task_(ctx.task_index)
 	{
-		ctx_.profile_event_id = event_id;
 		ctx_.task_index = task_index;
 	}
 
-	~TaskProfileEventGuard()
+	~TaskIndexGuard()
 	{
-		ctx_.profile_event_id = previous_;
 		ctx_.task_index = previous_task_;
 	}
 
-	TaskProfileEventGuard(const TaskProfileEventGuard &) = delete;
-	TaskProfileEventGuard &operator=(const TaskProfileEventGuard &) = delete;
+	TaskIndexGuard(const TaskIndexGuard &) = delete;
+	TaskIndexGuard &operator=(const TaskIndexGuard &) = delete;
 
 private:
 	ExecCtx &ctx_;
-	EventId previous_;
 	uint32_t previous_task_;
 };
 
@@ -156,13 +151,7 @@ DrainOperatorSuffix(ExecCtx &ctx,
 	if (op_idx >= pipeline.ops.size())
 	{
 		OperatorSinkInput sink_in{*ps.global_sink, *ps.local_sink};
-		SinkResultType kres;
-		{
-			PipelineProfileScope sink_scope(ctx,
-				PipelineProfileSinkStage(pipeline.sink->type()));
-			kres = pipeline.sink->SinkChunk(ctx, input, sink_in);
-			sink_scope.AddRows(input.count);
-		}
+		const SinkResultType kres = pipeline.sink->SinkChunk(ctx, input, sink_in);
 		if (kres == SinkResultType::BLOCKED)
 			RaiseBlockedForbidden();
 		if (kres == SinkResultType::FINISHED)
@@ -178,14 +167,7 @@ DrainOperatorSuffix(ExecCtx &ctx,
 	for (;;)
 	{
 		out->reset();
-		OperatorResultType ores;
-		{
-			PipelineProfileScope op_scope(ctx,
-				PipelineProfileOperatorStage(op->type()));
-			ores = op->Execute(ctx, input, *out, op_state);
-			if (ores == OperatorResultType::HAVE_MORE_OUTPUT)
-				op_scope.AddRows(out->count);
-		}
+		const OperatorResultType ores = op->Execute(ctx, input, *out, op_state);
 		if (ores == OperatorResultType::BLOCKED)
 			RaiseBlockedForbidden();
 		if (ores == OperatorResultType::FINISHED)
@@ -227,10 +209,7 @@ PipelineRunTask::Execute()
 {
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
-	TaskProfileEventGuard event_guard(ctx, event_id_,
-		partition_id_ == UINT32_MAX ? task_index_ : UINT32_MAX);
-	PipelineTimelineTaskScope timeline_scope(ctx, event_id_, partition_id_);
-	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_RUN_TOTAL);
+	TaskIndexGuard task_guard(ctx, partition_id_ == UINT32_MAX ? task_index_ : UINT32_MAX);
 	TrimLocalScratchIfUnderPressure(rt);
 	auto task_state = std::make_unique<ProcessPipelineExecState>();
 	auto &ps = *task_state;
@@ -265,7 +244,6 @@ PipelineRunTask::Execute()
 		if (rt.control != nullptr &&
 			pg_atomic_read_u32(&rt.control->shutdown_requested) != 0)
 		{
-			timeline_scope.SetResult(TimelineTaskResult::CANCELLED);
 			return finish_run();
 		}
 		CHECK_FOR_INTERRUPTS();
@@ -282,13 +260,7 @@ PipelineRunTask::Execute()
 				return finish_run();
 			auto *op = static_cast<PhysicalHashJoinProbe *>(pipeline_->ops[ps.final_op_index]);
 			src_chunk.reset();
-			OperatorResultType ores;
-			{
-				PipelineProfileScope op_scope(ctx, PipelineProfileOperatorStage(op->type()));
-				ores = op->FinalExecute(ctx, src_chunk, *ps.local_ops[ps.final_op_index]);
-				if (ores == OperatorResultType::HAVE_MORE_OUTPUT)
-					op_scope.AddRows(src_chunk.count);
-			}
+			const OperatorResultType ores = op->FinalExecute(ctx, src_chunk, *ps.local_ops[ps.final_op_index]);
 			if (ores == OperatorResultType::BLOCKED)
 				RaiseBlockedForbidden();
 			if (ores == OperatorResultType::FINISHED)
@@ -305,14 +277,7 @@ PipelineRunTask::Execute()
 		}
 
 		OperatorSourceInput src_in{*ps.global_source, *ps.local_source};
-		SourceResultType sres;
-		{
-			PipelineProfileScope source_scope(ctx,
-				PipelineProfileSourceStage(pipeline_->source->type()));
-			sres = pipeline_->source->GetData(ctx, src_chunk, src_in);
-			if (sres == SourceResultType::HAVE_MORE_OUTPUT)
-				source_scope.AddRows(src_chunk.count);
-		}
+		const SourceResultType sres = pipeline_->source->GetData(ctx, src_chunk, src_in);
 
 		if (sres == SourceResultType::BLOCKED)
 			RaiseBlockedForbidden();
@@ -342,22 +307,14 @@ PipelineCombineTask::Execute()
 {
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
-	TaskProfileEventGuard event_guard(ctx, event_id_,
-		partition_id_ == UINT32_MAX ? task_index_ : UINT32_MAX);
-	PipelineTimelineTaskScope timeline_scope(ctx, event_id_, partition_id_);
-	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_COMBINE_TOTAL);
+	TaskIndexGuard task_guard(ctx, partition_id_ == UINT32_MAX ? task_index_ : UINT32_MAX);
 	auto &ps = rt.GetOrCreatePipelineState(pipeline_->id);
 	/* RUN cleanup may already have retired input/operator payloads. Only
 	 * the output sink state is needed by this independently claimed stage. */
 	if (ps.global_sink == nullptr)
 		ps.global_sink = pipeline_->sink->GetGlobalSinkState(ctx);
 	OperatorSinkCombineInput in{nullptr, *ps.global_sink, partition_id_};
-	SinkCombineResultType cres;
-	{
-		PipelineProfileScope combine_scope(ctx,
-			PipelineProfileCombineStage(pipeline_->sink->type()));
-		cres = pipeline_->sink->Combine(ctx, in);
-	}
+	const SinkCombineResultType cres = pipeline_->sink->Combine(ctx, in);
 	if (cres == SinkCombineResultType::BLOCKED)
 		RaiseBlockedForbidden();
 	return TaskExecutionResult::TASK_FINISHED;
@@ -375,28 +332,21 @@ PipelineFinalizeTask::Execute()
 {
 	auto &rt = *runtime_;
 	auto &ctx = rt.exec_ctx;
-	TaskProfileEventGuard event_guard(ctx, event_id_,
-		partition_id_ == UINT32_MAX ? task_index_ : UINT32_MAX);
-	PipelineTimelineTaskScope timeline_scope(ctx, event_id_, partition_id_);
-	PipelineProfileScope task_scope(ctx, PipelineProfileStage::TASK_FINALIZE_TOTAL);
+	TaskIndexGuard task_guard(ctx, partition_id_ == UINT32_MAX ? task_index_ : UINT32_MAX);
 	/* COMBINE may have replaced shared storage. Resolve the sink again
 	 * after its publication barrier, even if this process ran COMBINE. */
 	auto global_sink = pipeline_->sink->GetGlobalSinkState(ctx);
 
 	SinkFinalizeType fres;
+	if (partition_id_ != UINT32_MAX)
 	{
-		PipelineProfileScope finalize_scope(ctx,
-			PipelineProfileFinalizeStage(pipeline_->sink->type()));
-		if (partition_id_ != UINT32_MAX)
-		{
-			if (pipeline_->sink->type() != PhysicalOperatorType::HASH_JOIN)
-				elog(ERROR, "pg_yaap: partitioned FINALIZE task is only valid for hash join");
-			fres = static_cast<PhysicalHashJoin *>(pipeline_->sink)->FinalizePartition(
-				ctx, *global_sink, partition_id_);
-		}
-		else
-			fres = pipeline_->sink->Finalize(ctx, *global_sink);
+		if (pipeline_->sink->type() != PhysicalOperatorType::HASH_JOIN)
+			elog(ERROR, "pg_yaap: partitioned FINALIZE task is only valid for hash join");
+		fres = static_cast<PhysicalHashJoin *>(pipeline_->sink)->FinalizePartition(
+			ctx, *global_sink, partition_id_);
 	}
+	else
+		fres = pipeline_->sink->Finalize(ctx, *global_sink);
 	if (fres == SinkFinalizeType::BLOCKED)
 		RaiseBlockedForbidden();
 	return TaskExecutionResult::TASK_FINISHED;

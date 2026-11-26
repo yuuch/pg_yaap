@@ -488,7 +488,6 @@ struct HashJoinBatch {
 	dsa_pointer matched_bitmap_dp; /* pg_atomic_uint32[ceil(row_count / 32)] */
 	pg_atomic_uint32 unmatched_done;
 	pg_atomic_uint32 matched_build_rows;
-	pg_atomic_uint32 profile_published;
 };
 
 struct HashJoinPartition {

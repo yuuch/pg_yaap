@@ -93,28 +93,13 @@ struct PipelineSharedControl
 	dsa_pointer      snapshot_root;
 
 	/*
-	 * Optional per-query profiling storage. The leader allocates the records
-	 * after TaskScheduler has built the Event DAG, because event_count is not
-	 * known when the runtime DSM is first created. Workers only write their own
-	 * worker slot; the leader aggregates after all workers have stopped.
+	 * Optional per-query Execution Trace storage (Layer 1).
+	 * Leader allocates per-process append-only buffers before launching workers
+	 * and publishes trace_root with a write barrier before setting trace_enabled.
 	 */
-	pg_atomic_uint32 profile_enabled;
+	pg_atomic_uint32 trace_enabled;
 	pg_atomic_uint32 trace_execution_path;
-	dsa_pointer      profile_records_root;
-	dsa_pointer      profile_slot_pids_root;
-	uint32           profile_event_count;
-	uint32           profile_worker_slots;
-	/* Immutable after publication; worker-exclusive Task timeline storage. */
-	uint32           scan_io_profile_mode;
-    dsa_pointer      scan_io_profile_root;
-    uint32           scan_io_reported;
-    uint32           scan_io_min_pages;
-    uint32           scan_io_wait_pct;
-    uint32           scan_profile_mode;
-	dsa_pointer      scan_profile_root;
-	uint32           scan_profile_reported;
-	uint32           timeline_mode;
-	dsa_pointer      timeline_root;
+	dsa_pointer      trace_root;
 
 	/* Query-scoped accounting for DSA-backed breaker storage. */
 	uint64_t dsa_limit_bytes = 0;

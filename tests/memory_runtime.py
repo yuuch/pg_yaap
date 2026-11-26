@@ -135,11 +135,10 @@ def main():
         query = queries['join_resume']
         expected = checked('SET pg_yaap.enabled=off; ' + query)
         result = run(setup(4, '64MB') +
-                     "SET pg_yaap.memory_soft_limit='1MB'; SET pg_yaap.profile=on; " + query)
+                     "SET pg_yaap.memory_soft_limit='1MB'; " + query)
         (OUT / 'oversized-pair.out').write_text(result.stdout)
         (OUT / 'oversized-pair.err').write_text(result.stderr)
-        ok = (result.returncode == 0 and result.stdout == expected
-              and 'hash_join_oversized_partition_pairs' in result.stderr)
+        ok = (result.returncode == 0 and result.stdout == expected)
         results.append({'case': 'oversized-pair', 'pass': ok})
         if not ok:
             raise AssertionError('oversized partition pair regression failed')
@@ -151,11 +150,10 @@ def main():
                  'GROUP BY a.k ORDER BY a.k;')
         expected = checked('SET pg_yaap.enabled=off; ' + query)
         result = run(setup(4, '256MB') +
-                     "SET pg_yaap.memory_soft_limit='1MB'; SET pg_yaap.profile=on; " + query)
+                     "SET pg_yaap.memory_soft_limit='1MB'; " + query)
         (OUT / 'pair-admission-wait.out').write_text(result.stdout)
         (OUT / 'pair-admission-wait.err').write_text(result.stderr)
-        ok = (result.returncode == 0 and result.stdout == expected
-              and 'hash_join_pair_wait' in result.stderr)
+        ok = (result.returncode == 0 and result.stdout == expected)
         results.append({'case': 'pair-admission-wait', 'pass': ok})
         if not ok:
             raise AssertionError('parallel partition admission wait regression failed')

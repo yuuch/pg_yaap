@@ -47,7 +47,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 
 ## GUCs (defined in `pg_yaap.c::_PG_init`)
 
-The execution and memory settings listed below are `PGC_USERSET`; the timeline export path is `PGC_SUSET`.
+The execution and memory settings listed below are `PGC_USERSET`; `pg_yaap.trace_output_dir` is `PGC_SUSET`.
 
 | GUC | Default | Range | Purpose |
 |-----|---------|-------|---------|
@@ -59,9 +59,9 @@ The execution and memory settings listed below are `PGC_USERSET`; the timeline e
 | `pg_yaap.parallel_max_workers` | `4` | 0–1024 | Max bgworkers per query. |
 | `pg_yaap.parallel_min_relation_blocks` | `1024` | 0–`INT_MAX` | Min relation size before parallel lowering is considered. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | `false` | bool | Reserved; **no effect in greenfield** (HashJoin removed). Kept registered to avoid breaking existing config files. |
-| `pg_yaap.profile` | `false` | bool | Emit per-stage pipeline timing after each offloaded query. Fine-grained scan stages add visible overhead; use for diagnosis, not benchmark timing. |
-| `pg_yaap.profile_scan` | `off` | enum: off/sample/exact | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |
-| `pg_yaap.profile_scan_io` | `off` | enum: off/summary/detail | Extension-only IO observations; strict unavailable metrics remain null. |
+| `pg_yaap.trace_enabled` | `false` | bool | Enable lightweight per-process Execution Trace recording (see `docs/execution_trace.md`). |
+| `pg_yaap.trace_buffer_mb` | `1MB` | 1–16 MB | Per-process Execution Trace buffer size in MB (leader and each worker). |
+| `pg_yaap.trace_output_dir` | `""` | absolute path (`PGC_SUSET`) | Server directory for exported Perfetto-compatible Chrome Trace Event JSON files. |
 | `pg_yaap.hash_join_partition_probe` | `true` | bool | Stream rows for the resident Build batch directly; partition and spill deferred Probe rows for matching later batches. Only equality-key joins use this path. Off retains the non-hybrid YAAP path for controlled comparisons. |
 | `pg_yaap.memory_limit` | `256MB` | 64MB–`INT_MAX` bytes | Hard shared breaker-payload budget; DSA can reserve up to 50% (capped at 4GB) additional metadata/allocator space. |
 | `pg_yaap.memory_soft_limit` | `-1` | -1–`INT_MAX` bytes | Spill threshold; `-1` uses 75% of `memory_limit`. |

@@ -72,6 +72,8 @@ public:
 		type_ = PhysicalOperatorType::PERFECT_HASH_AGGREGATE;
 	}
 
+	bool ParallelSource() const override { return false; }
+
 	SinkTaskPlan GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) const override;
 
 	std::unique_ptr<GlobalSinkState>   GetGlobalSinkState(ExecCtx &ctx) override;

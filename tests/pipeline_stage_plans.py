@@ -6,7 +6,6 @@ Includes single-worker and partitioned plans so each
 producer's local state must be included exactly once at the combine barrier.
 """
 import os
-import re
 
 import memory_runtime as runtime
 
@@ -43,8 +42,6 @@ def main():
                 for partition_probe in ('off', 'on'):
                     settings = runtime.setup(workers, '256MB') + (
                         f'SET pg_yaap.hash_join_partition_probe={partition_probe}; ')
-                    if name == 'perfect-aggregate':
-                        settings += 'SET pg_yaap.profile=on; '
                     result = runtime.run(settings + query)
                     tag = f'{name}-w{workers}-probe-{partition_probe}'
                     if result.returncode or result.stdout != expected:
@@ -52,27 +49,6 @@ def main():
                         (runtime.OUT / f'{tag}.out').write_text(result.stdout)
                         (runtime.OUT / f'{tag}.err').write_text(result.stderr)
                         raise AssertionError(f'{tag}: result mismatch or SQL error; see {runtime.OUT}')
-                    if name == 'perfect-aggregate':
-                        # Small integer domains still use regular hashagg.
-                        # char(1) keys select the actual perfect-hash sink;
-                        # require profiler evidence to keep this regression
-                        # from silently losing coverage as planning changes.
-                        if not re.search(r'overall stage=perfect_agg_combine_global[^\n]*calls=1\b',
-                                         result.stderr):
-                            raise AssertionError(f'{tag}: perfect-hash combine was not executed once')
-                        updates = re.findall(
-                            r'role=(leader|worker) worker_index=(-?\d+)[^\n]*'
-                            r'stage=perfect_agg_update_local[^\n]*rows=(\d+)', result.stderr)
-                        producer_count = sum(int(rows) > 0 for _, _, rows in updates)
-                        # One idle process may legitimately claim several complete RUN tasks.
-                        required = 1
-                        if producer_count < required:
-                            raise AssertionError(f'{tag}: expected {required} active perfect-hash producers, '
-                                                 f'observed {producer_count}')
-                        if sum(int(rows) for _, _, rows in updates) != 1000000:
-                            raise AssertionError(f'{tag}: perfect-hash producers did not consume every row')
-                        if any(role == 'leader' for role, _, _ in updates):
-                            raise AssertionError(f'{tag}: leader unexpectedly ran the sink')
                     print(f'{tag}: PASS', flush=True)
     finally:
         runtime.ddl(f'DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;')

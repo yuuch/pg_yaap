@@ -371,8 +371,8 @@ HashAggChoosePartitionCount(uint32_t worker_count, uint32_t row_width)
 		target = width_target;
 	if (target < 8u)
 		target = 8u;
-	if (target > 32u)
-		target = 32u;
+	if (target > 64u)
+		target = 64u;
 
 	uint32_t pow2 = 1;
 	while (pow2 < target)
@@ -1089,6 +1089,250 @@ AggregateHashTableFindOrInsertSegmented(AggregateHashTable *aht,
 	SpinLockRelease(&aht->mutex);
 	ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("pg_yaap: segmented aggregate AHT full (capacity=%u)", aht->capacity)));
+}
+
+static inline bool
+LayoutHasStringCols(const TupleDataLayout *layout)
+{
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
+			return true;
+	return false;
+}
+
+static inline void
+CopyWholeAggregateRow(const TupleDataLayout *layout,
+					  bool has_strings,
+					  const TupleDataCollection *src_tdc,
+					  const uint8_t *src_row,
+					  TupleDataCollection *dst_tdc,
+					  uint8_t *dst_row)
+{
+	std::memcpy(dst_row, src_row, layout->row_width);
+	if (!has_strings)
+		return;
+	const char *src_heap = src_tdc != nullptr
+		? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(src_tdc))
+		: nullptr;
+	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
+	{
+		const TdcColumnDesc &col = layout->columns[col_idx];
+		if (col.kind != TdcColumnKind::STRING_REF)
+			continue;
+		VecStringRef src_ref;
+		std::memcpy(&src_ref, src_row + col.offset, sizeof(src_ref));
+		const char *src_ptr = VecStringRefDataPtr(src_ref, src_heap);
+		VecStringRef dst_ref;
+		if ((src_ptr == nullptr && src_ref.len != 0) ||
+			!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
+			elog(ERROR, "pg_yaap: aggregate hash table string group copy failed");
+		std::memcpy(dst_row + col.offset, &dst_ref, sizeof(dst_ref));
+	}
+}
+
+void
+AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
+									  TupleDataCollection *tdc,
+									  const TupleDataLayout *layout,
+									  const TupleDataCollection *src_tdc,
+									  uint32_t start_row,
+									  uint32_t count,
+									  const uint64_t *hashes)
+{
+	Assert(aht != nullptr && tdc != nullptr && layout != nullptr && src_tdc != nullptr && hashes != nullptr);
+	const uint32_t mask = aht->capacity_mask;
+	const bool has_strings = LayoutHasStringCols(layout);
+
+	for (uint32_t i = 0; i < count; ++i)
+		PrefetchEntry(aht, static_cast<uint32_t>(hashes[i]) & mask);
+
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		const uint8_t *src_row = TupleDataCollectionGetRowConst(src_tdc, start_row + i);
+		const uint64_t hash = hashes[i];
+		const uint16_t our_salt = HashSalt(hash);
+		const uint32_t step = ProbeStep(hash);
+		uint32_t slot = static_cast<uint32_t>(hash) & mask;
+		bool done = false;
+
+		for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+		{
+			AggHtEntry &e = aht->entries[slot];
+			if (EntryIsEmpty(e))
+			{
+				uint8_t *new_row = nullptr;
+				const uint32_t new_idx = TupleDataCollectionAppendRow(tdc, &new_row);
+				if (new_idx == TDC_INVALID_ROW_INDEX)
+					ereport(ERROR,
+					        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					         errmsg("pg_yaap: AggregateHashTableCombineRowBatchFlat TDC full")));
+				CopyWholeAggregateRow(layout, has_strings, src_tdc, src_row, tdc, new_row);
+				e.value = PackEntry(our_salt, new_idx);
+				done = true;
+				break;
+			}
+			if (EntrySalt(e) == our_salt)
+			{
+				const uint32_t existing_idx = EntryRowIndex(e);
+				uint8_t *existing_ptr = TupleDataCollectionGetRow(tdc, existing_idx);
+				if (MatchGroupRow(layout, src_tdc, src_row, tdc, existing_ptr))
+				{
+					CombineAggregates(layout, existing_ptr, src_row);
+					done = true;
+					break;
+				}
+			}
+			slot = (slot + step) & mask;
+		}
+		if (!done)
+			ereport(ERROR,
+			        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			         errmsg("pg_yaap: AggregateHashTableCombineRowBatchFlat AHT full (capacity=%u)",
+			                aht->capacity)));
+	}
+}
+
+void
+AggregateHashTableCombineRowBatchSegmented(AggregateHashTable *aht,
+										   dsa_area *dsa,
+										   dsa_pointer arena_dp,
+										   buffer::YaapBufferSharedState *buffer_state,
+										   buffer::YaapSegmentedTdc *segmented_tdc,
+										   uint32_t *row_count,
+										   const TupleDataLayout *layout,
+										   const TupleDataCollection *src_tdc,
+										   uint32_t start_row,
+										   uint32_t count,
+										   const uint64_t *hashes)
+{
+	if (aht == nullptr || dsa == nullptr || buffer_state == nullptr ||
+		segmented_tdc == nullptr || row_count == nullptr || layout == nullptr ||
+		src_tdc == nullptr || hashes == nullptr || !DsaPointerIsValid(aht->row_refs_dp))
+		ereport(ERROR, (errmsg("pg_yaap: invalid segmented hash aggregate batch combine state")));
+
+	const uint32_t mask = aht->capacity_mask;
+	const bool has_strings = LayoutHasStringCols(layout);
+	auto *row_refs_table = static_cast<buffer::YaapSegmentRowRefTable *>(
+		dsa_get_address(dsa, aht->row_refs_dp));
+	if (row_refs_table == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: segmented hash aggregate row ref table missing")));
+
+	for (uint32_t i = 0; i < count; ++i)
+		PrefetchEntry(aht, static_cast<uint32_t>(hashes[i]) & mask);
+
+	buffer::YaapSegmentHandle active_handle{};
+	TupleDataCollection *active_store = nullptr;
+	if (segmented_tdc->active.IsValid())
+	{
+		auto *active_seg = buffer::YaapSharedSegmentResolve(dsa, arena_dp, segmented_tdc->active);
+		if (active_seg != nullptr &&
+			pg_atomic_read_u32(&active_seg->state) ==
+				static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL) &&
+			DsaPointerIsValid(active_seg->payload_dp))
+		{
+			active_handle = segmented_tdc->active;
+			active_store = static_cast<TupleDataCollection *>(
+				dsa_get_address(dsa, active_seg->payload_dp));
+		}
+	}
+
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		const uint8_t *src_row = TupleDataCollectionGetRowConst(src_tdc, start_row + i);
+		const uint64_t hash = hashes[i];
+		const uint16_t salt = HashSalt(hash);
+		const uint32_t step = ProbeStep(hash);
+		uint32_t slot = static_cast<uint32_t>(hash) & mask;
+		bool done = false;
+
+		for (uint32_t tries = 0; tries < aht->capacity; ++tries)
+		{
+			AggHtEntry &entry = aht->entries[slot];
+			if (EntryIsEmpty(entry))
+			{
+				const uint32_t global_row_index = *row_count;
+				const uint32_t req_heap = has_strings
+					? TupleDataCollectionRequiredHeapBytesForRow(layout, src_tdc, src_row)
+					: 0u;
+				buffer::YaapSegmentedRowHandle handle{};
+				TupleDataCollection *store = nullptr;
+				uint8_t *canonical_row = nullptr;
+
+				if (active_store != nullptr &&
+					pg_atomic_read_u32(&active_store->row_count) < active_store->row_capacity &&
+					(!has_strings || TupleDataCollectionHasSpaceForAppend(active_store, req_heap)))
+				{
+					const uint32_t seg_row_idx = TupleDataCollectionAppendRow(active_store, &canonical_row);
+					if (seg_row_idx != TDC_INVALID_ROW_INDEX)
+					{
+						handle = buffer::YaapSegmentedRowHandle{active_handle, seg_row_idx};
+						store = active_store;
+						++segmented_tdc->row_count;
+					}
+				}
+				if (store == nullptr)
+				{
+					if (!buffer::YaapSegmentedTdcAppendWithHeap(dsa, buffer_state, segmented_tdc,
+						req_heap, &handle, &store, &canonical_row) || store == nullptr)
+						ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+									 errmsg("pg_yaap: segmented hash aggregate row append failed")));
+					active_handle = handle.segment;
+					active_store = store;
+				}
+
+				CopyWholeAggregateRow(layout, has_strings, src_tdc, src_row, store, canonical_row);
+				const auto ref_id = buffer::YaapSegmentRowRefAppend(dsa, row_refs_table,
+					buffer::YaapSegmentRowRef{handle.segment, handle.row_index});
+				if (ref_id != global_row_index)
+					ereport(ERROR, (errmsg("pg_yaap: segmented hash aggregate row reference append failed")));
+				aht->row_ref_capacity = row_refs_table->capacity;
+
+				entry.value = PackEntry(salt, global_row_index);
+				++*row_count;
+				done = true;
+				break;
+			}
+
+			if (EntrySalt(entry) == salt)
+			{
+				const uint32_t existing_index = EntryRowIndex(entry);
+				const auto *ref = buffer::YaapSegmentRowRefGet(dsa, row_refs_table, existing_index);
+				TupleDataCollection *store = nullptr;
+				if (ref != nullptr)
+				{
+					if (active_store != nullptr &&
+						ref->segment.segment_id == active_handle.segment_id &&
+						ref->segment.generation == active_handle.generation &&
+						ref->segment.arena_id == active_handle.arena_id)
+					{
+						store = active_store;
+					}
+					else
+					{
+						const auto *segment = buffer::YaapSharedSegmentResolve(dsa, arena_dp, ref->segment);
+						if (segment != nullptr && DsaPointerIsValid(segment->payload_dp))
+							store = static_cast<TupleDataCollection *>(
+								dsa_get_address(dsa, segment->payload_dp));
+					}
+				}
+				if (store != nullptr && ref->row_index < pg_atomic_read_u32(&store->row_count))
+				{
+					uint8_t *existing_row = TupleDataCollectionGetRow(store, ref->row_index);
+					if (MatchGroupRow(layout, store, existing_row, src_tdc, src_row))
+					{
+						CombineAggregates(layout, existing_row, src_row);
+						done = true;
+						break;
+					}
+				}
+			}
+			slot = (slot + step) & mask;
+		}
+		if (!done)
+			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("pg_yaap: segmented hash aggregate AHT full (capacity=%u)",
+								aht->capacity)));
+	}
 }
 
 }  /* namespace pipeline */

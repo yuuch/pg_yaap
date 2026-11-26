@@ -29,7 +29,7 @@ extern "C" {
 #include "parallel/pipeline/physical_operator.hpp"
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
-#include "parallel/pipeline/pipeline_timeline.hpp"
+#include "parallel/pipeline/execution_trace.hpp"
 #include "parallel/pipeline/task_scheduler.hpp"
 #include "parallel/pipeline/worker_error.hpp"
 
@@ -142,8 +142,8 @@ void errfinish(const char *, int, const char *) {
 
 namespace pg_yaap::pipeline {
 
-void PipelineTimelineReady(PipelineSharedControl *, dsa_area *, uint32) {}
-void PipelineTimelineFinished(PipelineSharedControl *, dsa_area *, uint32, bool) {}
+YaapTraceLocalState *g_yaap_trace_local = nullptr;
+void YaapTraceRecordInstantImpl(YaapTraceEventType, YaapTraceCategory, uint32_t, uint32_t, uint64_t) noexcept {}
 void PhysicalHashJoinProbe::InitializeHybrid(ExecCtx &, uint32_t) {}
 void PhysicalHashJoinProbe::ReleaseAfterConsumerRun(ExecCtx &) {}
 void PhysicalHashJoin::ReleaseBuildPayloadAfterConsumerRun(ExecCtx &) {}
@@ -281,7 +281,7 @@ static void WaitChildOk(pid_t child) {
 
 static void TestValidationErrors() {
     TestArena arena(4, 2);
-    ExecCtx ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control, INVALID_EVENT_ID};
+    ExecCtx ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control};
 
     MockSourceOp src(2, true);
     MockSinkOp sink0(2, {0, 0, false}, {1, 1, false}, true);
@@ -324,7 +324,7 @@ static void TestValidationErrors() {
 static void TestDeepZeroTaskChain() {
     constexpr uint32_t kDepth = 20;
     TestArena arena(4, 1);
-    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control, INVALID_EVENT_ID};
+    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control};
     MetaPipelineBundle b;
     std::vector<std::unique_ptr<MockSourceOp>> srcs;
     std::vector<std::unique_ptr<MockSinkOp>> sinks;
@@ -350,7 +350,7 @@ static void TestDeepZeroTaskChain() {
     assert(events[3].dependencies_remaining == 1); /* Coalesced duplicate edge. */
 
     pg_atomic_write_membarrier_u32(&arena.control->scheduler_started, 1);
-    ExecCtx worker_ctx{nullptr, nullptr, 0, arena.control, INVALID_EVENT_ID};
+    ExecCtx worker_ctx{nullptr, nullptr, 0, arena.control};
     TaskScheduler scheduler(worker_ctx, *arena.queue, lookup);
 
     uint32_t completed_runs = 0;
@@ -377,7 +377,7 @@ static void TestDiamondAndSmallQueueMultiprocess() {
      */
     constexpr int kWorkers = 4;
     TestArena arena(2 /* tiny queue capacity < task batch! */, kWorkers);
-    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control, INVALID_EVENT_ID};
+    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control};
 
     MetaPipelineBundle b;
     MockSourceOp src(kWorkers, true);
@@ -411,7 +411,7 @@ static void TestDiamondAndSmallQueueMultiprocess() {
         kids[w] = fork();
         assert(kids[w] >= 0);
         if (kids[w] == 0) {
-            ExecCtx wctx{nullptr, nullptr, w, arena.control, INVALID_EVENT_ID};
+            ExecCtx wctx{nullptr, nullptr, w, arena.control};
             TaskScheduler sched(wctx, *arena.queue, lookup);
             while (pg_atomic_read_membarrier_u32(&arena.control->events_remaining) > 0) {
                 const bool adv = sched.Advance();
@@ -476,7 +476,7 @@ static void TestDiamondAndSmallQueueMultiprocess() {
 
 static void TestAbortBlocksSuccessorRelease() {
     TestArena arena(4, 2);
-    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control, INVALID_EVENT_ID};
+    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control};
     MetaPipelineBundle b;
     MockSourceOp src(1, false);
     MockSinkOp sink0(1, {0, 0, false}, {1, 1, false}, true);
@@ -494,7 +494,7 @@ static void TestAbortBlocksSuccessorRelease() {
     TaskScheduler::BuildEvents(b, leader_ctx);
     pg_atomic_write_membarrier_u32(&arena.control->scheduler_started, 1);
 
-    ExecCtx wctx{nullptr, nullptr, 0, arena.control, INVALID_EVENT_ID};
+    ExecCtx wctx{nullptr, nullptr, 0, arena.control};
     TaskScheduler sched(wctx, *arena.queue, lookup);
     assert(sched.Advance());
     TaskDescriptor desc{};
@@ -509,6 +509,77 @@ static void TestAbortBlocksSuccessorRelease() {
     assert(pg_atomic_read_u32(&arena.control->events_remaining) == 6);
 }
 
+static void TestDispatchPriorityFinalizeCombineRun() {
+    /* Three independent pipelines:
+     *   P0: 1 RUN, 0 COMBINE, 1 FINALIZE  -> will be advanced to RUNNING FINALIZE
+     *   P1: 1 RUN, 1 COMBINE, 1 FINALIZE  -> will be advanced to RUNNING COMBINE
+     *   P2: 2 RUN, 0 COMBINE, 1 FINALIZE  -> has RUN still pending when P0 FINALIZE & P1 COMBINE become ready
+     * Verify that DispatchReadyTasks enqueues FINALIZE before COMBINE before RUN. */
+    TestArena arena(16, 4);
+    ExecCtx leader_ctx{nullptr, nullptr, LEADER_WORKER_INDEX, arena.control};
+    MetaPipelineBundle b;
+    MockSourceOp src_p0(1, false);
+    MockSourceOp src_p1(1, false);
+    MockSourceOp src_p2(2, true);
+    MockSinkOp sink_p0(1, {0, 0, false}, {1, 1, false}, true);
+    MockSinkOp sink_p1(1, {1, 1, true}, {1, 1, false}, false);
+    MockSinkOp sink_p2(2, {0, 0, false}, {1, 1, false}, true);
+    auto make_pipe = [](PipelineId id, MockSourceOp &src, MockSinkOp &sink) {
+        auto p = std::make_unique<Pipeline>();
+        p->id = id; p->source = &src; p->sink = &sink;
+        return p;
+    };
+    b.pipelines.push_back(make_pipe(0, src_p0, sink_p0));
+    b.pipelines.push_back(make_pipe(1, src_p1, sink_p1));
+    b.pipelines.push_back(make_pipe(2, src_p2, sink_p2));
+    PipelineDsmLookup<Pipeline> lookup(nullptr);
+    for (auto &p : b.pipelines)
+        lookup.Register(p->id, p.get());
+
+    TaskScheduler::BuildEvents(b, leader_ctx);
+    pg_atomic_write_membarrier_u32(&arena.control->scheduler_started, 1);
+
+    /* Manually place P2 RUN (id 6), P1 COMBINE (id 4), P0 FINALIZE (id 2) in RUNNING
+     * with un-dispatched tasks, plus give P2 a higher EventId so linear scan would pick RUN last,
+     * and also add P3 (id 9) with RUN=1 before P0? Better: put P0=RUN, P1=COMBINE, P2=FINALIZE
+     * so linear EventId order (0, 4, 8) is the EXACT OPPOSITE of priority order (8, 4, 0)! */
+    auto *events = static_cast<EventShmState *>(dsa_get_address(nullptr, arena.control->event_states_root));
+    /* Reset P0..P2 to test reverse EventId order:
+     *   id 0 (P0 RUN):      RUNNING, 1 task remaining
+     *   id 4 (P1 COMBINE):  RUNNING, 1 task remaining
+     *   id 8 (P2 FINALIZE): RUNNING, 1 task remaining */
+    for (EventId id = 0; id < arena.control->event_count; ++id) {
+        events[id].phase = SharedEventPhase::FINISHED;
+        events[id].dependencies_remaining = 0;
+        events[id].task_count = 0;
+        events[id].next_task = 0;
+        pg_atomic_write_u32(&events[id].tasks_remaining, 0);
+        pg_atomic_write_u32(&events[id].tasks_in_flight, 0);
+    }
+    auto arm = [&](EventId id) {
+        events[id].phase = SharedEventPhase::RUNNING;
+        events[id].task_count = 1;
+        events[id].max_concurrency = 1;
+        events[id].next_task = 0;
+        pg_atomic_write_u32(&events[id].tasks_remaining, 1);
+    };
+    arm(0); /* P0 RUN */
+    arm(4); /* P1 COMBINE */
+    arm(8); /* P2 FINALIZE */
+
+    ExecCtx wctx{nullptr, nullptr, 0, arena.control};
+    TaskScheduler sched(wctx, *arena.queue, lookup);
+    assert(sched.Advance());
+
+    TaskDescriptor d0{}, d1{}, d2{};
+    assert(arena.queue->TryPop(&d0));
+    assert(arena.queue->TryPop(&d1));
+    assert(arena.queue->TryPop(&d2));
+    assert(static_cast<TaskKind>(d0.kind) == TaskKind::FINALIZE && d0.pipeline_id == 2);
+    assert(static_cast<TaskKind>(d1.kind) == TaskKind::COMBINE && d1.pipeline_id == 1);
+    assert(static_cast<TaskKind>(d2.kind) == TaskKind::RUN && d2.pipeline_id == 0);
+}
+
 } /* namespace */
 
 int main() {
@@ -517,5 +588,6 @@ int main() {
     TestDeepZeroTaskChain();
     TestDiamondAndSmallQueueMultiprocess();
     TestAbortBlocksSuccessorRelease();
+    TestDispatchPriorityFinalizeCombineRun();
     return 0;
 }

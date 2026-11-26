@@ -36,8 +36,7 @@ extern "C" {
 #include "parallel/pipeline/pipeline.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/pipeline_dsm_lookup.hpp"
-#include "parallel/pipeline/pipeline_profile.hpp"
-#include "parallel/pipeline/pipeline_timeline.hpp"
+#include "parallel/pipeline/execution_trace.hpp"
 #include "parallel/pipeline/task.hpp"
 #include "parallel/pipeline/task_scheduler.hpp"
 #include "parallel/pipeline/types.hpp"
@@ -141,9 +140,14 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			wait_event_extension = WaitEventExtensionNew("pg_yaap worker");
 
 		WorkerTaskRuntime rt;
-		rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index, ctl, INVALID_EVENT_ID};
+		rt.exec_ctx = ExecCtx{worker_mcxt, dsa, worker_index, ctl};
 		rt.control = ctl;
-		PipelineProfileRegisterProcess(ctl, dsa, worker_index, MyProcPid);
+		YaapTraceAttachProcess(ctl, dsa, worker_index, MyProcPid);
+		YAAP_TRACE_INSTANT(YaapTraceEventType::WORKER_START,
+		                   YaapTraceCategory::EXECUTION,
+		                   YAAP_TRACE_INVALID_ID,
+		                   YAAP_TRACE_INVALID_ID,
+		                   0);
 		PipelineDsmLookup<Pipeline> lookup(worker_mcxt);
 
 		PgVector<std::unique_ptr<Pipeline>> owned_pipelines{
@@ -177,25 +181,14 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 				 * immediately instead of waiting for the Latch timeout. */
 				if (advanced || scheduler.Advance())
 					continue;
-				instr_time wait_start;
-				if (pg_atomic_read_u32(&ctl->profile_enabled) != 0)
-					INSTR_TIME_SET_CURRENT(wait_start);
-				int rc = WaitLatch(MyLatch,
-				                   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
-				                   1000,
-				                   wait_event_extension);
-				if (pg_atomic_read_u32(&ctl->profile_enabled) != 0)
+				int rc;
 				{
-					instr_time wait_end;
-					INSTR_TIME_SET_CURRENT(wait_end);
-					instr_time elapsed = wait_end;
-					INSTR_TIME_SUBTRACT(elapsed, wait_start);
-					PipelineProfileAddElapsed(ctl,
-									  dsa,
-									  worker_index,
-									  0,
-									  PipelineProfileStage::WORKER_WAIT_TASK,
-									  elapsed);
+					YaapTraceScoped idle_scope(YaapTraceEventType::WORKER_IDLE,
+					                           YaapTraceCategory::SCHEDULER);
+					rc = WaitLatch(MyLatch,
+					               WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+					               1000,
+					               wait_event_extension);
 				}
 				if (rc & WL_POSTMASTER_DEATH)
 					break;
@@ -205,6 +198,12 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			}
 			if (WorkerShutdownRequested(ctl))
 				break;
+
+			YAAP_TRACE_INSTANT(YaapTraceEventType::TASK_DEQUEUE,
+			                   YaapTraceCategory::SCHEDULER,
+			                   desc.pipeline_id,
+			                   desc.task_index,
+			                   YaapTracePackTaskArg(desc.event_id, desc.kind, desc.partition_id));
 
 			Pipeline *pipeline = lookup.Resolve(desc.pipeline_id);
 			if (pipeline == nullptr)
@@ -236,10 +235,22 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 					break;
 			}
 
+			YaapTraceScope task_trace_scope = YaapTraceBegin(
+				YaapTraceEventType::TASK_EXECUTE,
+				YaapTraceCategory::EXECUTION,
+				desc.pipeline_id,
+				desc.task_index,
+				YaapTracePackTaskArg(desc.event_id, desc.kind, desc.partition_id,
+				                     YaapTraceTaskOutcome::OK));
 			PG_TRY();
 			{
 				if (task->Execute() != TaskExecutionResult::TASK_FINISHED)
 					ereport(ERROR, (errmsg("pg_yaap: whole pipeline task did not finish")));
+				const YaapTraceTaskOutcome outcome = WorkerShutdownRequested(ctl)
+					? YaapTraceTaskOutcome::CANCELLED
+					: YaapTraceTaskOutcome::OK;
+				YaapTraceEnd(&task_trace_scope,
+				             YaapTracePackTaskArg(desc.event_id, desc.kind, desc.partition_id, outcome));
 				CHECK_FOR_INTERRUPTS();
 				if (!WorkerShutdownRequested(ctl))
 					scheduler.CompleteTask(desc.event_id);
@@ -247,8 +258,11 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			PG_CATCH();
 			{
 				ErrorData *edata = CopyErrorData();
-				PipelineTimelineAbortProcess(ctl, dsa, worker_index,
-					edata->sqlerrcode == ERRCODE_QUERY_CANCELED);
+				const YaapTraceTaskOutcome outcome = (edata->sqlerrcode == ERRCODE_QUERY_CANCELED)
+					? YaapTraceTaskOutcome::CANCELLED
+					: YaapTraceTaskOutcome::FAILED;
+				YaapTraceEnd(&task_trace_scope,
+				             YaapTracePackTaskArg(desc.event_id, desc.kind, desc.partition_id, outcome));
 				ReportWorkerError(ctl,
 					"worker=%d kind=%u pipeline=%u partition=%u: %s%s%s",
 					worker_index, desc.kind, desc.pipeline_id, desc.partition_id,
@@ -265,6 +279,13 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 			PG_END_TRY();
 		}
 
+		YAAP_TRACE_INSTANT(YaapTraceEventType::WORKER_EXIT,
+		                   YaapTraceCategory::EXECUTION,
+		                   YAAP_TRACE_INVALID_ID,
+		                   YAAP_TRACE_INVALID_ID,
+		                   0);
+		YaapTraceDetachProcess(false);
+
 		rt.per_pipeline.clear();
 		owned_pipelines.clear();
 		dsa_detach(dsa);
@@ -275,6 +296,12 @@ pg_yaap_pipeline_worker_main(Datum main_arg)
 	PG_CATCH();
 	{
 		ErrorData *edata = CopyErrorData();
+		YAAP_TRACE_INSTANT(YaapTraceEventType::WORKER_EXIT,
+		                   YaapTraceCategory::EXECUTION,
+		                   YAAP_TRACE_INVALID_ID,
+		                   YAAP_TRACE_INVALID_ID,
+		                   1);
+		YaapTraceDetachProcess(true);
 		ReportWorkerFailure(ctl, edata->message);
 		FreeErrorData(edata);
 		FlushErrorState();

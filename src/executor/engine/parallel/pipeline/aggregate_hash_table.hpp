@@ -315,5 +315,28 @@ void AggregateHashTableCombineRowSegmented(AggregateHashTable *aht,
 									 const uint8_t *src_row,
 									 uint64_t hash);
 
+/* Batched exclusive-owner combine helpers (caller holds partition LWLock and
+ * ensures AHT/TDC headroom for up to `count` inserts). Prefetching hides DRAM
+ * latency on large hash tables and avoids per-row spinlock / DSA resolution. */
+void AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
+										   TupleDataCollection *tdc,
+										   const TupleDataLayout *layout,
+										   const TupleDataCollection *src_tdc,
+										   uint32_t start_row,
+										   uint32_t count,
+										   const uint64_t *hashes);
+
+void AggregateHashTableCombineRowBatchSegmented(AggregateHashTable *aht,
+												dsa_area *dsa,
+												dsa_pointer arena_dp,
+												buffer::YaapBufferSharedState *buffer_state,
+												buffer::YaapSegmentedTdc *segmented_tdc,
+												uint32_t *row_count,
+												const TupleDataLayout *layout,
+												const TupleDataCollection *src_tdc,
+												uint32_t start_row,
+												uint32_t count,
+												const uint64_t *hashes);
+
 }  /* namespace pipeline */
 }  /* namespace pg_yaap */

@@ -156,12 +156,15 @@ install_data(
   install_dir: join_paths(pg_sharedir, 'extension'),
 )
 
-# Portable rule/histogram tests use no server, PG headers or external packages.
-scan_io_rules_test = executable('scan_io_rules_test',
-  ['tests/scan_io_rules.cpp', 'src/executor/engine/parallel/pipeline/scan_io_diagnosis.cpp'],
-  include_directories: include_directories('src/executor/engine'),
-  cpp_args: ['-O2', '-UNDEBUG'], install: false)
-test('pg_yaap_scan_io_rules', scan_io_rules_test, timeout: 30)
+# Execution trace unit tests exercise shared-memory per-worker buffers,
+# overflow accounting, abnormal exit handling, and Chrome Trace JSON export.
+execution_trace_unit_test = executable('execution_trace_unit_test',
+  ['tests/execution_trace_unit.cpp',
+   'src/executor/engine/parallel/pipeline/execution_trace.cpp'],
+  include_directories: pg_yaap_inc,
+  cpp_args: ['-O2', '-UNDEBUG', '-I' + pg_includedir_server,
+             '-include', 'pg_yaap_postgres.h'], install: false)
+test('pg_yaap_execution_trace_unit', execution_trace_unit_test, timeout: 30)
 
 # The queue and error tests use the production PG atomics in fork/mmap memory.
 pipeline_task_queue_test = executable('pipeline_task_queue_test',

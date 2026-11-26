@@ -198,9 +198,9 @@ All defined in `pg_yaap.c::_PG_init`. All are `PGC_USERSET`.
 | `pg_yaap.parallel_max_workers` | int | 4 (0–1024) | Max bgworkers per query. |
 | `pg_yaap.parallel_min_relation_blocks` | int | 1024 (0–INT_MAX) | Min relation size before parallel lowering. |
 | `pg_yaap.parallel_experimental_hash_pipeline` | bool | `off` | Legacy GUC — registered but has no effect. |
-| `pg_yaap.profile` | bool | `off` | Emit per-stage pipeline timing after each query. |
-| `pg_yaap.profile_scan` | enum | `off` | `off`/`sample`/`exact`: attribute PG access, row-to-column, predicate and scan setup costs; see docs/scan_profile.md. |
-| `pg_yaap.profile_scan_io` | enum | `off` | `off`/`summary`/`detail`: extension-only IO observations and evidence-based diagnoses; see docs/scan_io_profiler.md. |
+| `pg_yaap.trace_enabled` | bool | `off` | Enable lightweight per-process Execution Trace recording (see `docs/execution_trace.md`). |
+| `pg_yaap.trace_buffer_mb` | int, MB | `1MB` | Per-process Execution Trace buffer size (1–16 MB, leader and each worker). |
+| `pg_yaap.trace_output_dir` | string | `""` | `PGC_SUSET` absolute directory for exported Perfetto Chrome Trace JSON files. |
 | `pg_yaap.memory_limit` | int | `256MB` | Hard budget for shared breaker payloads; DSA has bounded headroom (up to 50%, capped at 4GB) for directories and allocator metadata. |
 | `pg_yaap.memory_soft_limit` | int | `-1` | Spill threshold; `-1` uses 75% of `memory_limit`. |
 | `pg_yaap.dsa_memory_limit` | int, MB | `-1` | Exact query DSA segment-capacity ceiling; `-1` preserves automatic metadata headroom. Not a whole-query RSS limit. |
@@ -309,7 +309,7 @@ pg_yaap/
 │           ├── tuple_data_layout.hpp/.cpp
 │           ├── tuple_data_collection.hpp/.cpp
 │           ├── tuple_data_ops.hpp/.cpp
-│           ├── pipeline_profile.hpp/.cpp
+│           ├── execution_trace.hpp/.cpp
 │           └── AGENTS.md
 ```
 

@@ -116,6 +116,7 @@ public:
 	{}
 
 	bool IsSource() const override { return true; }
+	bool ParallelSource() const override { return true; }
 	bool IsSink() const override { return true; }
 	bool IsPipelineBreaker() const override { return true; }
 	int  MaxThreads(ExecCtx &ctx) const override;

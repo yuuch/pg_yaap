@@ -504,6 +504,11 @@ RetireSegmentBackingAfterGrow(ExecCtx &ctx, dsa_pointer arena_dp,
  * The writer object is reconstructed from the shared tail on every combine
  * call; only the chain links and row-reference directory are persistent. */
 static void
+GrowSegmentedAhtToCapacity(ExecCtx &ctx, HashAggPartition &part,
+						   uint32_t row_count, const TupleDataLayout *layout,
+						   uint32_t target_capacity);
+
+static void
 GrowSegmentedLocalAht(ExecCtx &ctx, HashAggPartition &part,
 					 uint32_t row_count, const TupleDataLayout *layout);
 
@@ -516,6 +521,10 @@ CombineLocalRowsIntoSegmentedGlobal(ExecCtx &ctx,
 {
 	if (!global_part.segment_backed || local_tdc == nullptr || layout == nullptr)
 		ereport(ERROR, (errmsg("pg_yaap: invalid segmented global hash aggregate state")));
+	const uint32_t row_count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&local_tdc->row_count));
+	if (row_count == 0)
+		return;
 	auto *state = ResolveBufferState(ctx);
 	if (state == nullptr)
 		ereport(ERROR, (errmsg("pg_yaap: segmented global hash aggregate buffer state missing")));
@@ -542,28 +551,35 @@ CombineLocalRowsIntoSegmentedGlobal(ExecCtx &ctx,
 	writer.segment_count = 1;
 	writer.row_count = global_part.segment_row_count;
 
-	const uint32_t row_count = pg_atomic_read_u32(
-		const_cast<pg_atomic_uint32 *>(&local_tdc->row_count));
-	for (uint32_t row_idx = 0; row_idx < row_count; ++row_idx)
+	constexpr uint32_t kCombineBatch = 64;
+	std::array<uint64_t, kCombineBatch> hashes;
+	AggregateHashTable *aht = ResolveAht(ctx.dsa, global_part.aht_dp);
+	if (aht == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: segmented global hash aggregate AHT missing")));
+
+	for (uint32_t base = 0; base < row_count; base += kCombineBatch)
 	{
-		if (PipelineCancelRequestedEvery(ctx, row_idx))
+		if (PipelineCancelRequested(ctx))
 			return;
-		const uint8_t *src_row = TupleDataCollectionGetRowConst(local_tdc, row_idx);
-		const uint64_t hash = HashGroupRow(layout, local_tdc, src_row);
-		AggregateHashTable *aht = ResolveAht(ctx.dsa, global_part.aht_dp);
-		if (aht == nullptr)
-			ereport(ERROR, (errmsg("pg_yaap: segmented global hash aggregate AHT missing")));
-		if (static_cast<uint64_t>(global_part.segment_row_count + 1u) * 3u >=
-			static_cast<uint64_t>(aht->capacity) * 2u)
+		const uint32_t batch = std::min(kCombineBatch, row_count - base);
+		for (uint32_t i = 0; i < batch; ++i)
+		{
+			const uint8_t *src_row = TupleDataCollectionGetRowConst(local_tdc, base + i);
+			hashes[i] = HashGroupRow(layout, local_tdc, src_row);
+		}
+		while (static_cast<uint64_t>(global_part.segment_row_count + batch) * 3u >=
+			   static_cast<uint64_t>(aht->capacity) * 2u)
 		{
 			GrowSegmentedLocalAht(ctx, global_part,
 				global_part.segment_row_count, layout);
 			aht = ResolveAht(ctx.dsa, global_part.aht_dp);
+			if (aht == nullptr)
+				ereport(ERROR, (errmsg("pg_yaap: segmented global hash aggregate AHT missing after grow")));
 		}
-		AggregateHashTableCombineRowSegmented(aht, ctx.dsa, global_part.segment_arena_dp,
-			state, &writer, &global_part.segment_row_count, layout, local_tdc, src_row, hash);
+		AggregateHashTableCombineRowBatchSegmented(aht, ctx.dsa, global_part.segment_arena_dp,
+			state, &writer, &global_part.segment_row_count, layout, local_tdc, base, batch,
+			hashes.data());
 	}
-	buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &writer);
 	global_part.segment_desc_dp = buffer::YaapSharedSegmentResolve(ctx.dsa,
 		global_part.segment_arena_dp, writer.active)->self_dp;
 	auto *new_tail = static_cast<buffer::YaapSharedSegmentDesc *>(
@@ -571,6 +587,32 @@ CombineLocalRowsIntoSegmentedGlobal(ExecCtx &ctx,
 	global_part.segment_id = new_tail->segment_id;
 	global_part.segment_generation = new_tail->generation;
 	global_part.tdc_dp = new_tail->payload_dp;
+}
+
+static void
+SealPublishHashAggGlobalTail(ExecCtx &ctx, HashAggPartition &part)
+{
+	if (!part.segment_backed || !DsaPointerIsValid(part.segment_desc_dp))
+		return;
+	auto *tail = static_cast<buffer::YaapSharedSegmentDesc *>(
+		dsa_get_address(ctx.dsa, part.segment_desc_dp));
+	if (tail == nullptr ||
+		pg_atomic_read_u32(&tail->state) !=
+			static_cast<uint32_t>(buffer::YaapSharedSegmentState::WRITABLE_LOCAL))
+		return;
+	auto *store = static_cast<TupleDataCollection *>(
+		dsa_get_address(ctx.dsa, tail->payload_dp));
+	if (store == nullptr)
+		ereport(ERROR, (errmsg("pg_yaap: segmented global hash aggregate tail store missing")));
+	const uint32_t heap_used = pg_atomic_read_u32(&store->heap_used);
+	const uint64_t used = offsetof(TupleDataCollection, rows) +
+		static_cast<uint64_t>(heap_used > 0 ? store->row_capacity :
+			pg_atomic_read_u32(&store->row_count)) * store->row_width + heap_used;
+	if (used > tail->capacity)
+		ereport(ERROR, (errmsg("pg_yaap: segmented global hash aggregate tail exceeds capacity")));
+	buffer::YaapSharedSegmentSetUsed(tail, static_cast<uint32_t>(used));
+	buffer::YaapSharedSegmentSeal(tail);
+	buffer::YaapSharedSegmentPublish(tail);
 }
 
 static void
@@ -889,30 +931,68 @@ AllocAhtForTdc(ExecCtx &ctx,
 	AggregateHashTableInit(*out_aht, capacity, tdc_dp);
 }
 
+static constexpr uint32_t kMaxSegmentedAhtCapacity = 1u << 26;
+
+static uint32_t
+ChooseCombineAhtCapacity(ExecCtx &ctx, uint64_t expected_rows, uint32_t workers)
+{
+	uint64_t needed = std::max<uint64_t>(1u, expected_rows);
+	needed = needed + (needed >> 1) + 1u;
+	uint32_t cap = 32u;
+	while (cap < needed && cap < kMaxSegmentedAhtCapacity)
+		cap <<= 1;
+
+	if (auto *budget = ResolveBufferState(ctx); budget != nullptr && budget->hard_limit > 0)
+	{
+		const uint64_t max_bytes = std::max<uint64_t>(
+			AggregateHashTableAllocSize(32u),
+			budget->hard_limit / 4u / std::max<uint64_t>(1u, workers));
+		while (cap > 32u && AggregateHashTableAllocSize(cap) > max_bytes)
+			cap >>= 1;
+	}
+	return cap;
+}
+
 static void
-GrowSegmentedLocalAht(ExecCtx &ctx, HashAggPartition &part,
-					 uint32_t row_count, const TupleDataLayout *layout)
+GrowSegmentedAhtToCapacity(ExecCtx &ctx, HashAggPartition &part,
+						   uint32_t row_count, const TupleDataLayout *layout,
+						   uint32_t target_capacity)
 {
 	auto *old_aht = ResolveAht(ctx.dsa, part.aht_dp);
 	if (old_aht == nullptr || !DsaPointerIsValid(old_aht->row_refs_dp))
 		elog(ERROR, "pg_yaap: segmented aggregate AHT cannot grow without row references");
-	constexpr uint32_t kMaxAhtCapacity = 1u << 26;
-	if (old_aht->capacity >= kMaxAhtCapacity)
+	if (old_aht->capacity >= kMaxSegmentedAhtCapacity)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("pg_yaap: segmented aggregate exceeds maximum AHT capacity")));
-	const uint32_t new_capacity = std::min(kMaxAhtCapacity, old_aht->capacity * 2u);
+	uint32_t new_capacity = std::max(old_aht->capacity * 2u, target_capacity);
+	if (new_capacity > kMaxSegmentedAhtCapacity)
+		new_capacity = kMaxSegmentedAhtCapacity;
 	const dsa_pointer new_dp = YaapDsaAllocateZero(ctx.dsa,
 		AggregateHashTableAllocSize(new_capacity));
 	auto *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_dp));
 	AggregateHashTableInit(new_aht, new_capacity, InvalidDsaPointer);
-	AggregateHashTableCopySegmentRefs(ctx.dsa, old_aht, new_aht);
-	TupleDataCollection row_count_header{};
-	pg_atomic_init_u32(&row_count_header.row_count, row_count);
-	AggregateHashTableRehashSegmented(new_aht, ctx.dsa, part.segment_arena_dp,
-		&row_count_header, layout);
+	/* Transfer row_refs ownership in O(1) instead of copying every reference. */
+	new_aht->row_refs_dp = old_aht->row_refs_dp;
+	new_aht->row_ref_capacity = old_aht->row_ref_capacity;
+	if (row_count > 0)
+	{
+		TupleDataCollection row_count_header{};
+		pg_atomic_init_u32(&row_count_header.row_count, row_count);
+		AggregateHashTableRehashSegmented(new_aht, ctx.dsa, part.segment_arena_dp,
+			&row_count_header, layout);
+	}
+	old_aht->row_refs_dp = InvalidDsaPointer;
+	old_aht->row_ref_capacity = 0;
 	const dsa_pointer old_dp = part.aht_dp;
 	part.aht_dp = new_dp;
 	DestroyAht(ctx, old_dp);
+}
+
+static void
+GrowSegmentedLocalAht(ExecCtx &ctx, HashAggPartition &part,
+					 uint32_t row_count, const TupleDataLayout *layout)
+{
+	GrowSegmentedAhtToCapacity(ctx, part, row_count, layout, 0);
 }
 
 static void
@@ -933,10 +1013,13 @@ ResizeAhtForTdc(ExecCtx &ctx,
 	AggregateHashTableInit(new_aht, new_capacity, tdc_dp);
 	if (old_aht->row_refs_dp != InvalidDsaPointer)
 	{
-		AggregateHashTableCopySegmentRefs(ctx.dsa, old_aht, new_aht);
+		new_aht->row_refs_dp = old_aht->row_refs_dp;
+		new_aht->row_ref_capacity = old_aht->row_ref_capacity;
 		AggregateHashTableRehashSegmented(new_aht, ctx.dsa,
 			ctx.control != nullptr ? ctx.control->shared_segment_arena_root : InvalidDsaPointer,
 			tdc, layout);
+		old_aht->row_refs_dp = InvalidDsaPointer;
+		old_aht->row_ref_capacity = 0;
 	}
 	else
 		AggregateHashTableRehash(new_aht, tdc, layout);
@@ -1223,16 +1306,6 @@ PartitionNeedsGrowForChunkBatch(const TupleDataLayout *layout,
 		RequiredHeapBytesForChunkRows(layout, chunk, row_indices, count));
 }
 
-static inline bool
-PartitionNeedsGrowForRow(const TupleDataLayout *layout,
-	                    const TupleDataCollection *tdc,
-	                    const uint8_t *row_ptr)
-{
-	return !TupleDataCollectionHasSpaceForAppend(
-		tdc,
-		TupleDataCollectionRequiredHeapBytesForRow(layout, tdc, row_ptr));
-}
-
 static void
 GatherDenseAggregateOutput(const TupleDataLayout *layout,
 	                       const TupleDataCollection *tdc,
@@ -1328,10 +1401,20 @@ PhysicalHashAggregate::GetCombineTaskPlan(ExecCtx &ctx, uint32_t run_tasks) cons
 int
 PhysicalHashAggregate::MaxThreads(ExecCtx &ctx) const
 {
-	/* String layouts above four workers use the existing flat DSA local-TDC
-	 * path (TryInitSegmentBackedTdc declines segment backing).  That storage
-	 * choice must not silently cap scan fan-out; honor the query GUC here. */
-	return static_cast<int>(EffectiveWorkerCount(ctx));
+	const uint32_t workers = EffectiveWorkerCount(ctx);
+	/* When acting as a finalized source, cap task fan-out to partition_count
+	 * so single-partition (e.g. scalar/perfect-hash) sources don't wake idle
+	 * workers. Sink fan-out always honors EffectiveWorkerCount(ctx). */
+	if (type() == PhysicalOperatorType::HASH_AGGREGATE)
+	{
+		const dsa_pointer payload_dp = DsaPointerIsValid(shared_payload_dp_)
+			? shared_payload_dp_
+			: LoadSharedPayloadFromDescriptor(this);
+		const HashAggSharedPayload *payload = ResolvePayload(ctx.dsa, payload_dp);
+		if (payload != nullptr && payload->finalized && payload->partition_count > 0)
+			return static_cast<int>(std::max(1u, std::min(workers, payload->partition_count)));
+	}
+	return static_cast<int>(workers);
 }
 
 dsa_pointer
@@ -1405,8 +1488,9 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		const uint32_t workers = EffectiveWorkerCount(ctx);
 		if (use_single_state)
 			state->max_groups = 1;
+		const uint32_t max_parts = state->max_groups >= 200000u ? 64u : 32u;
 		state->partition_count = (use_perfect_hash || use_single_state) ? 1u :
-			HashAggChoosePartitionCount(workers, state->layout->row_width);
+			std::min(max_parts, HashAggChoosePartitionCount(workers, state->layout->row_width));
 		const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 		const uint32_t initial_global_partition_rows = InitialPartitionRows(ctx, state->layout,
 			state->max_groups, state->partition_count, workers);
@@ -1631,16 +1715,35 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 	std::array<AggregateHashTableBatchProbeResult, PIPELINE_DEFAULT_CHUNK_SIZE> probe_results;
 	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_canonical_rows;
 	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_row_indices;
-	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_partitions;
-	uint16_t update_count = 0;
 
+	constexpr uint32_t kInlinePartitionCap = 64;
+	std::array<uint16_t, kInlinePartitionCap> part_counts{};
+	std::array<uint16_t, kInlinePartitionCap> part_offsets{};
+	std::array<uint16_t, kInlinePartitionCap> part_write{};
+	const bool use_radix_scatter = local.partition_count <= kInlinePartitionCap;
 	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
 	{
 		if (PipelineCancelRequestedEvery(ctx, row_idx))
 			return SinkResultType::FINISHED;
 		hashes[row_idx] = HashGroup(local.layout, in, row_idx);
-		partitions[row_idx] = static_cast<uint32_t>(hashes[row_idx] >> local.partition_shift) &
+		const uint32_t p = static_cast<uint32_t>(hashes[row_idx] >> local.partition_shift) &
 			local.partition_mask;
+		partitions[row_idx] = p;
+		if (use_radix_scatter)
+			++part_counts[p];
+	}
+
+	if (use_radix_scatter)
+	{
+		uint16_t offset = 0;
+		for (uint32_t p = 0; p < local.partition_count; ++p)
+		{
+			part_offsets[p] = offset;
+			part_write[p] = offset;
+			offset += part_counts[p];
+		}
+		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+			probe_rows[part_write[partitions[row_idx]]++] = row_idx;
 	}
 
 	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
@@ -1648,11 +1751,20 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		if (PipelineCancelRequestedEvery(ctx, part_idx))
 			return SinkResultType::FINISHED;
 		uint16_t probe_count = 0;
-		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+		uint16_t *part_rows = probe_rows.data();
+		if (use_radix_scatter)
 		{
-			if (partitions[row_idx] != part_idx)
-				continue;
-			probe_rows[probe_count++] = row_idx;
+			probe_count = part_counts[part_idx];
+			part_rows = probe_rows.data() + part_offsets[part_idx];
+		}
+		else
+		{
+			for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+			{
+				if (partitions[row_idx] != part_idx)
+					continue;
+				probe_rows[probe_count++] = row_idx;
+			}
 		}
 		if (probe_count == 0)
 			continue;
@@ -1666,7 +1778,7 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 			buffer::YaapSegmentedTdc &writer = local.segmented_writers[part_idx];
 			for (uint16_t i = 0; i < probe_count; ++i)
 			{
-				const uint16_t row_idx = probe_rows[i];
+				const uint16_t row_idx = part_rows[i];
 				TupleDataCollection *row_store = nullptr;
 				uint8_t *row = nullptr;
 				auto *aht = ResolveAht(ctx.dsa, part.aht_dp);
@@ -1698,12 +1810,12 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 		if (tdc == nullptr)
 			elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
-		while (PartitionNeedsGrowForChunkBatch(local.layout, tdc, in, probe_rows.data(), probe_count))
+		while (PartitionNeedsGrowForChunkBatch(local.layout, tdc, in, part_rows, probe_count))
 		{
 			GrowLocalTdc(ctx,
 				local,
 				part,
-				RequiredHeapBytesForChunkRows(local.layout, in, probe_rows.data(), probe_count));
+				RequiredHeapBytesForChunkRows(local.layout, in, part_rows, probe_count));
 			tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 			if (tdc == nullptr)
 				elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing after grow");
@@ -1711,7 +1823,7 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		AggregateHashTable *aht = ResolveAht(ctx.dsa, part.aht_dp);
 		for (uint16_t i = 0; i < probe_count; ++i)
 		{
-			const uint16_t row_idx = probe_rows[i];
+			const uint16_t row_idx = part_rows[i];
 			probe_inputs[i].row_idx = row_idx;
 			probe_inputs[i].hash = hashes[row_idx];
 		}
@@ -1735,41 +1847,27 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 				elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
 		}
 
-		for (uint16_t i = 0; i < probe_count; ++i)
+		if (local.layout->aggregate_count > 0)
 		{
-			update_row_indices[update_count] = probe_results[i].row_idx;
-			update_canonical_rows[update_count] = probe_results[i].canonical_row_idx;
-			update_partitions[update_count] = static_cast<uint16_t>(part_idx);
-			++update_count;
+			for (uint16_t i = 0; i < probe_count; ++i)
+			{
+				update_row_indices[i] = probe_results[i].row_idx;
+				update_canonical_rows[i] = probe_results[i].canonical_row_idx;
+			}
+			UpdateAggregatesGather(local.layout,
+				tdc->rows,
+				tdc->row_width,
+				update_canonical_rows.data(),
+				in,
+				update_row_indices.data(),
+				probe_count);
 		}
-	}
-	uint16_t update_pos = 0;
-	while (update_pos < update_count)
-	{
-		if (PipelineCancelRequestedEvery(ctx, update_pos))
-			return SinkResultType::FINISHED;
-		const uint16_t part_idx = update_partitions[update_pos];
-		uint16_t run_count = 1;
-		while (update_pos + run_count < update_count &&
-			update_partitions[update_pos + run_count] == part_idx)
-			run_count++;
-
-		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, local.local_partitions[part_idx].tdc_dp);
-		if (tdc == nullptr)
-			elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
-		UpdateAggregatesGather(local.layout,
-			tdc->rows,
-			tdc->row_width,
-			update_canonical_rows.data() + update_pos,
-			in,
-			update_row_indices.data() + update_pos,
-			run_count);
-		update_pos += run_count;
 	}
 
 	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
-		SyncSegmentUsed(ctx, local.local_partitions[part_idx],
-			ResolveTdc(ctx.dsa, local.local_partitions[part_idx].tdc_dp));
+		if (local.local_partitions[part_idx].segment_backed)
+			SyncSegmentUsed(ctx, local.local_partitions[part_idx],
+				ResolveTdc(ctx.dsa, local.local_partitions[part_idx].tdc_dp));
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -1786,25 +1884,64 @@ CombineTdcIntoGlobal(ExecCtx &ctx, HashAggGlobalSinkState &global,
 		return;
 	}
 	const uint32_t count = pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&local_tdc->row_count));
-	for (uint32_t row_idx = 0; row_idx < count; ++row_idx)
+	if (count == 0)
+		return;
+	const bool has_strings = LayoutHasStringRef(global.layout);
+	constexpr uint32_t kCombineBatch = 64;
+	std::array<uint64_t, kCombineBatch> hashes;
+
+	TupleDataCollection *tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
+	if (tdc == nullptr)
+		elog(ERROR, "pg_yaap: hash aggregate partition TDC missing");
+	AggregateHashTable *aht = ResolveAht(ctx.dsa, global_part.aht_dp);
+	if (aht == nullptr)
+		elog(ERROR, "pg_yaap: hash aggregate partition AHT missing");
+
+	for (uint32_t base = 0; base < count; base += kCombineBatch)
 	{
-		if (PipelineCancelRequestedEvery(ctx, row_idx))
+		if (PipelineCancelRequested(ctx))
 			return;
-		const uint8_t *row = TupleDataCollectionGetRowConst(local_tdc, row_idx);
-		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
-		if (tdc == nullptr)
-			elog(ERROR, "pg_yaap: hash aggregate partition TDC missing");
-		while (PartitionNeedsGrowForRow(global.layout, tdc, row))
+		const uint32_t batch = std::min(kCombineBatch, count - base);
+		uint64_t req_heap_total = 0;
+		for (uint32_t i = 0; i < batch; ++i)
 		{
-			GrowTdcForPartition(ctx, global.layout_dp, global.layout, global_part,
-				TupleDataCollectionRequiredHeapBytesForRow(global.layout, local_tdc, row));
-			tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
-			if (tdc == nullptr)
-				elog(ERROR, "pg_yaap: hash aggregate partition TDC missing after grow");
+			const uint8_t *row = TupleDataCollectionGetRowConst(local_tdc, base + i);
+			hashes[i] = HashGroupRow(global.layout, local_tdc, row);
+			if (has_strings)
+				req_heap_total += TupleDataCollectionRequiredHeapBytesForRow(global.layout, local_tdc, row);
 		}
-		AggregateHashTableCombineRow(ResolveAht(ctx.dsa, global_part.aht_dp), tdc,
-			global.layout, local_tdc, row, HashGroupRow(global.layout, local_tdc, row));
-		ResizeAhtForTdc(ctx, global_part.tdc_dp, tdc, global.layout, &global_part.aht_dp);
+		const uint32_t req_heap = req_heap_total > UINT32_MAX ? UINT32_MAX
+			: static_cast<uint32_t>(req_heap_total);
+		while (static_cast<uint64_t>(pg_atomic_read_u32(&tdc->row_count)) + batch > tdc->row_capacity ||
+			   !TupleDataCollectionHasSpaceForAppend(tdc, req_heap))
+		{
+			const uint32_t prev_cap = tdc->row_capacity;
+			const uint32_t prev_heap = tdc->heap_capacity;
+			GrowTdcForPartition(ctx, global.layout_dp, global.layout, global_part, req_heap);
+			tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
+			aht = ResolveAht(ctx.dsa, global_part.aht_dp);
+			if (tdc == nullptr || aht == nullptr)
+				elog(ERROR, "pg_yaap: hash aggregate partition TDC/AHT missing after grow");
+			if (tdc->row_capacity == prev_cap && tdc->heap_capacity == prev_heap)
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("pg_yaap: hash aggregate flat TDC cannot grow further")));
+		}
+		while (static_cast<uint64_t>(pg_atomic_read_u32(&tdc->row_count) + batch) * 3u >=
+			   static_cast<uint64_t>(aht->capacity) * 2u)
+		{
+			const uint32_t new_capacity = aht->capacity << 1;
+			dsa_pointer old_aht_dp = global_part.aht_dp;
+			dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(new_capacity));
+			AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(
+				dsa_get_address(ctx.dsa, new_aht_dp));
+			AggregateHashTableInit(new_aht, new_capacity, global_part.tdc_dp);
+			AggregateHashTableRehash(new_aht, tdc, global.layout);
+			global_part.aht_dp = new_aht_dp;
+			DestroyAht(ctx, old_aht_dp);
+			aht = new_aht;
+		}
+		AggregateHashTableCombineRowBatchFlat(aht, tdc, global.layout, local_tdc,
+			base, batch, hashes.data());
 	}
 }
 
@@ -1904,6 +2041,30 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	LWLockAcquire(&global_part.mutex, LW_EXCLUSIVE);
 	PG_TRY();
 	{
+		/* Pre-size the global partition AHT once using the known total incoming
+		 * local rows so high-cardinality combine avoids repeated rehash waves. */
+		uint64_t total_incoming_rows = 0;
+		for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
+		{
+			if (!DsaPointerIsValid(registry[slot]))
+				continue;
+			auto *parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
+			const HashAggPartition &lp = parts[input.partition_id];
+			if (lp.segment_backed)
+				total_incoming_rows += lp.segment_row_count;
+			else if (const auto *ltdc = ResolveTdc(ctx.dsa, lp.tdc_dp); ltdc != nullptr)
+				total_incoming_rows += pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&ltdc->row_count));
+		}
+		if (total_incoming_rows > 0 && global_part.segment_backed)
+		{
+			AggregateHashTable *aht = ResolveAht(ctx.dsa, global_part.aht_dp);
+			const uint32_t desired_cap = ChooseCombineAhtCapacity(
+				ctx, global_part.segment_row_count + total_incoming_rows,
+				EffectiveWorkerCount(ctx));
+			if (aht != nullptr && desired_cap > aht->capacity)
+				GrowSegmentedAhtToCapacity(ctx, global_part, global_part.segment_row_count,
+					global.layout, desired_cap);
+		}
 		for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
 		{
 			if (PipelineCancelRequestedEvery(ctx, slot))
@@ -1918,7 +2079,10 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		}
 
 		if (!cancelled)
+		{
+			SealPublishHashAggGlobalTail(ctx, global_part);
 			SpillHashAggGlobalPartition(ctx, global_part, input.partition_id);
+		}
 	}
 	PG_CATCH();
 	{
@@ -2168,17 +2332,17 @@ PhysicalHashAggregate::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceI
 			return SourceResultType::FINISHED;
 
 		const uint32_t row_count = pg_atomic_read_u32(&tdc->row_count);
+		while (local.source_cursor < row_count && out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
+		{
+			const uint8_t *row = TupleDataCollectionGetRowConst(tdc, local.source_cursor++);
+			GatherDenseAggregateOutput(global.layout, tdc, row, out, out.count++);
+		}
 		if (local.source_cursor >= row_count)
 		{
 			local.source_partition = UINT32_MAX;
 			local.source_cursor = 0;
 			local.source_segment_desc_dp = InvalidDsaPointer;
-			continue;
 		}
-
-		const uint8_t *row = TupleDataCollectionGetRowConst(tdc, local.source_cursor++);
-		GatherDenseAggregateOutput(global.layout, tdc, row, out, out.count);
-		++out.count;
 	}
 
 	return out.count > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
