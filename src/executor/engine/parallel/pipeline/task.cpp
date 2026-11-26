@@ -161,6 +161,23 @@ DrainOperatorSuffix(ExecCtx &ctx,
 
 	PhysicalOperator *op = pipeline.ops[op_idx];
 	OperatorState &op_state = *ps.local_ops[op_idx];
+	if (op->SupportsInPlace())
+	{
+		const OperatorResultType ores = op->ExecuteInPlace(ctx, input, op_state);
+		if (ores == OperatorResultType::BLOCKED)
+			RaiseBlockedForbidden();
+		if (ores == OperatorResultType::FINISHED)
+			return DrainResult::FINISHED;
+		if (ores == OperatorResultType::NEED_MORE_INPUT)
+			return DrainResult::NEED_MORE_INPUT;
+		return DrainOperatorSuffix(ctx,
+			pipeline,
+			ps,
+			op_idx + 1,
+			input,
+			scratch_a,
+			scratch_b);
+	}
 	PipelineChunk *out = ps.run_op_outputs.empty()
 		? ((&input == &scratch_a) ? &scratch_b : &scratch_a)
 		: ps.run_op_outputs[op_idx].chunk;

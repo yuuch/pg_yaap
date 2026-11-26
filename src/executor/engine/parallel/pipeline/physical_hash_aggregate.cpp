@@ -1302,6 +1302,8 @@ PartitionNeedsGrowForChunkBatch(const TupleDataLayout *layout,
 		const_cast<pg_atomic_uint32 *>(&tdc->row_count));
 	if (static_cast<uint64_t>(row_count) + count > tdc->row_capacity)
 		return true;
+	if (!LayoutHasStringRef(layout))
+		return false;
 	return !TupleDataCollectionHasSpaceForAppend(tdc,
 		RequiredHeapBytesForChunkRows(layout, chunk, row_indices, count));
 }
@@ -1854,13 +1856,28 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 				update_row_indices[i] = probe_results[i].row_idx;
 				update_canonical_rows[i] = probe_results[i].canonical_row_idx;
 			}
-			UpdateAggregatesGather(local.layout,
-				tdc->rows,
-				tdc->row_width,
-				update_canonical_rows.data(),
-				in,
-				update_row_indices.data(),
-				probe_count);
+			const uint32_t distinct = pg_atomic_read_u32(&tdc->row_count);
+			if (probe_count > 128 && distinct <= 64u && !in.has_any_dictionary())
+			{
+				UpdateAggregatesGatherDenseSmall(local.layout,
+					tdc->rows,
+					tdc->row_width,
+					update_canonical_rows.data(),
+					in,
+					update_row_indices.data(),
+					probe_count,
+					distinct);
+			}
+			else
+			{
+				UpdateAggregatesGather(local.layout,
+					tdc->rows,
+					tdc->row_width,
+					update_canonical_rows.data(),
+					in,
+					update_row_indices.data(),
+					probe_count);
+			}
 		}
 	}
 

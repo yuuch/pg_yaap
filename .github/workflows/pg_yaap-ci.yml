@@ -92,16 +92,53 @@ jobs:
         # Install into the PostgreSQL installation discovered via pg_config
         ninja -C build install
 
-    - name: Run smoke test
+    - name: Run C++ unit tests
       run: |
         export PATH=$GITHUB_WORKSPACE/pg_install/bin:$PATH
-        
-        # Initialize a temporary database for testing
-        initdb -D test_db
-        pg_ctl -D test_db -l log start
-        sleep 2
-        
-        # Load extension and display a configuration parameter to verify it works
+        meson test -C build --print-errorlogs
+
+    - name: Run smoke and Python integration tests
+      run: |
+        set -euo pipefail
+        export PATH=$GITHUB_WORKSPACE/pg_install/bin:$PATH
+        export PSQL="$GITHUB_WORKSPACE/pg_install/bin/psql"
+        export YAAP_LIBRARY="$(pg_config --pkglibdir)/pg_yaap.so"
+        export YAAP_TEST_OUTPUT="${RUNNER_TEMP:-/tmp}/yaap-test-output"
+        export PGHOST=/tmp
+        export PGPORT=55432
+        export PGUSER=postgres
+        export PGDATABASE=postgres
+
+        rm -rf test_db log "$YAAP_TEST_OUTPUT"
+        initdb -D test_db -U postgres
+
+        cleanup() {
+          status=$?
+          if [ "$status" -ne 0 ] && [ -f log ]; then
+            echo "=== PostgreSQL log tail ==="
+            tail -n 100 log || true
+          fi
+          pg_ctl -D test_db -m fast stop >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        pg_ctl -D test_db -l log -w start -o \
+          "-p 55432 -k /tmp -c listen_addresses='' -c shared_buffers=256MB -c max_worker_processes=32 -c max_parallel_workers=12"
+
+        # Verify extension loads cleanly
         psql -d postgres -c "LOAD 'pg_yaap'; SHOW pg_yaap.enabled;"
-        
-        pg_ctl -D test_db stop
+
+        # Run Python integration suites
+        for t in \
+          tests/hybrid_hash_join.py \
+          tests/right_outer_hash_join.py \
+          tests/memory_runtime.py \
+          tests/pipeline_scheduling.py \
+          tests/pipeline_stage_plans.py
+        do
+          echo "=== Running $t ==="
+          python3 "$t"
+        done
+
+        echo "=== Running tests/execution_trace.py --abnormal ==="
+        python3 tests/execution_trace.py --abnormal

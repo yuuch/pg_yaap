@@ -52,6 +52,7 @@ public:
 	virtual bool IsSource() const { return false; }
 	virtual bool IsSink() const { return false; }
 	virtual bool ParallelSource() const { return false; }
+	virtual bool SupportsInPlace() const { return false; }
 
 	/* Pipeline-breakers split MetaPipeline construction. HashAggregate / Order = true. */
 	virtual bool IsPipelineBreaker() const { return IsSink(); }
@@ -79,6 +80,10 @@ public:
 	}
 	virtual OperatorResultType Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state) {
 		(void) ctx; (void) in; (void) out; (void) state;
+		return OperatorResultType::FINISHED;
+	}
+	virtual OperatorResultType ExecuteInPlace(ExecCtx &ctx, PipelineChunk &chunk, OperatorState &state) {
+		(void) ctx; (void) chunk; (void) state;
 		return OperatorResultType::FINISHED;
 	}
 

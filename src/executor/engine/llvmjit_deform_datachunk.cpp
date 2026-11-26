@@ -1005,8 +1005,11 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 		for (int att_index = 0; att_index <= program->last_att_index; att_index++) {
 			CompactAttribute *att = TupleDescCompactAttr(desc, att_index);
 			LLVMBasicBlockRef b_next = (att_index == program->last_att_index) ? b_out : attcheck[att_index + 1];
-			bool is_target = target_idx < program->ntargets && program->targets[target_idx].att_index == att_index;
 			int current_target_idx = target_idx;
+			int target_end_idx = current_target_idx;
+			while (target_end_idx < program->ntargets &&
+				   program->targets[target_end_idx].att_index == att_index)
+				target_end_idx++;
 
 			LLVMPositionBuilderAtEnd(b, attcheck[att_index]);
 			LLVMBuildCondBr(b,
@@ -1032,8 +1035,8 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 			}
 
 			LLVMPositionBuilderAtEnd(b, attnull[att_index]);
-			if (is_target)
-				store_target_null(program->targets[current_target_idx]);
+			for (int i = current_target_idx; i < target_end_idx; i++)
+				store_target_null(program->targets[i]);
 			LLVMBuildBr(b, b_next);
 
 			LLVMPositionBuilderAtEnd(b, attnonnull[att_index]);
@@ -1071,8 +1074,8 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 				LLVMValueRef v_off = LLVMBuildLoad2(b, type_sizet, v_offp, "off");
 				LLVMValueRef v_attdatap = LLVMBuildGEP2(b, type_i8, v_tupdata_base, &v_off, 1, "attdatap");
 
-				if (is_target)
-					store_target_notnull(program->targets[current_target_idx], v_attdatap);
+				for (int i = current_target_idx; i < target_end_idx; i++)
+					store_target_notnull(program->targets[i], v_attdatap);
 
 				LLVMValueRef v_new_off;
 				if (att->attlen > 0) {
@@ -1130,8 +1133,7 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 				store_target_null(program->targets[i]);
 			LLVMBuildBr(b, b_out);
 
-			if (is_target)
-				target_idx++;
+			target_idx = target_end_idx;
 		}
 	}
 

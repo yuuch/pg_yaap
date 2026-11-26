@@ -213,6 +213,20 @@ void UpdateAggregatesGather(const TupleDataLayout *layout,
                             const uint16_t *row_indices,
                             uint16_t count);
 
+/**
+ * Column-major small-group fast path when all canonical row indices lie in
+ * [0, distinct_count) with distinct_count <= 64 and chunk has no dictionaries.
+ * When row_indices is nullptr, input rows are contiguous 0..count-1.
+ */
+void UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
+                                      uint8_t *tdc_base,
+                                      uint32_t row_width,
+                                      const uint32_t *canonical_row_indices,
+                                      const PipelineChunk &chunk,
+                                      const uint16_t *row_indices,
+                                      uint16_t count,
+                                      uint32_t distinct_count);
+
 /*
  * CombineAggregates:
  *   For each aggregate a:

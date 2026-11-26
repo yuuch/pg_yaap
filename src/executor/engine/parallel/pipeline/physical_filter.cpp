@@ -586,29 +586,20 @@ PhysicalFilter::GetOperatorState(ExecCtx &ctx)
 }
 
 OperatorResultType
-PhysicalFilter::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
+PhysicalFilter::ExecuteInPlace(ExecCtx &ctx, PipelineChunk &chunk, OperatorState &state)
 {
 	(void) ctx;
 	auto &op_state = static_cast<FilterOperatorState &>(state);
-	if (op_state.current_input_drained)
-	{
-		op_state.current_input_drained = false;
-		out.reset();
+	if (chunk.count == 0)
 		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	out = in;
-	if (out.has_any_dictionary())
-		out.flatten();
+	if (chunk.has_any_dictionary())
+		chunk.flatten();
 	if (filter_exprs_.empty())
-	{
-		op_state.current_input_drained = out.count > 0;
-		return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT : OperatorResultType::NEED_MORE_INPUT;
-	}
+		return OperatorResultType::HAVE_MORE_OUTPUT;
 
 	if (!op_state.filter_chunk)
 		op_state.filter_chunk = std::make_unique<PipelineChunk>();
-	PopulateFilterChunk(filter_inputs_, out, *op_state.filter_chunk);
+	PopulateFilterChunk(filter_inputs_, chunk, *op_state.filter_chunk);
 
 	const uint16_t required_bool_regs = RequiredFilterBoolRegs(filter_exprs_);
 	const FilterStep *simple_filter_step = nullptr;
@@ -616,7 +607,7 @@ PhysicalFilter::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, Ope
 	const char *filter_string_consts = filter_string_consts_.empty() ? nullptr : filter_string_consts_.data();
 	uint16_t selected_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
 	uint16_t selected_count = 0;
-	for (uint16_t row = 0; row < out.count; ++row)
+	for (uint16_t row = 0; row < chunk.count; ++row)
 	{
 		bool pass;
 		if (use_simple_filter)
@@ -652,12 +643,28 @@ PhysicalFilter::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, Ope
 
 	if (selected_count == 0)
 	{
+		chunk.reset_lightweight();
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+	CompactSelectedRows(chunk, selected_rows, selected_count);
+	return OperatorResultType::HAVE_MORE_OUTPUT;
+}
+
+OperatorResultType
+PhysicalFilter::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
+{
+	auto &op_state = static_cast<FilterOperatorState &>(state);
+	if (op_state.current_input_drained)
+	{
+		op_state.current_input_drained = false;
 		out.reset();
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
-	CompactSelectedRows(out, selected_rows, selected_count);
-	op_state.current_input_drained = out.count > 0;
-	return OperatorResultType::HAVE_MORE_OUTPUT;
+
+	out = in;
+	const OperatorResultType res = ExecuteInPlace(ctx, out, state);
+	op_state.current_input_drained = (res == OperatorResultType::HAVE_MORE_OUTPUT);
+	return res;
 }
 
 }  /* namespace pipeline */

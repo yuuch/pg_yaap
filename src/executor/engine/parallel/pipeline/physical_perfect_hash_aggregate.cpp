@@ -249,24 +249,16 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 	TupleDataCollection *tdc = local.local_tdc;
 	if (tdc == nullptr)
 		elog(ERROR, "pg_yaap: perfect hash local TDC missing");
+	if (in.count == 0)
+		return;
 
 	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> canonical_rows;
-	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_rows;
-	uint16_t update_count = 0;
+	const uint16_t count = in.count;
+	const bool no_dict = !in.has_any_dictionary();
 
-	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
-	{
-		uint32_t key = 0;
-		if (!EncodePerfectHashKey(local.layout, in, row_idx, &key) ||
-			key >= local.perfect_capacity)
-		{
-			ereport(ERROR,
-			        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-			         errmsg("pg_yaap: perfect hash key out of domain")));
-		}
-
+	auto insert_or_lookup = [&](uint16_t row_idx, uint32_t key) -> uint32_t {
 		uint32_t canonical_idx = local.perfect_row_indices[key];
-		if (canonical_idx == TDC_INVALID_ROW_INDEX)
+		if (unlikely(canonical_idx == TDC_INVALID_ROW_INDEX))
 		{
 			while (pg_atomic_read_u32(&tdc->row_count) >= tdc->row_capacity)
 			{
@@ -280,21 +272,77 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 			ScatterGroupOnly(local.layout, tdc, candidate_row, in, row_idx);
 			local.perfect_row_indices[key] = canonical_idx;
 		}
+		return canonical_idx;
+	};
 
-		update_rows[update_count] = row_idx;
-		canonical_rows[update_count] = canonical_idx;
-		++update_count;
+	if (no_dict && local.layout->column_count == 1)
+	{
+		const int32_t *const c0 = in.int32_columns[local.layout->columns[0].src_col_idx];
+		for (uint16_t row_idx = 0; row_idx < count; ++row_idx)
+		{
+			const int32_t v0 = c0[row_idx];
+			const uint32_t key = static_cast<uint32_t>(v0);
+			if (unlikely(v0 < 0 || key >= local.perfect_capacity))
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("pg_yaap: perfect hash key out of domain")));
+			canonical_rows[row_idx] = insert_or_lookup(row_idx, key);
+		}
+	}
+	else if (no_dict && local.layout->column_count == 2)
+	{
+		const int32_t *const c0 = in.int32_columns[local.layout->columns[0].src_col_idx];
+		const int32_t *const c1 = in.int32_columns[local.layout->columns[1].src_col_idx];
+		for (uint16_t row_idx = 0; row_idx < count; ++row_idx)
+		{
+			const int32_t v0 = c0[row_idx];
+			const int32_t v1 = c1[row_idx];
+			if (unlikely((static_cast<uint32_t>(v0) | static_cast<uint32_t>(v1)) > 255u))
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("pg_yaap: perfect hash key out of domain")));
+			const uint32_t key = (static_cast<uint32_t>(v0) << 8) | static_cast<uint32_t>(v1);
+			if (unlikely(key >= local.perfect_capacity))
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("pg_yaap: perfect hash key out of domain")));
+			canonical_rows[row_idx] = insert_or_lookup(row_idx, key);
+		}
+	}
+	else
+	{
+		for (uint16_t row_idx = 0; row_idx < count; ++row_idx)
+		{
+			uint32_t key = 0;
+			if (!EncodePerfectHashKey(local.layout, in, row_idx, &key) ||
+				key >= local.perfect_capacity)
+			{
+				ereport(ERROR,
+				        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				         errmsg("pg_yaap: perfect hash key out of domain")));
+			}
+			canonical_rows[row_idx] = insert_or_lookup(row_idx, key);
+		}
 	}
 
-	if (update_count > 0)
+	const uint32_t distinct = pg_atomic_read_u32(&tdc->row_count);
+	if (no_dict && distinct <= 64u)
 	{
+		UpdateAggregatesGatherDenseSmall(local.layout,
+			tdc->rows,
+			tdc->row_width,
+			canonical_rows.data(),
+			in,
+			nullptr,
+			count,
+			distinct);
+	}
+	else
+	{
+		std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> update_rows;
+		for (uint16_t i = 0; i < count; ++i)
+			update_rows[i] = i;
 		UpdateAggregatesGather(local.layout,
 			tdc->rows,
 			tdc->row_width,
 			canonical_rows.data(),
 			in,
 			update_rows.data(),
-			update_count);
+			count);
 	}
 }
 
