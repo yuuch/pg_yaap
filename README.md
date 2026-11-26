@@ -103,13 +103,13 @@ See [Pipeline runtime and process communication](docs/pipeline_runtime.md) for t
 
 ![TPC-H median runtime chart](imgs/comparison.svg)
 
-> Benchmark numbers depend on hardware, PostgreSQL configuration, dataset scale factor, query coverage, and whether the query is fully supported by YAAP. Treat this chart as a snapshot, not a universal claim.
+> Updated `pg_yaap` SF10 snapshot (Apple M4 Pro / 24GB, `shared_buffers=4GB`, `pg_yaap.memory_limit=8GB`, 12 workers): **20.5s** SQL time (**21.4s** wall time) across all 22/22 queries (down from 30.8s; vs PostgreSQL `447.9s` and `pg_duckdb` `95.8s` from the baseline run). Benchmark numbers depend on hardware, PostgreSQL configuration, dataset scale factor, query coverage, and whether the query is fully supported by YAAP. Treat this chart as a snapshot, not a universal claim.
 
 ### SF100 (100GB)
 
 ![TPC-H SF100 comparison](imgs/comparison-sf100.svg)
 
-This run used the `tpch100g` database (about 125GB on disk) on a 24GB M4 Pro, with 2GB `shared_buffers`. YAAP used 12 workers, an 8GiB payload limit, and a 20GiB DSA limit. pg_duckdb used its default 4GiB memory limit and default scan parallelism. YAAP and pg_duckdb were interleaved by query; PostgreSQL ran separately. Each timeout counts as 600 seconds in the total.
+This snapshot uses the `tpch100g` database (about 125GB on disk) on a 24GB M4 Pro. In the updated `pg_yaap` run (`shared_buffers=4GB`, 12 workers, `pg_yaap.memory_limit=8GB`), all **22/22** queries complete in **414.5s** SQL time (**425.3s** wall time, 0 timeouts — down from `619.5s`). PostgreSQL native (`3,302.0s`, 18/22 OK, 4 timeouts) and `pg_duckdb` (`3,346.6s`, 18/22 OK, 4 timeouts, default 4GiB memory and scan parallelism) are from the `shared_buffers=2GB` baseline run; each timeout counts as 600 seconds in the total.
 
 **Correctness note:** YAAP's SF100 Q1 `N|O` `sum_charge` differs from both PostgreSQL and pg_duckdb: YAAP returns a negative value while the other two return a positive value. The chart compares runtime; it does not imply matching results.
 

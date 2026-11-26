@@ -108,13 +108,13 @@ PostgreSQL 是非常优秀的通用数据库，但分析型查询通常需要一
 
 ![TPC-H median runtime chart](imgs/comparison.svg)
 
-> Benchmark 结果会受到硬件、PostgreSQL 配置、数据规模、查询覆盖范围、YAAP 支持程度等因素影响。这里的图表是当前阶段的性能快照，不代表所有环境下的通用结论。
+> 最新 `pg_yaap` SF10 快照（Apple M4 Pro / 24GB，`shared_buffers=4GB`，`pg_yaap.memory_limit=8GB`，12 workers）：22/22 查询 SQL 总耗时 **20.5s**（墙钟 **21.4s**，此前为 30.8s；对照基线 PostgreSQL `447.9s`、`pg_duckdb` `95.8s`）。Benchmark 结果会受到硬件、PostgreSQL 配置、数据规模、查询覆盖范围、YAAP 支持程度等因素影响，这里的图表是当前阶段的性能快照，不代表所有环境下的通用结论。
 
 ### SF100（100GB）
 
 ![TPC-H SF100 对比图](imgs/comparison-sf100.svg)
 
-本轮使用 `tpch100g` 数据库（磁盘占用约 125GB），运行于 24GB 内存的 M4 Pro，`shared_buffers=2GB`。YAAP 配置为 12 workers、8GiB payload 上限、20GiB DSA 上限；pg_duckdb 使用默认 4GiB 内存和默认扫描并行度。YAAP 与 pg_duckdb 按查询交错运行，PostgreSQL 单独运行；总耗时中每个 timeout 按 600 秒计。
+本快照基于 `tpch100g` 数据库（磁盘占用约 125GB），运行于 24GB 内存的 M4 Pro。最新 `pg_yaap` 结果（`shared_buffers=4GB`、12 workers、`pg_yaap.memory_limit=8GB`）在 **22/22** 查询上全部通过、0 超时，SQL 总耗时 **414.5s**（墙钟 **425.3s**，较此前 `619.5s` 提速 1.49×）；PostgreSQL 原生（`3,302.0s`，18/22 通过、4 超时）与 `pg_duckdb`（`3,346.6s`，18/22 通过、4 超时，默认 4GiB 内存与扫描并行度）来自 `shared_buffers=2GB` 基线测试，总耗时中每个 timeout 按 600 秒计。
 
 **正确性注意：**SF100 Q1 的 `N|O` 组 `sum_charge` 不一致：YAAP 返回负数，而 PostgreSQL 和 pg_duckdb 返回正数。图表比较的是耗时，不代表结果一致。
 
