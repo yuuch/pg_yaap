@@ -37,9 +37,11 @@ public:
 	bool IsSource() const override { return false; }
 	bool IsSink() const override { return false; }
 	bool IsPipelineBreaker() const override { return false; }
+	bool SupportsInPlace() const override { return true; }
 
 	std::unique_ptr<OperatorState> GetOperatorState(ExecCtx &ctx) override;
 	OperatorResultType Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state) override;
+	OperatorResultType ExecuteInPlace(ExecCtx &ctx, PipelineChunk &chunk, OperatorState &state) override;
 
 	dsa_pointer input_schema_dp() const { return input_schema_dp_; }
 	dsa_pointer output_schema_dp() const { return output_schema_dp_; }

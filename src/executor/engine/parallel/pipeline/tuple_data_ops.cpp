@@ -1233,6 +1233,200 @@ UpdateAggregatesGather(const TupleDataLayout *layout,
 }
 
 void
+UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
+                                 uint8_t *tdc_base,
+                                 uint32_t row_width,
+                                 const uint32_t *canonical_row_indices,
+                                 const PipelineChunk &chunk,
+                                 const uint16_t *row_indices,
+                                 uint16_t count,
+                                 uint32_t distinct_count)
+{
+	Assert(layout != nullptr && tdc_base != nullptr && canonical_row_indices != nullptr);
+	Assert(row_width == layout->row_width);
+	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
+	if (count == 0 || layout->aggregate_count == 0)
+		return;
+	if (distinct_count == 0 || distinct_count > 64 || chunk.has_any_dictionary())
+	{
+		if (row_indices != nullptr)
+		{
+			UpdateAggregatesGatherGroupedGeneric(layout,
+				tdc_base,
+				row_width,
+				canonical_row_indices,
+				chunk,
+				row_indices,
+				count);
+			return;
+		}
+		uint16_t seq_rows[PIPELINE_DEFAULT_CHUNK_SIZE];
+		for (uint16_t i = 0; i < count; ++i)
+			seq_rows[i] = i;
+		UpdateAggregatesGatherGroupedGeneric(layout,
+			tdc_base,
+			row_width,
+			canonical_row_indices,
+			chunk,
+			seq_rows,
+			count);
+		return;
+	}
+
+	bool have_group_counts = false;
+	int64_t group_counts[64]{};
+
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		const uint16_t agg_off = agg.offset;
+		switch (agg.kind)
+		{
+			case TdcAggKind::SUM_INT64:
+			case TdcAggKind::SUM_NUMERIC:
+			{
+				const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
+				int64_t acc[64]{};
+				if (row_indices == nullptr)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						acc[canonical_row_indices[i]] += src[i];
+				}
+				else
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						acc[canonical_row_indices[i]] += src[row_indices[i]];
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					AddInt64At(tdc_base + static_cast<size_t>(g) * row_width, agg_off, acc[g]);
+				break;
+			}
+			case TdcAggKind::COUNT_STAR:
+			{
+				if (!have_group_counts)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						++group_counts[canonical_row_indices[i]];
+					have_group_counts = true;
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					AddInt64At(tdc_base + static_cast<size_t>(g) * row_width, agg_off, group_counts[g]);
+				break;
+			}
+			case TdcAggKind::COUNT_NONNULL:
+			case TdcAggKind::COUNT_DISTINCT_NONNULL:
+			{
+				const uint8_t *const nulls = chunk.nulls[agg.src_col_idx];
+				int64_t acc[64]{};
+				if (row_indices == nullptr)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						acc[canonical_row_indices[i]] += (nulls[i] == 0 ? 1 : 0);
+				}
+				else
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						acc[canonical_row_indices[i]] += (nulls[row_indices[i]] == 0 ? 1 : 0);
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					AddInt64At(tdc_base + static_cast<size_t>(g) * row_width, agg_off, acc[g]);
+				break;
+			}
+			case TdcAggKind::AVG_NUMERIC:
+			{
+				const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
+				int64_t acc[64]{};
+				if (row_indices == nullptr)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						acc[canonical_row_indices[i]] += src[i];
+				}
+				else
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						acc[canonical_row_indices[i]] += src[row_indices[i]];
+				}
+				if (!have_group_counts)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+						++group_counts[canonical_row_indices[i]];
+					have_group_counts = true;
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+				{
+					uint8_t *row_ptr = tdc_base + static_cast<size_t>(g) * row_width;
+					AddInt64At(row_ptr, agg_off, acc[g]);
+					AddInt64At(row_ptr, agg_off + 8, group_counts[g]);
+				}
+				break;
+			}
+			case TdcAggKind::MIN_INT64:
+			case TdcAggKind::MIN_NUMERIC:
+			{
+				const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
+				int64_t cur[64];
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					cur[g] = ReadInt64At(tdc_base + static_cast<size_t>(g) * row_width, agg_off);
+				if (row_indices == nullptr)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+					{
+						const uint32_t g = canonical_row_indices[i];
+						const int64_t v = src[i];
+						if (cur[g] == INT64_MAX || v < cur[g])
+							cur[g] = v;
+					}
+				}
+				else
+				{
+					for (uint16_t i = 0; i < count; ++i)
+					{
+						const uint32_t g = canonical_row_indices[i];
+						const int64_t v = src[row_indices[i]];
+						if (cur[g] == INT64_MAX || v < cur[g])
+							cur[g] = v;
+					}
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					std::memcpy(tdc_base + static_cast<size_t>(g) * row_width + agg_off, &cur[g], sizeof(int64_t));
+				break;
+			}
+			case TdcAggKind::MAX_INT64:
+			case TdcAggKind::MAX_NUMERIC:
+			{
+				const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
+				int64_t cur[64];
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					cur[g] = ReadInt64At(tdc_base + static_cast<size_t>(g) * row_width, agg_off);
+				if (row_indices == nullptr)
+				{
+					for (uint16_t i = 0; i < count; ++i)
+					{
+						const uint32_t g = canonical_row_indices[i];
+						const int64_t v = src[i];
+						if (cur[g] == INT64_MIN || v > cur[g])
+							cur[g] = v;
+					}
+				}
+				else
+				{
+					for (uint16_t i = 0; i < count; ++i)
+					{
+						const uint32_t g = canonical_row_indices[i];
+						const int64_t v = src[row_indices[i]];
+						if (cur[g] == INT64_MIN || v > cur[g])
+							cur[g] = v;
+					}
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					std::memcpy(tdc_base + static_cast<size_t>(g) * row_width + agg_off, &cur[g], sizeof(int64_t));
+				break;
+			}
+		}
+	}
+}
+
+void
 CombineAggregates(const TupleDataLayout *layout,
                   uint8_t *dst_row,
                   const uint8_t *src_row)

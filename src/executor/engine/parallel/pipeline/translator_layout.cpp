@@ -250,12 +250,12 @@ TryBuildPerfectHashSpec(const std::vector<ColumnRef> &group_cols,
 			return false;
 		if (col->decode_kind != ColumnDecodeKind::INT32_CHAR ||
 			(col->type_oid != BPCHAROID && col->type_oid != CHAROID) ||
-			capacity > 1024u / 256u)
+			capacity > 65536u / 256u)
 			return false;
 		capacity *= 256u;
 	}
 	out_capacity = capacity;
-	return capacity > 0 && capacity <= 1024u;
+	return capacity > 0 && capacity <= 65536u;
 }
 
 bool

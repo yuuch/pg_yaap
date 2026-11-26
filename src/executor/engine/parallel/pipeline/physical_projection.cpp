@@ -549,19 +549,14 @@ PhysicalProjection::GetOperatorState(ExecCtx &ctx)
 }
 
 OperatorResultType
-PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
+PhysicalProjection::ExecuteInPlace(ExecCtx &ctx, PipelineChunk &chunk, OperatorState &state)
 {
 	(void) ctx;
-	auto &op_state = static_cast<ProjectionOperatorState &>(state);
-	if (op_state.current_input_drained)
-	{
-		op_state.current_input_drained = false;
-		out.reset();
+	(void) state;
+	if (chunk.count == 0)
 		return OperatorResultType::NEED_MORE_INPUT;
-	}
-	out = in;
-	if (out.has_any_dictionary())
-		out.flatten();
+	if (chunk.has_any_dictionary())
+		chunk.flatten();
 
 	for (const ProjectExprDesc &expr : expr_descs_)
 	{
@@ -575,15 +570,29 @@ PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out,
 		     ++step_idx)
 		{
 			const ProjectStep &step = steps_[step_idx];
-			ExecuteStep(step, out);
+			ExecuteStep(step, chunk);
 		}
 
 		if (expr.output_chunk_slot != steps_[expr.first_step_idx + expr.n_steps - 1].out_chunk_slot)
 			elog(ERROR, "pg_yaap: projection output slot descriptor mismatch");
 	}
-	op_state.current_input_drained = out.count > 0;
-	return out.count > 0 ? OperatorResultType::HAVE_MORE_OUTPUT
-	                     : OperatorResultType::NEED_MORE_INPUT;
+	return OperatorResultType::HAVE_MORE_OUTPUT;
+}
+
+OperatorResultType
+PhysicalProjection::Execute(ExecCtx &ctx, PipelineChunk &in, PipelineChunk &out, OperatorState &state)
+{
+	auto &op_state = static_cast<ProjectionOperatorState &>(state);
+	if (op_state.current_input_drained)
+	{
+		op_state.current_input_drained = false;
+		out.reset();
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+	out = in;
+	const OperatorResultType res = ExecuteInPlace(ctx, out, state);
+	op_state.current_input_drained = (res == OperatorResultType::HAVE_MORE_OUTPUT);
+	return res;
 }
 
 }  /* namespace pipeline */
