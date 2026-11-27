@@ -147,6 +147,7 @@ public:
 		tupdesc_ = tupdesc;
 		operation_ = operation;
 	}
+	void SetSkipEmitRows(uint64 skip_rows) { skip_emit_rows_ = skip_rows; }
 
 private:
 	DestReceiver *dest_;
@@ -159,6 +160,7 @@ private:
 	dsa_pointer   shared_payload_dp_;
 	uint32_t      tdc_max_rows_;
 	uint64        max_emit_rows_;
+	uint64        skip_emit_rows_ = 0;
 	OpDescriptor *desc_;
 	PgVector<OpDescriptor *> desc_list_;
 };

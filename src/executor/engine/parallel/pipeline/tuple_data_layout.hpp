@@ -40,7 +40,7 @@ namespace pipeline {
  * Compile-time cap on per-operator column counts. 32 covers all TPC-H
  * shapes (max ~12 cols including aggs at Q9). Layout struct size ≈ 1 KB.
  */
-static constexpr uint16_t TUPLE_DATA_MAX_COLUMNS = 32;
+static constexpr uint16_t TUPLE_DATA_MAX_COLUMNS = 192;
 
 /*
  * Column kind for fixed-width data columns. Scatter/gather dispatch on this
@@ -90,7 +90,11 @@ enum class TdcAggKind : uint8_t {
 	MIN_NUMERIC  = 7,
 	MAX_INT64    = 8,
 	MAX_NUMERIC  = 9,
+	MIN_STRING   = 10,
+	MAX_STRING   = 11,
 };
+
+static constexpr uint32_t kTdcMinMaxStringEmptyOffset = UINT32_MAX - 1;
 
 /*
  * Per-column descriptor.
@@ -128,7 +132,7 @@ struct TdcColumnDesc {
  */
 struct TdcAggregateDesc {
 	TdcAggKind kind;
-	uint8_t    _pad0;
+	uint8_t    input_is_string;
 	uint16_t   offset;
 	uint16_t   width;
 	uint16_t   src_col_idx;
@@ -216,6 +220,33 @@ TupleDataLayoutColumnIsNull(const TupleDataLayout *layout, const uint8_t *row, u
 		return false;
 	const uint8_t *bitmap = row + TupleDataLayoutValidityOffset(layout);
 	return (bitmap[column >> 3] & (uint8_t(1u) << (column & 7u))) != 0;
+}
+
+static inline bool
+TdcLayoutHasStringAgg(const TupleDataLayout *layout)
+{
+	if (layout == nullptr)
+		return false;
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		if (layout->aggregates[a].kind == TdcAggKind::MIN_STRING ||
+			layout->aggregates[a].kind == TdcAggKind::MAX_STRING)
+			return true;
+	}
+	return false;
+}
+
+static inline bool
+TdcLayoutHasAnyString(const TupleDataLayout *layout)
+{
+	if (layout == nullptr)
+		return false;
+	for (uint16_t i = 0; i < layout->column_count; ++i)
+	{
+		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
+			return true;
+	}
+	return TdcLayoutHasStringAgg(layout);
 }
 
 /*

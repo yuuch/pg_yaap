@@ -203,7 +203,16 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 			const auto &order = static_cast<const PhysicalOrderBy &>(op);
 			if (order.children.size() != 1 || order.children[0] == nullptr)
 				return false;
-			if (!TranslateOptimizerNode(*order.children[0], queryDesc, state, required_output_cols, out))
+			std::vector<ColumnRef> order_required;
+			const std::vector<ColumnRef> *order_required_ptr = required_output_cols;
+			if (required_output_cols != nullptr && !required_output_cols->empty())
+			{
+				order_required = *required_output_cols;
+				for (const auto *node : order.orders)
+					CollectReferencedSourceColumns(node, order.children[0].get(), order_required);
+				order_required_ptr = &order_required;
+			}
+			if (!TranslateOptimizerNode(*order.children[0], queryDesc, state, order_required_ptr, out))
 			{
 				if (pg_yaap_trace_hooks)
 					elog(LOG, "pg_yaap: optimizer order rejected: child translation failed");
@@ -222,14 +231,26 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 				return false;
 			if (limit_count == 0)
 				return false;
+			uint64_t limit_offset = 0;
+			if (limit.limit_offset != nullptr && !TryParseLimitExpression(limit.limit_offset, limit_offset))
+				return false;
 			if (IsTopNNode(op))
 			{
 				const auto &order = static_cast<const PhysicalOrderBy &>(*limit.children[0]);
+				std::vector<ColumnRef> order_required;
+				const std::vector<ColumnRef> *order_required_ptr = required_output_cols;
+				if (required_output_cols != nullptr && !required_output_cols->empty())
+				{
+					order_required = *required_output_cols;
+					for (const auto *node : order.orders)
+						CollectReferencedSourceColumns(node, order.children[0].get(), order_required);
+					order_required_ptr = &order_required;
+				}
 				OptimizerNodeTranslation child;
 				if (!TranslateOptimizerNode(*order.children[0],
 						queryDesc,
 						state,
-						required_output_cols,
+						order_required_ptr,
 						child))
 					return false;
 				if (!BuildFinalSortKeys(order,
@@ -239,6 +260,10 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 						child.schema,
 						child.final_sort_keys))
 					return false;
+				const uint64_t keep_rows_u64 = limit_count + limit_offset;
+				if (keep_rows_u64 > UINT32_MAX)
+					return false;
+				const uint32_t keep_rows = static_cast<uint32_t>(keep_rows_u64);
 				TupleDataLayout payload_layout;
 				if (!BuildColumnOnlyLayout(child.schema, payload_layout))
 					return false;
@@ -260,24 +285,25 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 				LWLockInitialize(&shared_payload->mutex, LWTRANCHE_PARALLEL_QUERY_DSA);
 				shared_payload->sort_indices_dp = InvalidDsaPointer;
 				shared_payload->finalized = false;
+				shared_payload->offset_rows = static_cast<uint32_t>(limit_offset);
 				shared_payload->tdc_dp = pipeline::TupleDataCollectionAllocate(state->runtime_dsa,
-					static_cast<uint32_t>(limit_count),
+					keep_rows,
 					payload_layout.row_width,
-					TupleDataCollectionDefaultHeapCapacity(&payload_layout, static_cast<uint32_t>(limit_count)));
+					TupleDataCollectionDefaultHeapCapacity(&payload_layout, keep_rows));
 				auto *global_tdc = static_cast<TupleDataCollection *>(
 					dsa_get_address(state->runtime_dsa, shared_payload->tdc_dp));
 				TupleDataCollectionInit(global_tdc,
-					static_cast<uint32_t>(limit_count),
+					keep_rows,
 					payload_layout.row_width,
 					layout_dp,
-					TupleDataCollectionDefaultHeapCapacity(&payload_layout, static_cast<uint32_t>(limit_count)));
+					TupleDataCollectionDefaultHeapCapacity(&payload_layout, keep_rows));
 				auto topn = std::make_unique<PipelineTopN>(
 					input_schema_dp,
 					layout_dp,
 					sort_keys_dp,
 					static_cast<uint16_t>(child.final_sort_keys.size()),
 					shared_payload_dp,
-					static_cast<uint32_t>(limit_count));
+					keep_rows);
 				topn->AddChild(std::move(child.op));
 				child.op = std::move(topn);
 				child.final_sort_keys.clear();
@@ -290,6 +316,7 @@ TranslateOptimizerNode(const PhysicalOperator &op,
 				return false;
 			out = std::move(child);
 			out.limit_count = limit_count;
+			out.limit_offset = limit_offset;
 			return true;
 		}
 

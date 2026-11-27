@@ -52,6 +52,8 @@ TupleDataLayoutAggregateWidth(TdcAggKind kind)
 		case TdcAggKind::MIN_NUMERIC:  return 8;
 		case TdcAggKind::MAX_INT64:    return 8;
 		case TdcAggKind::MAX_NUMERIC:  return 8;
+		case TdcAggKind::MIN_STRING:   return sizeof(VecStringRef);
+		case TdcAggKind::MAX_STRING:   return sizeof(VecStringRef);
 	}
 	elog(ERROR, "pg_yaap: TupleDataLayoutAggregateWidth: unknown TdcAggKind %u",
 		 static_cast<unsigned>(kind));

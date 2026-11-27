@@ -384,7 +384,8 @@ LowerScanFilterCompare(const BoundFunctionExpression *func,
 		if (col->decode_kind == ColumnDecodeKind::INT64_INT8)
 		{
 			Datum datum = 0;
-			if (!ConvertConstantToDatum(constant, INT8OID, -1, datum) ||
+			const Oid parse_oid = (col->type_oid == TIMESTAMPOID) ? TIMESTAMPOID : INT8OID;
+			if (!ConvertConstantToDatum(constant, parse_oid, -1, datum) ||
 				!MapComparisonNameToQualOp(func->function_name, step.cmp_op))
 				return false;
 			step.op = FilterStepOp::INT64_CMP_CONST;
@@ -1089,7 +1090,8 @@ LowerJoinFilterCompare(const BoundFunctionExpression *func,
 		if (col->decode_kind == ColumnDecodeKind::INT64_INT8)
 		{
 			Datum datum = 0;
-			if (!ConvertConstantToDatum(constant, INT8OID, -1, datum) ||
+			const Oid parse_oid = (col->type_oid == TIMESTAMPOID) ? TIMESTAMPOID : INT8OID;
+			if (!ConvertConstantToDatum(constant, parse_oid, -1, datum) ||
 				!MapComparisonNameToQualOp(func->function_name, step.cmp_op))
 				return false;
 			step.op = FilterStepOp::INT64_CMP_CONST;

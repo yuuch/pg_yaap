@@ -97,6 +97,12 @@ TupleDataCollectionDefaultHeapCapacity(const TupleDataLayout *layout,
 		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
 			string_columns++;
 	}
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		if (layout->aggregates[a].kind == TdcAggKind::MIN_STRING ||
+			layout->aggregates[a].kind == TdcAggKind::MAX_STRING)
+			string_columns++;
+	}
 	if (string_columns == 0)
 		return 0;
 
@@ -263,9 +269,18 @@ TupleDataCollectionRequiredHeapBytesForChunkRow(const TupleDataLayout *layout,
 		const TdcColumnDesc &col = layout->columns[i];
 		if (col.kind != TdcColumnKind::STRING_REF)
 			continue;
-		Assert(col.src_col_idx < 16);
+		Assert(col.src_col_idx < kDataChunkMaxSlots);
 		required += HeapBytesNeededForStringLength(
 			chunk.get_string_ref(col.src_col_idx, row_idx).len);
+	}
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		if (agg.kind != TdcAggKind::MIN_STRING && agg.kind != TdcAggKind::MAX_STRING)
+			continue;
+		Assert(agg.src_col_idx < kDataChunkMaxSlots);
+		required += HeapBytesNeededForStringLength(
+			chunk.get_string_ref(agg.src_col_idx, row_idx).len);
 	}
 
 	return required > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(required);
@@ -292,6 +307,22 @@ TupleDataCollectionRequiredHeapBytesForRow(const TupleDataLayout *layout,
 			tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
 		if (ref.len != 0 && ptr == nullptr)
 			elog(ERROR, "pg_yaap: STRING_REF row-store copy missing heap backing");
+		required += HeapBytesNeededForStringLength(ref.len);
+	}
+	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[a];
+		if (agg.kind != TdcAggKind::MIN_STRING && agg.kind != TdcAggKind::MAX_STRING)
+			continue;
+
+		VecStringRef ref;
+		std::memcpy(&ref, row_ptr + agg.offset, sizeof(ref));
+		if (ref.len == 0 && ref.offset == kTdcMinMaxStringEmptyOffset)
+			continue;
+		const char *ptr = VecStringRefDataPtr(ref,
+			tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+		if (ref.len != 0 && ptr == nullptr)
+			elog(ERROR, "pg_yaap: MIN/MAX STRING_REF row-store copy missing heap backing");
 		required += HeapBytesNeededForStringLength(ref.len);
 	}
 

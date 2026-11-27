@@ -4,8 +4,10 @@
 
 extern "C" {
 #include "postgres.h"
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_type_d.h"
 #include "utils/elog.h"
+#include "utils/varlena.h"
 
 extern int pg_yaap_parallel_max_workers;
 extern bool pg_yaap_trace_hooks;
@@ -57,17 +59,20 @@ GetSingleDistinctCountAgg(const TupleDataLayout *layout, uint16_t *out_idx = nul
 {
 	if (layout == nullptr)
 		return false;
+	uint16_t found_idx = UINT16_MAX;
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
 		if (layout->aggregates[agg_idx].kind != TdcAggKind::COUNT_DISTINCT_NONNULL)
 			continue;
-		if (layout->aggregate_count != 1)
-			elog(ERROR, "pg_yaap: distinct aggregates currently require a single COUNT(DISTINCT ...) aggregate");
-		if (out_idx != nullptr)
-			*out_idx = agg_idx;
-		return true;
+		if (found_idx != UINT16_MAX)
+			elog(ERROR, "pg_yaap: multiple COUNT(DISTINCT ...) aggregates in one HashAggregate are not yet supported");
+		found_idx = agg_idx;
 	}
-	return false;
+	if (found_idx == UINT16_MAX)
+		return false;
+	if (out_idx != nullptr)
+		*out_idx = found_idx;
+	return true;
 }
 
 static bool
@@ -94,10 +99,18 @@ BuildDistinctLayout(dsa_area *dsa, const TupleDataLayout *layout,
 		(void) TupleDataLayoutAppendColumn(&distinct_layout, col.kind, col.src_col_idx,
 			col.pg_type_oid, col.numeric_scale);
 	}
-	(void) TupleDataLayoutAppendColumn(&distinct_layout, TdcColumnKind::INT64,
-		distinct_agg.src_col_idx,
-		distinct_agg.numeric_scale != 0 ? NUMERICOID : INT8OID,
-		distinct_agg.numeric_scale);
+	if (distinct_agg.input_is_string != 0)
+	{
+		(void) TupleDataLayoutAppendColumn(&distinct_layout, TdcColumnKind::STRING_REF,
+			distinct_agg.src_col_idx, TEXTOID, 0);
+	}
+	else
+	{
+		(void) TupleDataLayoutAppendColumn(&distinct_layout, TdcColumnKind::INT64,
+			distinct_agg.src_col_idx,
+			distinct_agg.numeric_scale != 0 ? NUMERICOID : INT8OID,
+			distinct_agg.numeric_scale);
+	}
 	TupleDataLayoutSeal(&distinct_layout);
 	return SerializeTupleDataLayout(distinct_layout, dsa);
 }
@@ -166,6 +179,23 @@ CopyTdcRow(const TupleDataLayout *layout,
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+		if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+		{
+			VecStringRef src_ref;
+			std::memcpy(&src_ref, src_row + agg.offset, sizeof(src_ref));
+			if (src_ref.len == 0 && src_ref.offset == kTdcMinMaxStringEmptyOffset)
+			{
+				std::memcpy(dst_row + agg.offset, &src_ref, sizeof(src_ref));
+				continue;
+			}
+			const char *src_ptr = VecStringRefDataPtr(src_ref,
+				src_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(src_tdc)) : nullptr);
+			VecStringRef dst_ref;
+			if (!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
+				elog(ERROR, "pg_yaap: hash aggregate TDC copy ran out of heap (string agg)");
+			std::memcpy(dst_row + agg.offset, &dst_ref, sizeof(dst_ref));
+			continue;
+		}
 		const uint16_t width = TupleDataLayoutAggregateWidth(agg.kind);
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
@@ -279,18 +309,15 @@ CanUseSegmentBackedLocalTdc(const TupleDataLayout *layout, uint32_t partition_co
 {
 	if (layout == nullptr || partition_count == 0)
 		return false;
+	if (TdcLayoutHasStringAgg(layout))
+		return false;
 	return true;
 }
 
 static bool
 LayoutHasStringRef(const TupleDataLayout *layout)
 {
-	if (layout == nullptr)
-		return false;
-	for (uint16_t i = 0; i < layout->column_count; ++i)
-		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
-			return true;
-	return false;
+	return TdcLayoutHasAnyString(layout);
 }
 
 static bool
@@ -774,6 +801,8 @@ CanEncodePerfectHashLayout(const TupleDataLayout *layout)
 {
 	if (layout == nullptr || layout->column_count == 0 || layout->validity_width != 0)
 		return false;
+	if (TdcLayoutHasStringAgg(layout))
+		return false;
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
@@ -862,7 +891,8 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 			canonical_rows.data(),
 			in,
 			update_rows.data(),
-			update_count);
+			update_count,
+			tdc);
 	}
 }
 
@@ -908,13 +938,26 @@ SinkChunkSingleState(ExecCtx &ctx,
 	tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 	if (tdc == nullptr)
 		elog(ERROR, "pg_yaap: single-state hash aggregate TDC missing");
+	if (LayoutHasStringRef(local.layout))
+	{
+		const uint32_t req_heap = RequiredHeapBytesForChunkRows(local.layout, in,
+			row_indices.data(), in.count);
+		while (!TupleDataCollectionHasSpaceForAppend(tdc, req_heap))
+		{
+			GrowLocalTdc(ctx, local, part, req_heap);
+			tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+			if (tdc == nullptr)
+				elog(ERROR, "pg_yaap: single-state hash aggregate TDC missing after grow");
+		}
+	}
 	UpdateAggregatesGather(local.layout,
 		tdc->rows,
 		tdc->row_width,
 		canonical_rows.data(),
 		in,
 		row_indices.data(),
-		in.count);
+		in.count,
+		tdc);
 	SyncSegmentUsed(ctx, part, tdc);
 }
 
@@ -1215,6 +1258,125 @@ SinkChunkDistinctCountShared(ExecCtx &ctx, HashAggLocalSinkState &local,
 			if (AggregateHashTableShouldResize(ResolveAht(ctx.dsa, group_part.aht_dp), group_tdc))
 				ResizeAhtForTdc(ctx, group_part.tdc_dp, group_tdc, local.layout, &group_part.aht_dp);
 
+			/* Update all non-distinct aggregates on the canonical group rows. */
+			if (local.layout->aggregate_count > 1)
+			{
+				group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
+				for (uint16_t i = 0; i < count; ++i)
+				{
+					uint8_t *row_ptr = group_tdc->rows +
+						static_cast<size_t>(results[i].canonical_row_idx) * group_tdc->row_width;
+					const uint16_t r = results[i].row_idx;
+					for (uint16_t a = 0; a < local.layout->aggregate_count; ++a)
+					{
+						if (a == local.distinct_agg_idx)
+							continue;
+						const TdcAggregateDesc &agg = local.layout->aggregates[a];
+						switch (agg.kind)
+						{
+							case TdcAggKind::SUM_INT64:
+							{
+								int64_t cur = 0;
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(int64_t));
+								cur += in.get_int64(agg.src_col_idx, r);
+								std::memcpy(row_ptr + agg.offset, &cur, sizeof(int64_t));
+								break;
+							}
+							case TdcAggKind::SUM_NUMERIC:
+							{
+								NumericWideInt cur{};
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(NumericWideInt));
+								cur += in.get_wide128(agg.src_col_idx, r);
+								std::memcpy(row_ptr + agg.offset, &cur, sizeof(NumericWideInt));
+								break;
+							}
+							case TdcAggKind::COUNT_STAR:
+							{
+								int64_t cur = 0;
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(int64_t));
+								cur += 1;
+								std::memcpy(row_ptr + agg.offset, &cur, sizeof(int64_t));
+								break;
+							}
+							case TdcAggKind::COUNT_NONNULL:
+								if (in.nulls[agg.src_col_idx][r] == 0)
+								{
+									int64_t cur = 0;
+									std::memcpy(&cur, row_ptr + agg.offset, sizeof(int64_t));
+									cur += 1;
+									std::memcpy(row_ptr + agg.offset, &cur, sizeof(int64_t));
+								}
+								break;
+							case TdcAggKind::AVG_NUMERIC:
+							{
+								NumericWideInt cur{};
+								int64_t cnt = 0;
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(NumericWideInt));
+								std::memcpy(&cnt, row_ptr + agg.offset + 16, sizeof(int64_t));
+								cur += in.get_wide128(agg.src_col_idx, r);
+								cnt += 1;
+								std::memcpy(row_ptr + agg.offset, &cur, sizeof(NumericWideInt));
+								std::memcpy(row_ptr + agg.offset + 16, &cnt, sizeof(int64_t));
+								break;
+							}
+							case TdcAggKind::MIN_INT64:
+							case TdcAggKind::MIN_NUMERIC:
+							{
+								const int64_t val = in.get_int64(agg.src_col_idx, r);
+								int64_t cur = 0;
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(int64_t));
+								if (cur == INT64_MAX || val < cur)
+									std::memcpy(row_ptr + agg.offset, &val, sizeof(int64_t));
+								break;
+							}
+							case TdcAggKind::MAX_INT64:
+							case TdcAggKind::MAX_NUMERIC:
+							{
+								const int64_t val = in.get_int64(agg.src_col_idx, r);
+								int64_t cur = 0;
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(int64_t));
+								if (cur == INT64_MIN || val > cur)
+									std::memcpy(row_ptr + agg.offset, &val, sizeof(int64_t));
+								break;
+							}
+							case TdcAggKind::MIN_STRING:
+							case TdcAggKind::MAX_STRING:
+							{
+								if (in.nulls[agg.src_col_idx][r] != 0)
+									break;
+								const VecStringRef cand_ref = in.get_string_ref(agg.src_col_idx, r);
+								const char *cand_ptr = in.get_string_ptr(agg.src_col_idx, r);
+								VecStringRef cur{};
+								std::memcpy(&cur, row_ptr + agg.offset, sizeof(cur));
+								bool take = (cur.len == 0 && cur.offset == kTdcMinMaxStringEmptyOffset);
+								if (!take)
+								{
+									const char *cur_ptr = VecStringRefDataPtr(
+										cur, reinterpret_cast<const char *>(TupleDataCollectionHeapConst(group_tdc)));
+									const int cmp = varstr_cmp(
+										const_cast<char *>(cand_ptr != nullptr ? cand_ptr : ""),
+										static_cast<int>(cand_ref.len),
+										const_cast<char *>(cur_ptr != nullptr ? cur_ptr : ""),
+										static_cast<int>(cur.len),
+										DEFAULT_COLLATION_OID);
+									take = (agg.kind == TdcAggKind::MAX_STRING) ? (cmp > 0) : (cmp < 0);
+								}
+								if (take)
+								{
+									VecStringRef stored{};
+									if (!TupleDataCollectionStoreStringBytes(group_tdc, cand_ptr, cand_ref.len, &stored))
+										elog(ERROR, "pg_yaap: shared distinct MIN/MAX string heap exhausted");
+									std::memcpy(row_ptr + agg.offset, &stored, sizeof(stored));
+								}
+								break;
+							}
+							case TdcAggKind::COUNT_DISTINCT_NONNULL:
+								break;
+						}
+					}
+				}
+			}
+
 			uint16_t distinct_count = 0;
 			for (uint16_t i = 0; i < count; ++i)
 			{
@@ -1248,21 +1410,17 @@ SinkChunkDistinctCountShared(ExecCtx &ctx, HashAggLocalSinkState &local,
 					ResizeAhtForTdc(ctx, distinct_part.tdc_dp, distinct_tdc,
 						global.distinct_layout, &distinct_part.aht_dp);
 
-				uint16_t new_count = 0;
+				group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
 				for (uint16_t i = 0; i < distinct_count; ++i)
 				{
 					if (!distinct_results[i].inserted)
 						continue;
-					distinct_rows[new_count] = distinct_results[i].row_idx;
-					group_rows[new_count] = group_rows[i];
-					++new_count;
-				}
-				if (new_count > 0)
-				{
-					group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
-					UpdateAggregatesGather(local.layout, group_tdc->rows,
-						group_tdc->row_width, group_rows.data(), in,
-						distinct_rows.data(), new_count);
+					uint8_t *row_ptr = group_tdc->rows +
+						static_cast<size_t>(group_rows[i]) * group_tdc->row_width;
+					int64_t cur = 0;
+					std::memcpy(&cur, row_ptr + distinct_agg.offset, sizeof(int64_t));
+					cur += 1;
+					std::memcpy(row_ptr + distinct_agg.offset, &cur, sizeof(int64_t));
 				}
 			}
 		}
@@ -1391,6 +1549,27 @@ GatherDenseAggregateOutput(const TupleDataLayout *layout,
 			}
 			else
 				chunk.set_wide128(layout->column_count + a, row_idx, WideIntFromInt64(0));
+			continue;
+		}
+		if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+		{
+			VecStringRef ref{};
+			std::memcpy(&ref, row_ptr + agg.offset, sizeof(ref));
+			if (ref.len == 0 && ref.offset == kTdcMinMaxStringEmptyOffset)
+			{
+				chunk.string_columns[layout->column_count + a][row_idx] = VecStringRef{0, 0, 0};
+				chunk.nulls[layout->column_count + a][row_idx] = 1;
+			}
+			else
+			{
+				const char *ptr = VecStringRefDataPtr(
+					ref,
+					tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+				if (ptr == nullptr && ref.len != 0)
+					elog(ERROR, "pg_yaap: dense hashagg gather missing MIN/MAX string backing");
+				chunk.string_columns[layout->column_count + a][row_idx] =
+					chunk.store_string_bytes(ptr, ref.len);
+			}
 			continue;
 		}
 		int64_t v;
@@ -1808,7 +1987,7 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 					state, &writer, &part.segment_row_count, local.layout, in, row_idx,
 					hashes[row_idx], &row_store, &row);
 				(void) inserted;
-				UpdateAggregates(local.layout, row, in, row_idx);
+				UpdateAggregates(local.layout, row, in, row_idx, row_store);
 			}
 			auto *tail = buffer::YaapSharedSegmentResolve(ctx.dsa,
 				part.segment_arena_dp, writer.active);
@@ -1877,7 +2056,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 					in,
 					update_row_indices.data(),
 					probe_count,
-					distinct);
+					distinct,
+					tdc);
 			}
 			else
 			{
@@ -1887,7 +2067,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 					update_canonical_rows.data(),
 					in,
 					update_row_indices.data(),
-					probe_count);
+					probe_count,
+					tdc);
 			}
 		}
 	}

@@ -291,6 +291,12 @@ enum class ProjectOp : uint8_t {
 	INT64_GE_VAR_CONST = 26,
 	INT64_GT_VAR_CONST = 27,
 	INT64_NE_VAR_CONST = 28,
+	EXTRACT_MINUTE_FROM_TIMESTAMP = 29,
+	DATE_TRUNC_MINUTE_TIMESTAMP = 30,
+	STRING_LENGTH = 31,
+	STRING_REGEXP_REPLACE = 32,
+	STRING_CASE_VAR_CONST = 33,
+	STRING_CASE_ELSE_VAR = 34,
 };
 
 struct ProjectStep {
@@ -314,9 +320,10 @@ struct ProjectOpBody {
 	dsa_pointer output_schema;
 	dsa_pointer expr_descs;
 	dsa_pointer steps;
+	dsa_pointer string_consts;
 	uint16_t    n_exprs;
 	uint16_t    n_steps_total;
-	uint32_t    _pad0;
+	uint32_t    string_const_bytes;
 };
 
 enum class HashJoinOutputSide : uint8_t {

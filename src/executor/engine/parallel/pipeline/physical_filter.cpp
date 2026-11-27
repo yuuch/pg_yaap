@@ -569,16 +569,25 @@ CompactSelectedRows(PipelineChunk &out, const uint16_t *selected_rows, uint16_t 
 		const uint16_t row = selected_rows[write_idx];
 		if (write_idx == row)
 			continue;
-		for (uint8_t slot = 0; slot < 16; ++slot)
+		for (uint16_t slot = 0; slot < out.double_columns.max_slot_count; ++slot)
+			if (out.double_columns.has_slot(slot))
+				out.double_columns[slot][write_idx] = out.double_columns[slot][row];
+		for (uint16_t slot = 0; slot < out.int64_columns.max_slot_count; ++slot)
 		{
-			out.double_columns[slot][write_idx] = out.double_columns[slot][row];
-			out.int64_columns[slot][write_idx] = out.int64_columns[slot][row];
-			out.int32_columns[slot][write_idx] = out.int32_columns[slot][row];
-			out.string_columns[slot][write_idx] = out.string_columns[slot][row];
-			out.nulls[slot][write_idx] = out.nulls[slot][row];
-			if (NumericWideInt *w = out.wide128_slot_data(slot))
+			if (out.int64_columns.has_slot(slot))
+				out.int64_columns[slot][write_idx] = out.int64_columns[slot][row];
+			if (NumericWideInt *w = out.wide128_slot_data(static_cast<uint8_t>(slot)))
 				w[write_idx] = w[row];
 		}
+		for (uint16_t slot = 0; slot < out.int32_columns.max_slot_count; ++slot)
+			if (out.int32_columns.has_slot(slot))
+				out.int32_columns[slot][write_idx] = out.int32_columns[slot][row];
+		for (uint16_t slot = 0; slot < out.string_columns.max_slot_count; ++slot)
+			if (out.string_columns.has_slot(slot))
+				out.string_columns[slot][write_idx] = out.string_columns[slot][row];
+		for (uint16_t slot = 0; slot < out.nulls.max_slot_count; ++slot)
+			if (out.nulls.has_slot(slot))
+				out.nulls[slot][write_idx] = out.nulls[slot][row];
 	}
 	out.count = selected_count;
 	out.has_selection = false;

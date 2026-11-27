@@ -471,6 +471,35 @@ bool TryResolveTargetListBinding(::Query *pg_query,
         }
         ++projected_idx;
     }
+    if (target_entry->resjunk && pg_query->sortClause != nullptr && pg_query->distinctClause == nullptr) {
+        std::vector<TargetEntry *> seen_junk;
+        foreach(lc, pg_query->sortClause) {
+            auto *sgc = reinterpret_cast<SortGroupClause *>(lfirst(lc));
+            auto *tle = get_sortgroupref_tle(sgc->tleSortGroupRef, pg_query->targetList);
+            if (tle == nullptr || !tle->resjunk) {
+                continue;
+            }
+            bool dup = false;
+            for (TargetEntry *prev : seen_junk) {
+                if (prev == tle) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            const size_t idx = projected_idx + seen_junk.size();
+            seen_junk.push_back(tle);
+            if (tle == target_entry && idx < projection->output_names.size()) {
+                out_expression = std::make_unique<BoundColumnRefExpression>(
+                    ColumnBinding{projection->table_index, ProjectionIndex{idx}},
+                    "proj",
+                    projection->output_names[idx]);
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -2269,6 +2298,37 @@ std::unique_ptr<LogicalOperator> YaapAdapter::TranslateProjection(::Query* pg_qu
             te->resname ? te->resname : DerivedColumnName(projection->expressions.back().get(), projection->output_names.size()));
     }
 
+    if (pg_query->sortClause != nullptr && pg_query->distinctClause == nullptr) {
+        std::vector<TargetEntry *> seen_junk;
+        foreach(lc, pg_query->sortClause) {
+            auto *sgc = reinterpret_cast<SortGroupClause *>(lfirst(lc));
+            auto *tle = get_sortgroupref_tle(sgc->tleSortGroupRef, pg_query->targetList);
+            if (tle == nullptr || !tle->resjunk) {
+                continue;
+            }
+            bool dup = false;
+            for (TargetEntry *prev : seen_junk) {
+                if (prev == tle) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            seen_junk.push_back(tle);
+            auto proj_expr = TranslateExpression((::Node*)tle->expr);
+            if (!proj_expr) {
+                throw std::runtime_error("Failed to translate sort-junk projection expression");
+            }
+            PromoteScalarSubqueryExpression(proj_expr, input, *this);
+            proj_expr = RewriteToProducedBinding(input.get(), std::move(proj_expr));
+            projection->expressions.push_back(std::move(proj_expr));
+            projection->output_names.push_back(
+                tle->resname ? tle->resname : DerivedColumnName(projection->expressions.back().get(), projection->output_names.size()));
+        }
+    }
+
     projection->children.push_back(std::move(input));
     PropagateUnaryCardinality(*projection);
     return projection;
@@ -2431,9 +2491,47 @@ std::unique_ptr<LogicalOperator> YaapAdapter::TranslatePGQuery(::Query* pg_query
     plan = TranslateHaving(pg_query, std::move(plan));
     plan = TranslateWindow(pg_query, std::move(plan));
     plan = TranslateProjection(pg_query, std::move(plan));
+    LogicalProjection *inner_proj =
+        (plan != nullptr && plan->type == LogicalOperatorType::LOGICAL_PROJECTION)
+            ? static_cast<LogicalProjection *>(plan.get())
+            : nullptr;
+    size_t visible_proj_count = 0;
+    if (pg_query->targetList != nullptr) {
+        ListCell *vlc = nullptr;
+        foreach(vlc, pg_query->targetList) {
+            auto *te = reinterpret_cast<TargetEntry *>(lfirst(vlc));
+            if (te != nullptr && !te->resjunk) {
+                ++visible_proj_count;
+            }
+        }
+    }
+    const bool need_strip_sort_junk =
+        inner_proj != nullptr &&
+        visible_proj_count > 0 &&
+        inner_proj->expressions.size() > visible_proj_count;
+    const TableIndex inner_proj_table = inner_proj != nullptr ? inner_proj->table_index : TableIndex{0};
+    std::vector<std::string> visible_names;
+    if (need_strip_sort_junk) {
+        visible_names.assign(inner_proj->output_names.begin(),
+                             inner_proj->output_names.begin() + static_cast<ptrdiff_t>(visible_proj_count));
+    }
     plan = TranslateDistinct(pg_query, std::move(plan));
     plan = TranslateOrder(pg_query, std::move(plan));
     plan = TranslateLimit(pg_query, std::move(plan));
+
+    if (need_strip_sort_junk) {
+        auto outer_proj = std::make_unique<LogicalProjection>(GenerateTableIndex());
+        for (size_t i = 0; i < visible_proj_count; ++i) {
+            outer_proj->expressions.push_back(std::make_unique<BoundColumnRefExpression>(
+                ColumnBinding{inner_proj_table, ProjectionIndex{i}},
+                "proj",
+                visible_names[i]));
+            outer_proj->output_names.push_back(visible_names[i]);
+        }
+        outer_proj->children.push_back(std::move(plan));
+        PropagateUnaryCardinality(*outer_proj);
+        plan = std::move(outer_proj);
+    }
 
     return plan;
 }

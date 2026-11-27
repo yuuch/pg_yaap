@@ -526,6 +526,11 @@ AggregateHashTableCombineRowSegmented(AggregateHashTable *aht,
 					const int64_t init_max = INT64_MIN;
 					std::memcpy(canonical_row + agg.offset, &init_max, sizeof(init_max));
 				}
+				else if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+				{
+					const VecStringRef init_str{0, kTdcMinMaxStringEmptyOffset, 0};
+					std::memcpy(canonical_row + agg.offset, &init_str, sizeof(init_str));
+				}
 			}
 			auto *segment = buffer::YaapSharedSegmentResolve(dsa, arena_dp, handle.segment);
 			if (segment == nullptr || !AggregateHashTableRecordSegmentRow(dsa, aht,
@@ -535,7 +540,7 @@ AggregateHashTableCombineRowSegmented(AggregateHashTable *aht,
 			}
 			entry.value = PackEntry(salt, global_row_index);
 			++*row_count;
-			CombineAggregates(layout, canonical_row, src_row);
+			CombineAggregates(layout, canonical_row, src_row, store, src_tdc);
 			return;
 		}
 
@@ -556,7 +561,8 @@ AggregateHashTableCombineRowSegmented(AggregateHashTable *aht,
 			if (existing_row != nullptr && store != nullptr &&
 				MatchGroupRow(layout, store, existing_row, src_tdc, src_row))
 			{
-				CombineAggregates(layout, const_cast<uint8_t *>(existing_row), src_row);
+				CombineAggregates(layout, const_cast<uint8_t *>(existing_row), src_row,
+					const_cast<TupleDataCollection *>(store), src_tdc);
 				return;
 			}
 		}
@@ -960,6 +966,11 @@ AggregateHashTableCombineRow(AggregateHashTable *aht,
 						const int64_t init_max = INT64_MIN;
 						std::memcpy(new_row + agg.offset, &init_max, sizeof(int64_t));
 					}
+					else if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+					{
+						const VecStringRef init_str{0, kTdcMinMaxStringEmptyOffset, 0};
+						std::memcpy(new_row + agg.offset, &init_str, sizeof(init_str));
+					}
 				}
 				e.value       = PackEntry(our_salt, new_idx);
 				canonical_row = new_row;
@@ -980,7 +991,7 @@ AggregateHashTableCombineRow(AggregateHashTable *aht,
 		}
 
 		if (canonical_row != nullptr)
-			CombineAggregates(layout, canonical_row, src_row);
+			CombineAggregates(layout, canonical_row, src_row, tdc, src_tdc);
 	}
 	SpinLockRelease(&aht->mutex);
 
@@ -1049,6 +1060,11 @@ AggregateHashTableFindOrInsertSegmented(AggregateHashTable *aht,
 					const int64_t init_max = INT64_MIN;
 					std::memcpy(*row + agg.offset, &init_max, sizeof(init_max));
 				}
+				else if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+				{
+					const VecStringRef init_str{0, kTdcMinMaxStringEmptyOffset, 0};
+					std::memcpy(*row + agg.offset, &init_str, sizeof(init_str));
+				}
 			}
 			auto *segment = buffer::YaapSharedSegmentResolve(dsa, arena_dp, handle.segment);
 			if (segment == nullptr || !AggregateHashTableRecordSegmentRow(dsa, aht,
@@ -1094,10 +1110,7 @@ AggregateHashTableFindOrInsertSegmented(AggregateHashTable *aht,
 static inline bool
 LayoutHasStringCols(const TupleDataLayout *layout)
 {
-	for (uint16_t i = 0; i < layout->column_count; ++i)
-		if (layout->columns[i].kind == TdcColumnKind::STRING_REF)
-			return true;
-	return false;
+	return TdcLayoutHasAnyString(layout);
 }
 
 static inline void
@@ -1127,6 +1140,22 @@ CopyWholeAggregateRow(const TupleDataLayout *layout,
 			!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
 			elog(ERROR, "pg_yaap: aggregate hash table string group copy failed");
 		std::memcpy(dst_row + col.offset, &dst_ref, sizeof(dst_ref));
+	}
+	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
+	{
+		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
+		if (agg.kind != TdcAggKind::MIN_STRING && agg.kind != TdcAggKind::MAX_STRING)
+			continue;
+		VecStringRef src_ref;
+		std::memcpy(&src_ref, src_row + agg.offset, sizeof(src_ref));
+		if (src_ref.len == 0 && src_ref.offset == kTdcMinMaxStringEmptyOffset)
+			continue;
+		const char *src_ptr = VecStringRefDataPtr(src_ref, src_heap);
+		VecStringRef dst_ref;
+		if ((src_ptr == nullptr && src_ref.len != 0) ||
+			!TupleDataCollectionStoreStringBytes(dst_tdc, src_ptr, src_ref.len, &dst_ref))
+			elog(ERROR, "pg_yaap: aggregate hash table MIN/MAX string copy failed");
+		std::memcpy(dst_row + agg.offset, &dst_ref, sizeof(dst_ref));
 	}
 }
 
@@ -1177,7 +1206,7 @@ AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
 				uint8_t *existing_ptr = TupleDataCollectionGetRow(tdc, existing_idx);
 				if (MatchGroupRow(layout, src_tdc, src_row, tdc, existing_ptr))
 				{
-					CombineAggregates(layout, existing_ptr, src_row);
+					CombineAggregates(layout, existing_ptr, src_row, tdc, src_tdc);
 					done = true;
 					break;
 				}
@@ -1320,7 +1349,7 @@ AggregateHashTableCombineRowBatchSegmented(AggregateHashTable *aht,
 					uint8_t *existing_row = TupleDataCollectionGetRow(store, ref->row_index);
 					if (MatchGroupRow(layout, store, existing_row, src_tdc, src_row))
 					{
-						CombineAggregates(layout, existing_row, src_row);
+						CombineAggregates(layout, existing_row, src_row, store, src_tdc);
 						done = true;
 						break;
 					}

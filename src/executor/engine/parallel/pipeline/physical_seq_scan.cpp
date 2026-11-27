@@ -582,7 +582,9 @@ MapColumnToDeformKind(const ColumnSchema &col, DeformDecodeKind &out_kind)
 			out_kind = DeformDecodeKind::kDate32;
 			return true;
 		case ColumnDecodeKind::INT32_INT4:
-			out_kind = DeformDecodeKind::kInt32;
+			out_kind = (col.type_oid == INT2OID)
+				? DeformDecodeKind::kInt16
+				: DeformDecodeKind::kInt32;
 			return true;
 		case ColumnDecodeKind::INT64_INT8:
 			out_kind = DeformDecodeKind::kInt64;
@@ -627,7 +629,7 @@ BuildDeformBindings(const SchemaDescriptor *out_schema,
 	{
 		const ColumnSchema &col = out_schema->columns[s];
 		const uint8_t       slot_idx = col.chunk_slot;
-		if (slot_idx >= 16)
+		if (slot_idx >= kDataChunkMaxSlots)
 			elog(ERROR,
 			     "pg_yaap: SeqScan projection column %u has invalid chunk slot %u",
 			     static_cast<unsigned>(s),
@@ -719,6 +721,7 @@ BuildProjDeformProgramFromSchema(const SchemaDescriptor *out_schema,
 static bool
 BuildFilterDeformProgram(const FilterInputDesc *inputs,
 			        uint16_t n_inputs,
+			        TupleDesc tupdesc,
 			        DeformProgram &program)
 {
 	program.reset();
@@ -738,7 +741,12 @@ BuildFilterDeformProgram(const FilterInputDesc *inputs,
 		{
 			case ColumnDecodeKind::INT32_CHAR: kind = DeformDecodeKind::kBpchar1; break;
 			case ColumnDecodeKind::INT32_DATE: kind = DeformDecodeKind::kDate32; break;
-			case ColumnDecodeKind::INT32_INT4: kind = DeformDecodeKind::kInt32; break;
+			case ColumnDecodeKind::INT32_INT4:
+				kind = (tupdesc != nullptr && input.attno <= tupdesc->natts &&
+						TupleDescAttr(tupdesc, input.attno - 1)->atttypid == INT2OID)
+					? DeformDecodeKind::kInt16
+					: DeformDecodeKind::kInt32;
+				break;
 			case ColumnDecodeKind::INT64_INT8:
 				kind = DeformDecodeKind::kInt64;
 				break;
@@ -1132,6 +1140,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 		{
 			if (!BuildFilterDeformProgram(filter_inputs,
 					n_filter_inputs_,
+					local.scan_tupdesc,
 					local.filter_deform_program))
 				ereport(ERROR,
 				        (errmsg("pg_yaap: failed to build SeqScan filter deformer")));

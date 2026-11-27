@@ -767,6 +767,11 @@ PhysicalTopN::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &inp
 	if (global.global_tdc == nullptr || !global.payload->finalized || !DsaPointerIsValid(global.payload->sort_indices_dp))
 		return SourceResultType::FINISHED;
 	auto *indices_obj = static_cast<const OrderSortIndices *>(dsa_get_address(ctx.dsa, global.payload->sort_indices_dp));
+	if (!local.initialized)
+	{
+		local.source_cursor = std::min(indices_obj->count, global.payload->offset_rows);
+		local.initialized = true;
+	}
 	while (local.source_cursor < indices_obj->count && out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 	{
 		const uint32_t row_idx = indices_obj->indices[local.source_cursor++];

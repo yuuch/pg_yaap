@@ -2,9 +2,14 @@
 
 extern "C" {
 #include "postgres.h"
+#include "catalog/pg_collation_d.h"
 #include "datatype/timestamp.h"
+#include "fmgr.h"
+#include "mb/pg_wchar.h"
+#include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
 }
 
 #include <algorithm>
@@ -30,7 +35,10 @@ TrimBpcharLength(const char *data, uint32_t len)
 }
 
 static void
-ExecuteStep(const ProjectStep &step, PipelineChunk &out)
+ExecuteStep(const ProjectStep &step,
+            PipelineChunk &out,
+            const PgVector<char> &string_consts,
+            ProjectionOperatorState &op_state)
 {
 	const uint16_t count = out.count;
 	uint8_t *const out_nulls = out.nulls[step.out_chunk_slot];
@@ -847,6 +855,215 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 			}
 			return;
 		}
+
+		case ProjectOp::EXTRACT_MINUTE_FROM_TIMESTAMP:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			out.clear_wide128(step.out_chunk_slot);
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				int64_t rem = input[row] % INT64CONST(3600000000);
+				if (rem < 0)
+					rem += INT64CONST(3600000000);
+				output[row] = rem / INT64CONST(60000000);
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::DATE_TRUNC_MINUTE_TIMESTAMP:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			out.clear_wide128(step.out_chunk_slot);
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				int64_t ts = input[row];
+				int64_t rem = ts % INT64CONST(60000000);
+				if (rem < 0)
+					rem += INT64CONST(60000000);
+				output[row] = ts - rem;
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::STRING_LENGTH:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const VecStringRef *const input = out.string_columns[step.in_a_chunk_slot];
+			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			out.clear_wide128(step.out_chunk_slot);
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (in_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				const VecStringRef &ref = input[row];
+				if (ref.len == 0)
+				{
+					output[row] = 0;
+					out_nulls[row] = 0;
+					continue;
+				}
+				const char *ptr = out.get_string_ptr(ref);
+				if (ptr == nullptr)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				bool ascii = true;
+				for (uint32_t b = 0; b < ref.len; ++b)
+				{
+					if (static_cast<unsigned char>(ptr[b]) >= 0x80u)
+					{
+						ascii = false;
+						break;
+					}
+				}
+				output[row] = ascii ? static_cast<int64_t>(ref.len)
+					: static_cast<int64_t>(pg_mbstrlen_with_len(ptr, static_cast<int>(ref.len)));
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::STRING_REGEXP_REPLACE:
+		{
+			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			const VecStringRef *const input = out.string_columns[step.in_a_chunk_slot];
+			VecStringRef *const output = out.string_columns[step.out_chunk_slot];
+			const uint64_t packed = static_cast<uint64_t>(step.const_value);
+			const uint32_t pat_off = static_cast<uint32_t>(packed & 0xFFFFu);
+			const uint32_t pat_len = static_cast<uint32_t>((packed >> 16) & 0xFFFFu);
+			const uint32_t repl_off = static_cast<uint32_t>((packed >> 32) & 0xFFFFu);
+			const uint32_t repl_len = static_cast<uint32_t>((packed >> 48) & 0xFFFFu);
+			if (pat_off + pat_len > string_consts.size() || repl_off + repl_len > string_consts.size())
+				elog(ERROR, "pg_yaap: STRING_REGEXP_REPLACE string_consts out of bounds");
+			if (op_state.scratch_mcxt == nullptr)
+				op_state.scratch_mcxt = AllocSetContextCreate(
+					CurrentMemoryContext, "pg_yaap_proj_regex", ALLOCSET_SMALL_SIZES);
+			MemoryContext old_mcxt = MemoryContextSwitchTo(op_state.scratch_mcxt);
+			PG_TRY();
+			{
+				text *pat_text = cstring_to_text_with_len(string_consts.data() + pat_off, pat_len);
+				text *repl_text = cstring_to_text_with_len(string_consts.data() + repl_off, repl_len);
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					if (in_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const VecStringRef &ref = input[row];
+					const char *ptr = out.get_string_ptr(ref);
+					if (ptr == nullptr && ref.len != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					text *src_text = cstring_to_text_with_len(ptr != nullptr ? ptr : "", ref.len);
+					Datum res_datum = DirectFunctionCall3Coll(
+						textregexreplace_noopt,
+						DEFAULT_COLLATION_OID,
+						PointerGetDatum(src_text),
+						PointerGetDatum(pat_text),
+						PointerGetDatum(repl_text));
+					text *res_text = DatumGetTextPP(res_datum);
+					const char *res_ptr = VARDATA_ANY(res_text);
+					const uint32_t res_len = static_cast<uint32_t>(VARSIZE_ANY_EXHDR(res_text));
+					MemoryContextSwitchTo(old_mcxt);
+					output[row] = out.store_string_bytes(res_ptr, res_len);
+					out_nulls[row] = 0;
+					MemoryContextSwitchTo(op_state.scratch_mcxt);
+				}
+			}
+			PG_CATCH();
+			{
+				MemoryContextSwitchTo(old_mcxt);
+				MemoryContextReset(op_state.scratch_mcxt);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			MemoryContextSwitchTo(old_mcxt);
+			MemoryContextReset(op_state.scratch_mcxt);
+			return;
+		}
+
+		case ProjectOp::STRING_CASE_VAR_CONST:
+		{
+			const uint8_t *const cond_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const then_nulls = out.nulls[step.in_b_chunk_slot];
+			const int64_t *const cond = out.int64_columns[step.in_a_chunk_slot];
+			const VecStringRef *const then_vals = out.string_columns[step.in_b_chunk_slot];
+			VecStringRef *const output = out.string_columns[step.out_chunk_slot];
+			const uint64_t packed = static_cast<uint64_t>(step.const_value);
+			const uint32_t else_off = static_cast<uint32_t>(packed & 0xFFFFFFFFu);
+			const uint32_t else_len = static_cast<uint32_t>(packed >> 32);
+			if (else_len > 0 && else_off + else_len > string_consts.size())
+				elog(ERROR, "pg_yaap: STRING_CASE_VAR_CONST string_consts out of bounds");
+			const char *else_ptr = else_len > 0 ? (string_consts.data() + else_off) : "";
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				if (cond_nulls[row] == 0 && cond[row] != 0)
+				{
+					if (then_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					output[row] = then_vals[row];
+				}
+				else
+				{
+					output[row] = else_len == 0 ? VecStringRef{0, 0, 0}
+						: out.store_string_bytes(else_ptr, else_len);
+				}
+				out_nulls[row] = 0;
+			}
+			return;
+		}
+
+		case ProjectOp::STRING_CASE_ELSE_VAR:
+		{
+			const uint8_t *const cond_nulls = out.nulls[step.in_a_chunk_slot];
+			const uint8_t *const then_nulls = out.nulls[step.in_b_chunk_slot];
+			const uint8_t else_slot = static_cast<uint8_t>(step.const_value);
+			const uint8_t *const else_nulls = out.nulls[else_slot];
+			const int64_t *const cond = out.int64_columns[step.in_a_chunk_slot];
+			const VecStringRef *const then_vals = out.string_columns[step.in_b_chunk_slot];
+			const VecStringRef *const else_vals = out.string_columns[else_slot];
+			VecStringRef *const output = out.string_columns[step.out_chunk_slot];
+			for (uint16_t row = 0; row < count; ++row)
+			{
+				const bool take_then = cond_nulls[row] == 0 && cond[row] != 0;
+				const uint8_t *src_nulls = take_then ? then_nulls : else_nulls;
+				const VecStringRef *src_vals = take_then ? then_vals : else_vals;
+				if (src_nulls[row] != 0)
+				{
+					out_nulls[row] = 1;
+					continue;
+				}
+				output[row] = src_vals[row];
+				out_nulls[row] = 0;
+			}
+			return;
+		}
 	}
 
 	elog(ERROR, "pg_yaap: unsupported projection opcode %u", static_cast<unsigned>(step.op));
@@ -865,7 +1082,7 @@ OperatorResultType
 PhysicalProjection::ExecuteInPlace(ExecCtx &ctx, PipelineChunk &chunk, OperatorState &state)
 {
 	(void) ctx;
-	(void) state;
+	auto &op_state = static_cast<ProjectionOperatorState &>(state);
 	if (chunk.count == 0)
 		return OperatorResultType::NEED_MORE_INPUT;
 	if (chunk.has_any_dictionary())
@@ -883,7 +1100,7 @@ PhysicalProjection::ExecuteInPlace(ExecCtx &ctx, PipelineChunk &chunk, OperatorS
 		     ++step_idx)
 		{
 			const ProjectStep &step = steps_[step_idx];
-			ExecuteStep(step, chunk);
+			ExecuteStep(step, chunk, string_consts_, op_state);
 		}
 
 		if (expr.output_chunk_slot != steps_[expr.first_step_idx + expr.n_steps - 1].out_chunk_slot)
