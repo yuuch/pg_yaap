@@ -1,8 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS pg_yaap;
 SET pg_yaap.enabled = on;
-SET pg_yaap.parallel = on;
 SET pg_yaap.parallel_max_workers = 4;
-SET pg_yaap.parallel_min_relation_blocks = 0;
 SET jit = off;
 
 CREATE TABLE yaap_min_t (

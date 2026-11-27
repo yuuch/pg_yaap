@@ -29,7 +29,7 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 | Admission filter | `state.c::plan_uses_supported_relations` | Recursive walk; rejects when no `RTE_RELATION` user table is touched. SubqueryScan supported via recursion. |
 | Per-query state HTAB | `state.c` (impl), `state.h` (API) | HTAB keyed by `QueryDesc *`; entries hold `PgYaapQueryState *`. |
 | Query state lifecycle | `state.c::pg_yaap_try_build_query_state`, `pg_yaap_close_query_state` | Allocates child `MemoryContext` named `"pg_yaap query context"`. |
-| Plan init / dispatch | `execute.cpp::pg_yaap_initialize_plan`, `pg_yaap_execute_query` | Lowers the optimizer bundle into the YAAP runtime. `parallel_scheduler` is set to a static char sentinel iff `pg_yaap.parallel=on`. |
+| Plan init / dispatch | `execute.cpp::pg_yaap_initialize_plan`, `pg_yaap_execute_query` | Lowers the optimizer bundle into the YAAP runtime and marks `parallel_scheduler` active. |
 | Plan teardown | `execute.cpp::pg_yaap_delete_plan` | `static_cast<PhysicalOperator*>(state->parallel_plan)` → `delete`. Called from `pg_yaap_close_query_state` in `state.c`. |
 | Pipeline dispatch | `execute.cpp::pg_yaap_execute_query` | Calls `pg_yaap::pipeline::PgYaapPipelineRun(queryDesc, state, &failure_reason)`. On failure/unsupported shape it falls through to `standard_ExecutorRun`. |
 
@@ -41,8 +41,8 @@ The bridge does **NO slot materialization** as of step 2. Result emission from `
 - **Worker bypass**: `ExecutorStart_hook` early-outs via `IsParallelWorker()`. Workers participate in the pipeline runtime via the worker bgworker entry (`pipeline_worker_main.cpp`), not via PG's executor hooks.
 - **Per-query state**: created in `ExecutorStart_hook` after `IsParallelWorker()` check, looked up by `QueryDesc *` pointer in `ExecutorRun_hook`, destroyed in `ExecutorEnd_hook`. The HTAB lives in `TopMemoryContext`; per-query data lives in a `state->context` child `MemoryContext` (`"pg_yaap query context"`) that is destroyed by `pg_yaap_close_query_state`.
 - **Admission**: `plan_uses_supported_relations` walks the plan tree before init. If it rejects, `pg_yaap_try_build_query_state` returns `NULL`, no state is registered, and `ExecutorRun_hook` finds no entry → fallthrough to standard PG executor.
-- **Plan-init failure**: if `pg_yaap_initialize_plan` returns `false` (Translator returned `nullptr`, or `pg_yaap.parallel=off`, or `parallel_plan==NULL`), the just-allocated state is closed via `pg_yaap_close_query_state` and is never registered — same fallthrough path.
-- **Parallel sentinel**: `state->parallel_plan` holds a real `PhysicalOperator *` cast to `void *`. `state->parallel_scheduler` is set to the address of a static char (`pgyaap_parallel_scheduler_sentinel` in `execute.cpp`) iff `pg_yaap.parallel=on`. Both being non-null gates the dispatch path. The real `TaskScheduler` lives inside `parallel/pipeline/` (not behind this sentinel) and is constructed per-query from `PgYaapPipelineRun`.
+- **Plan-init failure**: if `pg_yaap_initialize_plan` returns `false` (or `parallel_plan==NULL`), the just-allocated state is closed via `pg_yaap_close_query_state` and is never registered.
+- **Parallel sentinel**: `state->parallel_plan` holds a real `PhysicalOperator *` cast to `void *`. `state->parallel_scheduler` is set unconditionally to the address of a static char (`pgyaap_parallel_scheduler_sentinel` in `execute.cpp`) when parallel pipeline initialization succeeds. Both being non-null gates the dispatch path. The real `TaskScheduler` lives inside `parallel/pipeline/` (not behind this sentinel) and is constructed per-query from `PgYaapPipelineRun`.
 - **`MemoryContextSwitchTo` discipline**: `pg_yaap_initialize_plan` switches into `state->context` before invoking optimizer-path lowering so any palloc-backed allocations the engine makes are anchored to the per-query lifetime.
 
 ## GUCs (defined in `pg_yaap.c::_PG_init`)
@@ -55,10 +55,7 @@ The execution and memory settings listed below are `PGC_USERSET`; `pg_yaap.trace
 | `pg_yaap.trace_hooks` | `false` | bool | `LOG`-level dump of every hook entry/exit and admission decision. |
 | `pg_yaap.trace_execution_path` | `false` | bool | One `LOG` line per query describing dispatch path (`pipeline` vs `native_pg`) and reason. |
 | `pg_yaap.jit_deform` | `true` | bool | Enable LLVM tuple-deform JIT. Consumed inside the engine, not the bridge. |
-| `pg_yaap.parallel` | `false` | bool | Enable pipeline runtime dispatch. **Required `on` for any pg_yaap execution today** (see `pg_yaap_initialize_plan`: returns `false` when off). |
 | `pg_yaap.parallel_max_workers` | `4` | 0–1024 | Max bgworkers per query. |
-| `pg_yaap.parallel_min_relation_blocks` | `1024` | 0–`INT_MAX` | Min relation size before parallel lowering is considered. |
-| `pg_yaap.parallel_experimental_hash_pipeline` | `false` | bool | Reserved; **no effect in greenfield** (HashJoin removed). Kept registered to avoid breaking existing config files. |
 | `pg_yaap.trace_enabled` | `false` | bool | Enable lightweight per-process Execution Trace recording (see `docs/execution_trace.md`). |
 | `pg_yaap.trace_buffer_mb` | `1MB` | 1–16 MB | Per-process Execution Trace buffer size in MB (leader and each worker). |
 | `pg_yaap.trace_output_dir` | `""` | absolute path (`PGC_SUSET`) | Server directory for exported Perfetto-compatible Chrome Trace Event JSON files. |
@@ -70,10 +67,6 @@ The execution and memory settings listed below are `PGC_USERSET`; `pg_yaap.trace
 `pg_yaap.parallel_morsel_nblocks` is no longer registered. The active SeqScan
 path uses an atomic block pool consumed by each worker's local read stream
 callback, not a tunable block-range morsel scheduler.
-
-### Dead-code GUC variable
-
-`pg_yaap.c:29` declares `bool pg_yaap_disable_jit_for_parallel_worker = false;` but **never registers it** with `DefineCustom*Variable` and nothing reads it. This is a leftover from the pre-greenfield era. Slated for removal at the next bridge cleanup pass.
 
 ## ANTI-PATTERNS
 
@@ -102,9 +95,8 @@ callback, not a tunable block-range morsel scheduler.
    - `pg_yaap_initialize_plan(qd, state)`:
      - `MemoryContextSwitchTo(state->context)`.
      - Lower `OptimizerPlanBundle::physical_plan` through the YAAP optimizer-to-executor path.
-     - On non-null: `state->parallel_plan = root.release()`; if `pg_yaap_parallel`, `state->parallel_scheduler = &sentinel`.
-     - On `parallel_plan==NULL`: emit `WARNING: pg_yaap: unsupported plan shape, falling back to standard PostgreSQL executor` and return `false`.
-     - On `pg_yaap_parallel==false`: emit `WARNING: pg_yaap: pg_yaap.parallel=off, falling back to standard PostgreSQL executor` and return `parallel_scheduler != NULL` (i.e. `false`).
+     - On non-null: `state->parallel_plan = root.release()` and `state->parallel_scheduler = &sentinel`.
+     - On lowering failure: raise `ereport(ERROR, ...)`.
    - On `true`: `pg_yaap_register_state(qd, state)`. On `false`: `pg_yaap_close_query_state(state)` (which calls `pg_yaap_delete_plan` and destroys `state->context`).
 3. **`pg_yaap_ExecutorRun`**:
    - `pg_yaap_lookup_state(qd)` → if non-`NULL`:
@@ -130,5 +122,4 @@ callback, not a tunable block-range morsel scheduler.
 - `pg_yaap_initialize_plan` always emits a `WARNING` on the fallthrough path. This is intentional (M-FRAME-MIN sanity test relies on the WARNING text). Once the runtime lands, demote to `LOG`-when-traced.
 - Admission is **broad on purpose**: the bridge does not gatekeep on plan shape — the Translator does. Today the Translator returns `nullptr` for everything, so `parallel_plan==NULL` is the universal fallthrough trigger.
 - `pg_yaap_plan_node_name` in `pg_yaap.c` is a debug helper for `trace_hooks`. It still names `HashJoin`/`MergeJoin`/etc. that have no Translator support; harmless because the strings are only used for logging.
-- The `parallel_experimental_hash_pipeline` GUC is a leftover from the pre-greenfield era; HashJoin is removed and this GUC currently has no effect. Kept registered to avoid breaking existing config files.
 - All admission failures must produce a clean fallback to PostgreSQL execution — **never** `ereport(ERROR)` for "unsupported plan".

@@ -7,9 +7,7 @@ All `pg_yaap` runtime GUCs are registered in [`src/bridge/pg_yaap.c`](../src/bri
 | Name | Type | Default | Range / Constraint | Unit | Context | Description |
 |---|---|---|---|---|---|---|
 | `pg_yaap.enabled` | `bool` | `on` | `on` / `off` | — | `PGC_USERSET` | Master switch for YAAP planner, EXPLAIN, and executor hooks. |
-| `pg_yaap.parallel` | `bool` | `on` | `on` / `off` | — | `PGC_USERSET` | Enables parallel pipeline lowering (`false` prevents pipeline plan initialization). |
 | `pg_yaap.parallel_max_workers` | `int` | `4` | `0`–`1024` | workers | `PGC_USERSET` | Maximum dynamic PostgreSQL background workers requested per query. |
-| `pg_yaap.parallel_min_relation_blocks` | `int` | `1024` | `0`–`INT_MAX` | blocks | `PGC_USERSET` | Minimum relation size in 8 KiB blocks before parallel lowering is considered. |
 | `pg_yaap.jit_deform` | `bool` | `on` | `on` / `off` | — | `PGC_USERSET` | Enables LLVM JIT heap tuple deformation into `DataChunk` columns. |
 | `pg_yaap.hash_join_partition_probe` | `bool` | `on` | `on` / `off` | — | `PGC_USERSET` | Uses radix-partitioned Hybrid Hash Join when running with multiple workers; `off` uses the non-hybrid streaming probe path. |
 | `pg_yaap.memory_limit` | `int` | `256` (`256MB`) | `64`–`INT_MAX / 1024` | MB | `PGC_USERSET` | Hard shared budget for operator breaker payloads (not whole-query RSS). |
@@ -20,7 +18,6 @@ All `pg_yaap` runtime GUCs are registered in [`src/bridge/pg_yaap.c`](../src/bri
 | `pg_yaap.trace_output_dir` | `string` | `""` | Absolute server path, no `..`, `< MAXPGPATH - 96` | — | `PGC_SUSET` | Server-side directory for exported Perfetto Chrome Trace JSON files. Requires superuser or `pg_write_server_files` at export time. |
 | `pg_yaap.trace_hooks` | `bool` | `off` | `on` / `off` | — | `PGC_USERSET` | Emits `LOG`-level diagnostic traces on hook entry, admission, and plan lowering. |
 | `pg_yaap.trace_execution_path` | `bool` | `off` | `on` / `off` | — | `PGC_USERSET` | Emits one low-noise `LOG` line per executed query summarizing dispatch path. |
-| `pg_yaap.parallel_experimental_hash_pipeline` | `bool` | `false` (`off`) | `on` / `off` | — | `PGC_USERSET` | Legacy compatibility GUC; registered with no effect in the current runtime. |
 
 ## PostgreSQL Server Settings Interaction
 

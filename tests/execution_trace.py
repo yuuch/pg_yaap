@@ -51,9 +51,7 @@ def setup(trace_dir='', workers=4, enabled=True, buffer_mb=1, application=''):
     parts = [
         f'LOAD {quote(LIBRARY)};',
         f'SET pg_yaap.enabled=on;',
-        f'SET pg_yaap.parallel=on;',
         f'SET pg_yaap.parallel_max_workers={workers};',
-        'SET pg_yaap.parallel_min_relation_blocks=0;',
         "SET pg_yaap.memory_limit='512MB';",
         "SET statement_timeout='90s';",
         f'SET pg_yaap.trace_enabled={"on" if enabled else "off"};',

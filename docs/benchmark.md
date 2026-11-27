@@ -57,7 +57,6 @@ All three engines (`pg_yaap`, `pg_duckdb v1.2.2`, and `PostgreSQL 18.3`) ran on 
   LOAD 'pg_yaap';
   SET duckdb.force_execution = false;
   SET pg_yaap.enabled = on;
-  SET pg_yaap.parallel = on;
   SET pg_yaap.parallel_max_workers = 12;
   SET pg_yaap.memory_limit = '8GB';
   SET pg_yaap.memory_soft_limit = -1;

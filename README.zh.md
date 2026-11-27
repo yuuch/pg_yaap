@@ -135,7 +135,6 @@ FROM generate_series(1, 200000) AS i;
 ANALYZE orders_demo;
 
 SET pg_yaap.enabled = on;
-SET pg_yaap.parallel = on;
 SET pg_yaap.parallel_max_workers = 4;
 
 -- 确认 Planner 已接管（rows 为优化器估算值）：
@@ -175,7 +174,6 @@ SET pg_yaap.enabled = off;
 | GUC | 默认值 | 说明 |
 |---|---|---|
 | `pg_yaap.enabled` | `on` | 启用或关闭 YAAP |
-| `pg_yaap.parallel` | `on` | 开启并行执行 |
 | `pg_yaap.parallel_max_workers` | `4` | 单查询最大 worker 数 |
 | `pg_yaap.memory_limit` | `256MB` | 共享算子载荷预算（`MB`，`>= 64MB`） |
 

@@ -44,8 +44,6 @@ extern "C" {
 extern "C" {
 extern bool pg_yaap_trace_hooks;
 extern bool pg_yaap_trace_execution_path;
-extern bool pg_yaap_parallel;
-extern int pg_yaap_parallel_max_workers;
 }
 
 /*
@@ -136,13 +134,6 @@ pg_yaap_initialize_plan(QueryDesc *queryDesc, PgYaapQueryState *state_ptr)
 		pg_yaap::pipeline::DestroyRuntimeDsm(state);
 		ereport(ERROR,
 				(errmsg("pg_yaap: no optimizer physical plan bundle registered for execution")));
-	}
-
-	if (!pg_yaap_parallel)
-	{
-		pg_yaap::pipeline::DestroyRuntimeDsm(state);
-		ereport(ERROR,
-				(errmsg("pg_yaap: pipeline executor requires pg_yaap.parallel=on")));
 	}
 
 	state->parallel_scheduler = &pgyaap_parallel_scheduler_sentinel;

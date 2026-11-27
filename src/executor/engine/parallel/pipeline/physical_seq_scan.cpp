@@ -21,7 +21,6 @@ extern "C" {
 
 extern int  pg_yaap_parallel_max_workers;
 extern bool pg_yaap_jit_deform;
-extern bool pg_yaap_disable_jit_for_parallel_worker;
 extern bool pg_yaap_trace_hooks;
 extern bool pg_yaap_trace_execution_path;
 
@@ -1095,10 +1094,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			bool proj_jit_compiled = false;
 			const char *proj_jit_reason = nullptr;
 #ifdef USE_LLVM
-			const bool allow_proj_worker_jit =
-				!pg_yaap_disable_jit_for_parallel_worker ||
-				ctx.worker_index == LEADER_WORKER_INDEX;
-			if (SeqScanJitDeformEnabled(ctx) && allow_proj_worker_jit)
+			if (SeqScanJitDeformEnabled(ctx))
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1120,10 +1116,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 						(err != nullptr && err[0] != '\0') ?
 						err : "compile returned false without failure reason";
 			}
-			else if (!SeqScanJitDeformEnabled(ctx))
-				proj_jit_reason = "disabled by pg_yaap.jit_deform";
 			else
-				proj_jit_reason = "disabled for parallel worker";
+				proj_jit_reason = "disabled by pg_yaap.jit_deform";
 #endif
 			LogSeqScanDeformerJitDecision(ctx,
 										 "projection",
@@ -1157,10 +1151,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 			bool filter_jit_compiled = false;
 			const char *filter_jit_reason = nullptr;
 #ifdef USE_LLVM
-			const bool allow_filter_worker_jit =
-				!pg_yaap_disable_jit_for_parallel_worker ||
-				ctx.worker_index == LEADER_WORKER_INDEX;
-			if (SeqScanJitDeformEnabled(ctx) && allow_filter_worker_jit)
+			if (SeqScanJitDeformEnabled(ctx))
 			{
 				JitDeformFunc fn = nullptr;
 				JitContext   *jc = nullptr;
@@ -1182,10 +1173,8 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 						(err != nullptr && err[0] != '\0') ?
 						err : "compile returned false without failure reason";
 			}
-			else if (!SeqScanJitDeformEnabled(ctx))
-				filter_jit_reason = "disabled by pg_yaap.jit_deform";
 			else
-				filter_jit_reason = "disabled for parallel worker";
+				filter_jit_reason = "disabled by pg_yaap.jit_deform";
 #endif
 			LogSeqScanDeformerJitDecision(ctx,
 										 "filter",
