@@ -40,15 +40,60 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 		case ProjectOp::NUMERIC_SCALE_VAR_CONST:
 		{
 			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			if (out.has_wide128(step.in_a_chunk_slot))
+			{
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					if (in_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const NumericWideInt v = out.get_wide128(step.in_a_chunk_slot, row);
+					const NumericWideInt res = (step.const_value >= 0) ?
+						v * WideIntFromInt64(step.const_value) :
+						v / WideIntFromInt64(-step.const_value);
+					out.set_wide128(step.out_chunk_slot, row, res);
+					out_nulls[row] = 0;
+				}
+				return;
+			}
+			out.clear_wide128(step.out_chunk_slot);
 			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
 			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			const bool in_place = (step.out_chunk_slot == step.in_a_chunk_slot);
 			if (!ColumnHasNulls(in_nulls, count))
 			{
 				std::memset(out_nulls, 0, count);
 				if (step.const_value >= 0)
 				{
-					for (uint16_t row = 0; row < count; ++row)
-						output[row] = input[row] * step.const_value;
+					if (!in_place)
+					{
+						bool overflow = false;
+						for (uint16_t row = 0; row < count; ++row)
+							overflow |= __builtin_mul_overflow(input[row], step.const_value, &output[row]);
+						if (unlikely(overflow))
+						{
+							for (uint16_t row = 0; row < count; ++row)
+								out.set_wide128(step.out_chunk_slot, row,
+									WideIntFromInt64(input[row]) * WideIntFromInt64(step.const_value));
+						}
+					}
+					else
+					{
+						for (uint16_t row = 0; row < count; ++row)
+						{
+							const int64_t in_val = input[row];
+							int64_t res = 0;
+							if (unlikely(__builtin_mul_overflow(in_val, step.const_value, &res)))
+								out.set_wide128(step.out_chunk_slot, row,
+									WideIntFromInt64(in_val) * WideIntFromInt64(step.const_value));
+							else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+								out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+							else
+								output[row] = res;
+						}
+					}
 				}
 				else
 				{
@@ -64,9 +109,20 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 					out_nulls[row] = 1;
 					continue;
 				}
-				output[row] = (step.const_value >= 0) ?
-					input[row] * step.const_value :
-					input[row] / (-step.const_value);
+				const int64_t in_val = input[row];
+				if (step.const_value >= 0)
+				{
+					int64_t res = 0;
+					if (unlikely(__builtin_mul_overflow(in_val, step.const_value, &res)))
+						out.set_wide128(step.out_chunk_slot, row,
+							WideIntFromInt64(in_val) * WideIntFromInt64(step.const_value));
+					else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+						out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+					else
+						output[row] = res;
+				}
+				else
+					output[row] = in_val / (-step.const_value);
 				out_nulls[row] = 0;
 			}
 			return;
@@ -78,28 +134,102 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 		{
 			const uint8_t *const left_nulls = out.nulls[step.in_a_chunk_slot];
 			const uint8_t *const right_nulls = out.nulls[step.in_b_chunk_slot];
+			if (out.has_wide128(step.in_a_chunk_slot) || out.has_wide128(step.in_b_chunk_slot))
+			{
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					if (left_nulls[row] != 0 || right_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const NumericWideInt l = out.get_wide128(step.in_a_chunk_slot, row);
+					const NumericWideInt r = out.get_wide128(step.in_b_chunk_slot, row);
+					NumericWideInt res = WideIntFromInt64(0);
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_VAR: res = l * r; break;
+						case ProjectOp::NUMERIC_ADD_VAR_VAR: res = l + r; break;
+						case ProjectOp::NUMERIC_SUB_VAR_VAR: res = l - r; break;
+						default: break;
+					}
+					out.set_wide128(step.out_chunk_slot, row, res);
+					out_nulls[row] = 0;
+				}
+				return;
+			}
+			out.clear_wide128(step.out_chunk_slot);
 			const int64_t *const left = out.int64_columns[step.in_a_chunk_slot];
 			const int64_t *const right = out.int64_columns[step.in_b_chunk_slot];
 			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			const bool in_place = (step.out_chunk_slot == step.in_a_chunk_slot ||
+			                       step.out_chunk_slot == step.in_b_chunk_slot);
 			if (!ColumnHasNulls(left_nulls, count) && !ColumnHasNulls(right_nulls, count))
 			{
 				std::memset(out_nulls, 0, count);
-				switch (step.op)
+				if (!in_place)
 				{
-					case ProjectOp::NUMERIC_MUL_VAR_VAR:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = left[row] * right[row];
-						break;
-					case ProjectOp::NUMERIC_ADD_VAR_VAR:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = left[row] + right[row];
-						break;
-					case ProjectOp::NUMERIC_SUB_VAR_VAR:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = left[row] - right[row];
-						break;
-					default:
-						break;
+					bool overflow = false;
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_VAR:
+							for (uint16_t row = 0; row < count; ++row)
+								overflow |= __builtin_mul_overflow(left[row], right[row], &output[row]);
+							if (unlikely(overflow))
+								for (uint16_t row = 0; row < count; ++row)
+									out.set_wide128(step.out_chunk_slot, row,
+										WideIntFromInt64(left[row]) * WideIntFromInt64(right[row]));
+							break;
+						case ProjectOp::NUMERIC_ADD_VAR_VAR:
+							for (uint16_t row = 0; row < count; ++row)
+								overflow |= __builtin_add_overflow(left[row], right[row], &output[row]);
+							if (unlikely(overflow))
+								for (uint16_t row = 0; row < count; ++row)
+									out.set_wide128(step.out_chunk_slot, row,
+										WideIntFromInt64(left[row]) + WideIntFromInt64(right[row]));
+							break;
+						case ProjectOp::NUMERIC_SUB_VAR_VAR:
+							for (uint16_t row = 0; row < count; ++row)
+								overflow |= __builtin_sub_overflow(left[row], right[row], &output[row]);
+							if (unlikely(overflow))
+								for (uint16_t row = 0; row < count; ++row)
+									out.set_wide128(step.out_chunk_slot, row,
+										WideIntFromInt64(left[row]) - WideIntFromInt64(right[row]));
+							break;
+						default:
+							break;
+					}
+					return;
+				}
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					const int64_t l = left[row];
+					const int64_t r = right[row];
+					int64_t res = 0;
+					bool ov = false;
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_VAR: ov = __builtin_mul_overflow(l, r, &res); break;
+						case ProjectOp::NUMERIC_ADD_VAR_VAR: ov = __builtin_add_overflow(l, r, &res); break;
+						case ProjectOp::NUMERIC_SUB_VAR_VAR: ov = __builtin_sub_overflow(l, r, &res); break;
+						default: break;
+					}
+					if (unlikely(ov))
+					{
+						NumericWideInt wres = WideIntFromInt64(0);
+						switch (step.op)
+						{
+							case ProjectOp::NUMERIC_MUL_VAR_VAR: wres = WideIntFromInt64(l) * WideIntFromInt64(r); break;
+							case ProjectOp::NUMERIC_ADD_VAR_VAR: wres = WideIntFromInt64(l) + WideIntFromInt64(r); break;
+							case ProjectOp::NUMERIC_SUB_VAR_VAR: wres = WideIntFromInt64(l) - WideIntFromInt64(r); break;
+							default: break;
+						}
+						out.set_wide128(step.out_chunk_slot, row, wres);
+					}
+					else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+						out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+					else
+						output[row] = res;
 				}
 				return;
 			}
@@ -110,20 +240,33 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 					out_nulls[row] = 1;
 					continue;
 				}
+				const int64_t l = left[row];
+				const int64_t r = right[row];
+				int64_t res = 0;
+				bool ov = false;
 				switch (step.op)
 				{
-					case ProjectOp::NUMERIC_MUL_VAR_VAR:
-						output[row] = left[row] * right[row];
-						break;
-					case ProjectOp::NUMERIC_ADD_VAR_VAR:
-						output[row] = left[row] + right[row];
-						break;
-					case ProjectOp::NUMERIC_SUB_VAR_VAR:
-						output[row] = left[row] - right[row];
-						break;
-					default:
-						break;
+					case ProjectOp::NUMERIC_MUL_VAR_VAR: ov = __builtin_mul_overflow(l, r, &res); break;
+					case ProjectOp::NUMERIC_ADD_VAR_VAR: ov = __builtin_add_overflow(l, r, &res); break;
+					case ProjectOp::NUMERIC_SUB_VAR_VAR: ov = __builtin_sub_overflow(l, r, &res); break;
+					default: break;
 				}
+				if (unlikely(ov))
+				{
+					NumericWideInt wres = WideIntFromInt64(0);
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_VAR: wres = WideIntFromInt64(l) * WideIntFromInt64(r); break;
+						case ProjectOp::NUMERIC_ADD_VAR_VAR: wres = WideIntFromInt64(l) + WideIntFromInt64(r); break;
+						case ProjectOp::NUMERIC_SUB_VAR_VAR: wres = WideIntFromInt64(l) - WideIntFromInt64(r); break;
+						default: break;
+					}
+					out.set_wide128(step.out_chunk_slot, row, wres);
+				}
+				else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+					out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+				else
+					output[row] = res;
 				out_nulls[row] = 0;
 			}
 			return;
@@ -135,31 +278,105 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 		case ProjectOp::COPY_VAR:
 		{
 			const uint8_t *const in_nulls = out.nulls[step.in_a_chunk_slot];
+			if (out.has_wide128(step.in_a_chunk_slot))
+			{
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					if (in_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const NumericWideInt v = out.get_wide128(step.in_a_chunk_slot, row);
+					NumericWideInt res = v;
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_CONST: res = v * WideIntFromInt64(step.const_value); break;
+						case ProjectOp::NUMERIC_ADD_VAR_CONST: res = v + WideIntFromInt64(step.const_value); break;
+						case ProjectOp::NUMERIC_SUB_VAR_CONST: res = v - WideIntFromInt64(step.const_value); break;
+						case ProjectOp::COPY_VAR: break;
+						default: break;
+					}
+					out.set_wide128(step.out_chunk_slot, row, res);
+					out_nulls[row] = 0;
+				}
+				return;
+			}
+			out.clear_wide128(step.out_chunk_slot);
 			const int64_t *const input = out.int64_columns[step.in_a_chunk_slot];
 			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			const bool in_place = (step.out_chunk_slot == step.in_a_chunk_slot);
 			if (!ColumnHasNulls(in_nulls, count))
 			{
 				std::memset(out_nulls, 0, count);
-				switch (step.op)
+				if (step.op == ProjectOp::COPY_VAR)
 				{
-					case ProjectOp::NUMERIC_MUL_VAR_CONST:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = input[row] * step.const_value;
-						break;
-					case ProjectOp::NUMERIC_ADD_VAR_CONST:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = input[row] + step.const_value;
-						break;
-					case ProjectOp::NUMERIC_SUB_VAR_CONST:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = input[row] - step.const_value;
-						break;
-					case ProjectOp::COPY_VAR:
-						for (uint16_t row = 0; row < count; ++row)
-							output[row] = input[row];
-						break;
-					default:
-						break;
+					for (uint16_t row = 0; row < count; ++row)
+						output[row] = input[row];
+					return;
+				}
+				if (!in_place)
+				{
+					bool overflow = false;
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_CONST:
+							for (uint16_t row = 0; row < count; ++row)
+								overflow |= __builtin_mul_overflow(input[row], step.const_value, &output[row]);
+							if (unlikely(overflow))
+								for (uint16_t row = 0; row < count; ++row)
+									out.set_wide128(step.out_chunk_slot, row,
+										WideIntFromInt64(input[row]) * WideIntFromInt64(step.const_value));
+							break;
+						case ProjectOp::NUMERIC_ADD_VAR_CONST:
+							for (uint16_t row = 0; row < count; ++row)
+								overflow |= __builtin_add_overflow(input[row], step.const_value, &output[row]);
+							if (unlikely(overflow))
+								for (uint16_t row = 0; row < count; ++row)
+									out.set_wide128(step.out_chunk_slot, row,
+										WideIntFromInt64(input[row]) + WideIntFromInt64(step.const_value));
+							break;
+						case ProjectOp::NUMERIC_SUB_VAR_CONST:
+							for (uint16_t row = 0; row < count; ++row)
+								overflow |= __builtin_sub_overflow(input[row], step.const_value, &output[row]);
+							if (unlikely(overflow))
+								for (uint16_t row = 0; row < count; ++row)
+									out.set_wide128(step.out_chunk_slot, row,
+										WideIntFromInt64(input[row]) - WideIntFromInt64(step.const_value));
+							break;
+						default:
+							break;
+					}
+					return;
+				}
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					const int64_t v = input[row];
+					int64_t res = 0;
+					bool ov = false;
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_CONST: ov = __builtin_mul_overflow(v, step.const_value, &res); break;
+						case ProjectOp::NUMERIC_ADD_VAR_CONST: ov = __builtin_add_overflow(v, step.const_value, &res); break;
+						case ProjectOp::NUMERIC_SUB_VAR_CONST: ov = __builtin_sub_overflow(v, step.const_value, &res); break;
+						default: break;
+					}
+					if (unlikely(ov))
+					{
+						NumericWideInt wres = WideIntFromInt64(0);
+						switch (step.op)
+						{
+							case ProjectOp::NUMERIC_MUL_VAR_CONST: wres = WideIntFromInt64(v) * WideIntFromInt64(step.const_value); break;
+							case ProjectOp::NUMERIC_ADD_VAR_CONST: wres = WideIntFromInt64(v) + WideIntFromInt64(step.const_value); break;
+							case ProjectOp::NUMERIC_SUB_VAR_CONST: wres = WideIntFromInt64(v) - WideIntFromInt64(step.const_value); break;
+							default: break;
+						}
+						out.set_wide128(step.out_chunk_slot, row, wres);
+					}
+					else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+						out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+					else
+						output[row] = res;
 				}
 				return;
 			}
@@ -170,23 +387,38 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 					out_nulls[row] = 1;
 					continue;
 				}
+				const int64_t v = input[row];
+				if (step.op == ProjectOp::COPY_VAR)
+				{
+					output[row] = v;
+					out_nulls[row] = 0;
+					continue;
+				}
+				int64_t res = 0;
+				bool ov = false;
 				switch (step.op)
 				{
-					case ProjectOp::NUMERIC_MUL_VAR_CONST:
-						output[row] = input[row] * step.const_value;
-						break;
-					case ProjectOp::NUMERIC_ADD_VAR_CONST:
-						output[row] = input[row] + step.const_value;
-						break;
-					case ProjectOp::NUMERIC_SUB_VAR_CONST:
-						output[row] = input[row] - step.const_value;
-						break;
-					case ProjectOp::COPY_VAR:
-						output[row] = input[row];
-						break;
-					default:
-						break;
+					case ProjectOp::NUMERIC_MUL_VAR_CONST: ov = __builtin_mul_overflow(v, step.const_value, &res); break;
+					case ProjectOp::NUMERIC_ADD_VAR_CONST: ov = __builtin_add_overflow(v, step.const_value, &res); break;
+					case ProjectOp::NUMERIC_SUB_VAR_CONST: ov = __builtin_sub_overflow(v, step.const_value, &res); break;
+					default: break;
 				}
+				if (unlikely(ov))
+				{
+					NumericWideInt wres = WideIntFromInt64(0);
+					switch (step.op)
+					{
+						case ProjectOp::NUMERIC_MUL_VAR_CONST: wres = WideIntFromInt64(v) * WideIntFromInt64(step.const_value); break;
+						case ProjectOp::NUMERIC_ADD_VAR_CONST: wres = WideIntFromInt64(v) + WideIntFromInt64(step.const_value); break;
+						case ProjectOp::NUMERIC_SUB_VAR_CONST: wres = WideIntFromInt64(v) - WideIntFromInt64(step.const_value); break;
+						default: break;
+					}
+					out.set_wide128(step.out_chunk_slot, row, wres);
+				}
+				else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+					out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+				else
+					output[row] = res;
 				out_nulls[row] = 0;
 			}
 			return;
@@ -196,20 +428,70 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 		case ProjectOp::NUMERIC_ADD_CONST_VAR:
 		{
 			const uint8_t *const in_nulls = out.nulls[step.in_b_chunk_slot];
+			if (out.has_wide128(step.in_b_chunk_slot))
+			{
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					if (in_nulls[row] != 0)
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const NumericWideInt v = out.get_wide128(step.in_b_chunk_slot, row);
+					const NumericWideInt res = (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
+						WideIntFromInt64(step.const_value) - v :
+						WideIntFromInt64(step.const_value) + v;
+					out.set_wide128(step.out_chunk_slot, row, res);
+					out_nulls[row] = 0;
+				}
+				return;
+			}
+			out.clear_wide128(step.out_chunk_slot);
 			const int64_t *const input = out.int64_columns[step.in_b_chunk_slot];
 			int64_t *const output = out.int64_columns[step.out_chunk_slot];
+			const bool in_place = (step.out_chunk_slot == step.in_b_chunk_slot);
 			if (!ColumnHasNulls(in_nulls, count))
 			{
 				std::memset(out_nulls, 0, count);
-				if (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR)
+				if (!in_place)
 				{
-					for (uint16_t row = 0; row < count; ++row)
-						output[row] = step.const_value - input[row];
+					bool overflow = false;
+					if (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR)
+					{
+						for (uint16_t row = 0; row < count; ++row)
+							overflow |= __builtin_sub_overflow(step.const_value, input[row], &output[row]);
+						if (unlikely(overflow))
+							for (uint16_t row = 0; row < count; ++row)
+								out.set_wide128(step.out_chunk_slot, row,
+									WideIntFromInt64(step.const_value) - WideIntFromInt64(input[row]));
+					}
+					else
+					{
+						for (uint16_t row = 0; row < count; ++row)
+							overflow |= __builtin_add_overflow(step.const_value, input[row], &output[row]);
+						if (unlikely(overflow))
+							for (uint16_t row = 0; row < count; ++row)
+								out.set_wide128(step.out_chunk_slot, row,
+									WideIntFromInt64(step.const_value) + WideIntFromInt64(input[row]));
+					}
+					return;
 				}
-				else
+				for (uint16_t row = 0; row < count; ++row)
 				{
-					for (uint16_t row = 0; row < count; ++row)
-						output[row] = step.const_value + input[row];
+					const int64_t v = input[row];
+					int64_t res = 0;
+					const bool ov = (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
+						__builtin_sub_overflow(step.const_value, v, &res) :
+						__builtin_add_overflow(step.const_value, v, &res);
+					if (unlikely(ov))
+						out.set_wide128(step.out_chunk_slot, row,
+							(step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
+								WideIntFromInt64(step.const_value) - WideIntFromInt64(v) :
+								WideIntFromInt64(step.const_value) + WideIntFromInt64(v));
+					else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+						out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+					else
+						output[row] = res;
 				}
 				return;
 			}
@@ -220,9 +502,20 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 					out_nulls[row] = 1;
 					continue;
 				}
-				output[row] = (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
-					step.const_value - input[row] :
-					step.const_value + input[row];
+				const int64_t v = input[row];
+				int64_t res = 0;
+				const bool ov = (step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
+					__builtin_sub_overflow(step.const_value, v, &res) :
+					__builtin_add_overflow(step.const_value, v, &res);
+				if (unlikely(ov))
+					out.set_wide128(step.out_chunk_slot, row,
+						(step.op == ProjectOp::NUMERIC_SUB_CONST_VAR) ?
+							WideIntFromInt64(step.const_value) - WideIntFromInt64(v) :
+							WideIntFromInt64(step.const_value) + WideIntFromInt64(v));
+				else if (unlikely(out.has_wide128(step.out_chunk_slot)))
+					out.set_wide128(step.out_chunk_slot, row, WideIntFromInt64(res));
+				else
+					output[row] = res;
 				out_nulls[row] = 0;
 			}
 			return;
@@ -232,9 +525,31 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 		{
 			const uint8_t *const left_nulls = out.nulls[step.in_a_chunk_slot];
 			const uint8_t *const right_nulls = out.nulls[step.in_b_chunk_slot];
+			if (out.has_wide128(step.in_a_chunk_slot) || out.has_wide128(step.in_b_chunk_slot))
+			{
+				for (uint16_t row = 0; row < count; ++row)
+				{
+					if ((left_nulls[row] != 0) || (right_nulls[row] != 0))
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const NumericWideInt denom = out.get_wide128(step.in_b_chunk_slot, row);
+					if (denom == WideIntFromInt64(0))
+					{
+						out_nulls[row] = 1;
+						continue;
+					}
+					const NumericWideInt numerator =
+						out.get_wide128(step.in_a_chunk_slot, row) * WideIntFromInt64(step.const_value);
+					out.set_wide128(step.out_chunk_slot, row, numerator / denom);
+					out_nulls[row] = 0;
+				}
+				return;
+			}
+			out.clear_wide128(step.out_chunk_slot);
 			const int64_t *const left = out.int64_columns[step.in_a_chunk_slot];
 			const int64_t *const right = out.int64_columns[step.in_b_chunk_slot];
-			int64_t *const output = out.int64_columns[step.out_chunk_slot];
 			if (!ColumnHasNulls(left_nulls, count) && !ColumnHasNulls(right_nulls, count))
 				std::memset(out_nulls, 0, count);
 			for (uint16_t row = 0; row < count; ++row)
@@ -252,9 +567,7 @@ ExecuteStep(const ProjectStep &step, PipelineChunk &out)
 				}
 				const NumericWideInt numerator =
 					WideIntFromInt64(left[row]) * WideIntFromInt64(step.const_value);
-				output[row] =
-					WideIntToInt64Checked(numerator / WideIntFromInt64(denom),
-						"projection numeric division");
+				out.set_wide128(step.out_chunk_slot, row, numerator / WideIntFromInt64(denom));
 				out_nulls[row] = 0;
 			}
 			return;

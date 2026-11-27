@@ -20,6 +20,14 @@ static_assert(pg_yaap::pipeline::HashJoinProbeShouldSpillTail(8, 8, 100, 1000, 2
 static_assert(!pg_yaap::pipeline::HashJoinProbeShouldSpillTail(0, 8, 1000, 1000, 2000));
 static_assert(pg_yaap::pipeline::HashJoinProbeShouldSpillTail(1, 8, 0, 1000, 2000));
 
+/* Regression: PG dsa.c::make_new_segment() odd-sized segment pagemap overflow
+ * guard must leave <=1 MiB segment sizes unchanged, round unsafe page counts up
+ * to a 2 MiB boundary, and preserve >512 MiB requests for NO_OOM checks. */
+static_assert(pg_yaap::YaapDsaSafeAllocBytes(256u * 1024u) == 256u * 1024u);
+static_assert(pg_yaap::YaapDsaSafeAllocBytes(1024u * 1024u) == 1024u * 1024u);
+static_assert(pg_yaap::YaapDsaSafeAllocBytes(368u * 4096u) == 512u * 4096u);
+static_assert(pg_yaap::YaapDsaSafeAllocBytes(512ull * 1024ull * 1024ull) == 512ull * 1024ull * 1024ull);
+
 extern "C" {
 PGDLLEXPORT Datum pg_yaap_segment_selftest(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pg_yaap_segment_selftest);

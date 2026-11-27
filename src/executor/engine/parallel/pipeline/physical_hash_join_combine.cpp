@@ -8,6 +8,7 @@ extern "C" {
 #include <cstring>
 
 #include "core/data_chunk.hpp"
+#include "core/dsa_allocation.hpp"
 #include "parallel/pipeline/dsm_control.hpp"
 #include "parallel/pipeline/execution_slots.hpp"
 #include "buffer_manager/yaap_buffer_shared.hpp"
@@ -164,9 +165,9 @@ EnsureBuildRowMappingCapacity(ExecCtx &ctx,
 {
 	size_t bytes = static_cast<size_t>(std::max(1u, target_rows)) * sizeof(uint32_t);
 	if (!DsaPointerIsValid(payload->build_row_slots_dp))
-		payload->build_row_slots_dp = dsa_allocate(ctx.dsa, bytes);
+		payload->build_row_slots_dp = YaapDsaAllocate(ctx.dsa, bytes);
 	if (!DsaPointerIsValid(payload->build_row_local_idxs_dp))
-		payload->build_row_local_idxs_dp = dsa_allocate(ctx.dsa, bytes);
+		payload->build_row_local_idxs_dp = YaapDsaAllocate(ctx.dsa, bytes);
 }
 
 static void
@@ -287,13 +288,13 @@ PrepareHashJoinCombine(ExecCtx &ctx, HashJoinGlobalSinkState &global)
 			buffer::YaapBufferChargeExternalBytes(buffer_state, directory_bytes,
 				"hash join combine directory");
 			payload->directory_charged_bytes += directory_bytes;
-			payload->hash_table_dp = dsa_allocate(ctx.dsa,
+			payload->hash_table_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(payload->hash_table_capacity) * sizeof(uint32_t));
-			payload->hash_buckets_dp = dsa_allocate(ctx.dsa,
+			payload->hash_buckets_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(total_rows) * sizeof(uint32_t));
-			payload->hash_links_dp = dsa_allocate(ctx.dsa,
+			payload->hash_links_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(total_rows) * sizeof(uint32_t));
-			payload->hash_salts_dp = dsa_allocate(ctx.dsa,
+			payload->hash_salts_dp = YaapDsaAllocate(ctx.dsa,
 				static_cast<size_t>(total_rows) * sizeof(uint16_t));
 			std::memset(dsa_get_address(ctx.dsa, payload->hash_table_dp),
 				0xFF,

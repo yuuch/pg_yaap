@@ -249,6 +249,91 @@ WideIntToInt64Checked(NumericWideInt value, const char *what)
 #endif
 }
 
+static inline Numeric
+WideIntToNumeric(NumericWideInt value, int scale)
+{
+	if (WideIntFitsInt64(value))
+		return int64_div_fast_to_numeric(
+#if defined(__SIZEOF_INT128__)
+			(int64_t) value,
+#else
+			(int64_t) value.lo,
+#endif
+			scale);
+
+	char buf[80];
+	char digits[48];
+	int ndigits = 0;
+	bool neg = value < WideIntFromInt64(0);
+#if defined(__SIZEOF_INT128__)
+	unsigned __int128 mag = neg
+		? (unsigned __int128) (-(value + (NumericWideInt) 1)) + (unsigned __int128) 1u
+		: (unsigned __int128) value;
+	if (mag == 0)
+		digits[ndigits++] = '0';
+	else
+	{
+		while (mag > 0)
+		{
+			digits[ndigits++] = (char) ('0' + (int) (mag % 10u));
+			mag /= 10u;
+		}
+	}
+#else
+	NumericWideInt abs_val = neg ? -value : value;
+	uint64_t hi = (uint64_t) abs_val.hi;
+	uint64_t lo = abs_val.lo;
+	if (hi == 0 && lo == 0)
+		digits[ndigits++] = '0';
+	else
+	{
+		while (hi != 0 || lo != 0)
+		{
+			uint64_t rem = hi % 10u;
+			hi /= 10u;
+			uint64_t hi_word = (rem << 32) | (lo >> 32);
+			uint64_t q_hi = hi_word / 10u;
+			rem = hi_word % 10u;
+			uint64_t lo_word = (rem << 32) | (lo & 0xFFFFFFFFULL);
+			uint64_t q_lo = lo_word / 10u;
+			rem = lo_word % 10u;
+			lo = (q_hi << 32) | q_lo;
+			digits[ndigits++] = (char) ('0' + (int) rem);
+		}
+	}
+#endif
+	int pos = 0;
+	if (neg)
+		buf[pos++] = '-';
+	if (scale <= 0)
+	{
+		for (int i = ndigits - 1; i >= 0; --i)
+			buf[pos++] = digits[i];
+	}
+	else if (ndigits <= scale)
+	{
+		buf[pos++] = '0';
+		buf[pos++] = '.';
+		for (int i = 0; i < scale - ndigits; ++i)
+			buf[pos++] = '0';
+		for (int i = ndigits - 1; i >= 0; --i)
+			buf[pos++] = digits[i];
+	}
+	else
+	{
+		for (int i = ndigits - 1; i >= scale; --i)
+			buf[pos++] = digits[i];
+		buf[pos++] = '.';
+		for (int i = scale - 1; i >= 0; --i)
+			buf[pos++] = digits[i];
+	}
+	buf[pos] = '\0';
+	return DatumGetNumeric(DirectFunctionCall3(numeric_in,
+		CStringGetDatum(buf),
+		ObjectIdGetDatum(InvalidOid),
+		Int32GetDatum(-1)));
+}
+
 static inline NumericWideInt
 WideIntMul(NumericWideInt left, NumericWideInt right)
 {

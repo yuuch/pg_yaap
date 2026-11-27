@@ -51,7 +51,7 @@ CopyTdcRow(const TupleDataLayout *layout,
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
-		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
+		const uint16_t width = TupleDataLayoutAggregateWidth(agg.kind);
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
 }

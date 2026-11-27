@@ -79,14 +79,20 @@ struct alignas(16) DataChunk {
 	VecDictionaryDesc string_dict[16];
 	SelectionVector sel;
 	bool has_selection;
+	uint16_t wide128_slot_mask;
+	uint8_t wide128_slot_index[16];
 	VolVecVector<char> string_arena;
+	VolVecVector<NumericWideInt> wide128_arena;
 
 	DataChunk()
 		: count(0),
 		  has_selection(false),
-		  string_arena(PgMemoryContextAllocator<char>(CurrentMemoryContext))
+		  wide128_slot_mask(0),
+		  string_arena(PgMemoryContextAllocator<char>(CurrentMemoryContext)),
+		  wide128_arena(PgMemoryContextAllocator<NumericWideInt>(CurrentMemoryContext))
 	{
 		memset(nulls, 0, sizeof(nulls));
+		memset(wide128_slot_index, 0xFF, sizeof(wide128_slot_index));
 		clear_dictionaries();
 	}
 
@@ -105,6 +111,12 @@ struct alignas(16) DataChunk {
 		count = 0;
 		sel.clear();
 		has_selection = false;
+		if (wide128_slot_mask != 0)
+		{
+			wide128_slot_mask = 0;
+			memset(wide128_slot_index, 0xFF, sizeof(wide128_slot_index));
+			wide128_arena.clear();
+		}
 		clear_dictionaries();
 		string_arena.clear();
 	}
@@ -175,6 +187,75 @@ struct alignas(16) DataChunk {
 		return int64_columns[slot][row_idx];
 	}
 
+	bool has_wide128(uint8_t slot) const
+	{
+		const uint8_t eff_slot = int64_dict[slot].active ? int64_dict[slot].source_slot : slot;
+		return (wide128_slot_mask & static_cast<uint16_t>(1u << eff_slot)) != 0;
+	}
+
+	void clear_wide128(uint8_t slot)
+	{
+		wide128_slot_mask &= static_cast<uint16_t>(~(1u << slot));
+	}
+
+	NumericWideInt *wide128_slot_data(uint8_t slot)
+	{
+		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) == 0)
+			return nullptr;
+		return wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
+	}
+
+	const NumericWideInt *wide128_slot_data(uint8_t slot) const
+	{
+		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) == 0)
+			return nullptr;
+		return wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
+	}
+
+	NumericWideInt *ensure_wide128_slot(uint8_t slot, uint16_t backfill_rows)
+	{
+		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) != 0)
+			return wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
+		if (wide128_slot_index[slot] == UINT8_MAX)
+		{
+			const uint8_t slab_idx = static_cast<uint8_t>(wide128_arena.size() / Capacity);
+			wide128_arena.resize(wide128_arena.size() + Capacity, WideIntFromInt64(0));
+			wide128_slot_index[slot] = slab_idx;
+		}
+		NumericWideInt *slab = wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
+		for (uint16_t r = 0; r < backfill_rows; ++r)
+			slab[r] = WideIntFromInt64(int64_columns[slot][r]);
+		wide128_slot_mask |= static_cast<uint16_t>(1u << slot);
+		return slab;
+	}
+
+	void set_wide128(uint8_t slot, uint16_t row_idx, NumericWideInt value)
+	{
+		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) == 0 && WideIntFitsInt64(value))
+		{
+			int64_columns[slot][row_idx] = static_cast<int64_t>(WideIntLow64(value));
+			return;
+		}
+		NumericWideInt *slab = ensure_wide128_slot(slot, row_idx);
+		slab[row_idx] = value;
+		int64_columns[slot][row_idx] = static_cast<int64_t>(WideIntLow64(value));
+	}
+
+	NumericWideInt get_wide128(uint8_t slot, uint16_t row_idx) const
+	{
+		if (int64_dict[slot].active)
+		{
+			const uint8_t src = int64_dict[slot].source_slot;
+			const uint16_t idx = int64_dict_indices[slot][row_idx];
+			if ((wide128_slot_mask & static_cast<uint16_t>(1u << src)) != 0)
+				return wide128_arena[static_cast<size_t>(wide128_slot_index[src]) * Capacity + idx];
+			return WideIntFromInt64(int64_columns[src][idx]);
+		}
+		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) != 0)
+			return wide128_arena[static_cast<size_t>(wide128_slot_index[slot]) * Capacity + row_idx];
+		return WideIntFromInt64(int64_columns[slot][row_idx]);
+	}
+
 	double get_double(uint8_t slot, uint16_t row_idx) const
 	{
 		if (double_dict[slot].active)
@@ -213,11 +294,28 @@ struct alignas(16) DataChunk {
 			}
 			if (int64_dict[slot].active)
 			{
-				int64_t tmp[Capacity];
-				for (uint16_t row = 0; row < count; ++row)
-					tmp[row] = get_int64(slot, row);
-				memcpy(int64_columns[slot], tmp, count * sizeof(int64_t));
-				clear_int64_dictionary(slot);
+				const bool wide = has_wide128(slot);
+				if (wide)
+				{
+					NumericWideInt wtmp[Capacity];
+					for (uint16_t row = 0; row < count; ++row)
+						wtmp[row] = get_wide128(slot, row);
+					clear_int64_dictionary(slot);
+					NumericWideInt *slab = ensure_wide128_slot(slot, 0);
+					for (uint16_t row = 0; row < count; ++row)
+					{
+						slab[row] = wtmp[row];
+						int64_columns[slot][row] = static_cast<int64_t>(WideIntLow64(wtmp[row]));
+					}
+				}
+				else
+				{
+					int64_t tmp[Capacity];
+					for (uint16_t row = 0; row < count; ++row)
+						tmp[row] = get_int64(slot, row);
+					memcpy(int64_columns[slot], tmp, count * sizeof(int64_t));
+					clear_int64_dictionary(slot);
+				}
 			}
 			if (double_dict[slot].active)
 			{

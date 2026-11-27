@@ -117,6 +117,15 @@ struct ColumnSchema {
 	uint8_t          _pad0;
 };
 
+inline bool
+ColumnSchemaIsWideNumeric(const ColumnSchema &cs)
+{
+	if (cs.decode_kind != ColumnDecodeKind::INT64_NUMERIC_SCALED || cs.typmod < VARHDRSZ)
+		return false;
+	const int32_t precision = ((cs.typmod - VARHDRSZ) >> 16) & 0xFFFF;
+	return precision > 18;
+}
+
 struct SchemaDescriptor {
 	uint16_t     n_columns;
 	uint16_t     _pad0;

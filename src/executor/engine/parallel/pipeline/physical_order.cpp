@@ -142,7 +142,7 @@ CopyTdcRow(const TupleDataLayout *layout,
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
-		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
+		const uint16_t width = TupleDataLayoutAggregateWidth(agg.kind);
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
 	if (layout->validity_width > 0)
@@ -259,6 +259,7 @@ TdcExternalSorter::TdcExternalSorter(ExecCtx &ctx, const TupleDataLayout *payloa
   const auto &col = key_layout->columns[sequential_keys ? k : keys[k].col_idx];
   Oid type = col.kind == TdcColumnKind::INT32 ? INT4OID :
     col.kind == TdcColumnKind::INT64 ? INT8OID :
+    col.kind == TdcColumnKind::INT128 ? NUMERICOID :
     col.kind == TdcColumnKind::DOUBLE ? FLOAT8OID : TEXTOID;
   TupleDescInitEntry(s.desc, k + 1, nullptr, type, -1, 0);
   attrs[k] = k + 1;
@@ -305,6 +306,7 @@ void TdcExternalSorter::Put(const TupleDataCollection *tdc, const uint8_t *row)
   switch (col.kind) {
    case TdcColumnKind::INT32: { int32_t v; memcpy(&v, value, sizeof(v)); s.slot->tts_values[k] = Int32GetDatum(v); break; }
    case TdcColumnKind::INT64: { int64_t v; memcpy(&v, value, sizeof(v)); s.slot->tts_values[k] = Int64GetDatum(v); break; }
+   case TdcColumnKind::INT128: { NumericWideInt v; memcpy(&v, value, sizeof(v)); s.slot->tts_values[k] = NumericGetDatum(WideIntToNumeric(v, col.numeric_scale)); break; }
    case TdcColumnKind::DOUBLE: { double v; memcpy(&v, value, sizeof(v)); s.slot->tts_values[k] = Float8GetDatum(v); break; }
    case TdcColumnKind::STRING_REF: {
     VecStringRef ref; memcpy(&ref, value, sizeof(ref));
