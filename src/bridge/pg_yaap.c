@@ -44,11 +44,7 @@ static bool pg_yaap_enabled = true;
 bool pg_yaap_trace_hooks = false;
 bool pg_yaap_trace_execution_path = false;
 bool pg_yaap_jit_deform = true;
-bool pg_yaap_parallel = true;
 int pg_yaap_parallel_max_workers = 4;
-int pg_yaap_parallel_min_relation_blocks = 1024;
-bool pg_yaap_parallel_experimental_hash_pipeline = false;
-bool pg_yaap_disable_jit_for_parallel_worker = false;
 extern bool pg_yaap_trace_enabled;
 extern int pg_yaap_trace_buffer_mb;
 extern char *pg_yaap_trace_output_dir;
@@ -315,17 +311,6 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomBoolVariable("pg_yaap.parallel",
-							 "Enable experimental parallel lowering in the YAAP executor path.",
-							 NULL,
-							 &pg_yaap_parallel,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
 	DefineCustomIntVariable("pg_yaap.parallel_max_workers",
 							"Maximum number of experimental YAAP parallel workers.",
 							NULL,
@@ -338,30 +323,6 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
-
-	DefineCustomIntVariable("pg_yaap.parallel_min_relation_blocks",
-							"Minimum relation size in blocks before experimental YAAP parallel lowering is considered.",
-							NULL,
-							&pg_yaap_parallel_min_relation_blocks,
-							1024,
-							0,
-							INT_MAX,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
-	DefineCustomBoolVariable("pg_yaap.parallel_experimental_hash_pipeline",
-							 "Enable the experimental leader-only HashBuild->Finalize->Probe pipeline DAG path.",
-							 NULL,
-							 &pg_yaap_parallel_experimental_hash_pipeline,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
 
 	DefineCustomBoolVariable("pg_yaap.trace_enabled",
 							 "Enable lightweight per-process Execution Trace recording.",

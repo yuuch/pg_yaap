@@ -135,7 +135,6 @@ FROM generate_series(1, 200000) AS i;
 ANALYZE orders_demo;
 
 SET pg_yaap.enabled = on;
-SET pg_yaap.parallel = on;
 SET pg_yaap.parallel_max_workers = 4;
 
 -- Confirm planner takeover (rows are optimizer estimates):
@@ -175,7 +174,6 @@ Example `EXPLAIN` output (`rows` are optimizer estimates):
 | GUC | Default | Description |
 |---|---|---|
 | `pg_yaap.enabled` | `on` | Enable YAAP |
-| `pg_yaap.parallel` | `on` | Enable parallel execution |
 | `pg_yaap.parallel_max_workers` | `4` | Max workers per query |
 | `pg_yaap.memory_limit` | `256MB` | Shared operator payload budget (`MB`, `>= 64MB`) |
 

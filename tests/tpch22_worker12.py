@@ -13,7 +13,7 @@ QUERIES = Path(os.environ.get('QUERY_DIR', '/Users/chenyunwen/proj/postgres_19de
 PSQL = os.environ.get('PSQL', '/Users/chenyunwen/proj/postgres/installed-bench/bin/psql')
 LIBRARY = Path(os.environ.get('YAAP_LIBRARY', ROOT / 'build-bench/pg_yaap.dylib')).resolve()
 BASE = [PSQL, '-X', '-U', os.environ.get('PGUSER', 'postgres'), '-h', os.environ.get('PGHOST', '/tmp'), '-p', os.environ.get('PGPORT', '55432'), '-d', os.environ.get('PGDATABASE', 'tpch'), '-v', 'ON_ERROR_STOP=1', '-P', 'pager=off']
-SETUP = (f"LOAD '{str(LIBRARY)}'; SET pg_yaap.enabled=on; SET pg_yaap.parallel=on; "
+SETUP = (f"LOAD '{str(LIBRARY)}'; SET pg_yaap.enabled=on; "
          "SET pg_yaap.parallel_max_workers=12; SET pg_yaap.memory_limit='8GB'; "
          "SET pg_yaap.memory_soft_limit=-1; SET statement_timeout='180s'; "
          "SET pg_yaap.trace_execution_path=on; \\timing on\n")

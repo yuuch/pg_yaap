@@ -73,7 +73,6 @@ trap 'rm -f "$TMP_SQL"' EXIT
 {
 	printf "LOAD 'pg_yaap';\n"
 	printf 'SET pg_yaap.enabled = on;\n'
-	printf 'SET pg_yaap.parallel = on;\n'
 	printf 'SET pg_yaap.parallel_max_workers = %s;\n' "$WORKERS"
 	printf "SET statement_timeout = '%s';\n" "$TIMEOUT"
 	printf 'SET pg_yaap.trace_hooks = %s;\n' "$TRACE_HOOKS"

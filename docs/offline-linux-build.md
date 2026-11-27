@@ -116,7 +116,7 @@ SHOW pg_yaap.enabled;
 ```sql
 LOAD 'pg_yaap';
 SET pg_yaap.enabled = on;
-SET pg_yaap.parallel = on;
+SET pg_yaap.parallel_max_workers = 4;
 ```
 
 要让所有新连接自动加载，在 `postgresql.conf` 中配置：

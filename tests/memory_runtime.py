@@ -55,10 +55,9 @@ def ddl(sql):
 
 def setup(workers=12, memory='64MB'):
     return (f"LOAD '{str(LIBRARY).replace(chr(39), chr(39)*2)}'; "
-            f"SET pg_yaap.enabled=on; SET pg_yaap.parallel=on; "
+            f"SET pg_yaap.enabled=on; "
             f"SET pg_yaap.parallel_max_workers={workers}; "
             f"SET pg_yaap.memory_limit='{memory}'; "
-            "SET pg_yaap.parallel_min_relation_blocks=0; "
             "SET statement_timeout='60s'; ")
 
 
