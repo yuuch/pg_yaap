@@ -63,7 +63,7 @@ All three engines (`pg_yaap`, `pg_duckdb v1.2.2`, and `PostgreSQL 18.3`) ran on 
   SET pg_yaap.trace_enabled = off;
   ```
 
-> **Memory limit semantics:** `pg_yaap.memory_limit = 8GB` caps **shared pipeline-breaker payloads** in DSA (and `pg_yaap.dsa_memory_limit = -1` permits up to `payload + min(payload / 2, 4 GiB)` in DSA segments). It is **not** a whole-query RSS cap — `shared_buffers` (4 GB), PostgreSQL backend/worker private `MemoryContext`s, LLVM JIT state, and OS file caches are outside `pg_yaap.memory_limit`. See [docs/dsa_memory_limits.md](dsa_memory_limits.md).
+> **Memory limit semantics:** `pg_yaap.memory_limit = 8GB` caps **shared pipeline-breaker payloads** in DSA (and `pg_yaap.dsa_memory_limit = -1` permits up to `payload + min(payload / 2, 4 GiB)` in DSA segments). It is **not** a whole-query RSS cap — `shared_buffers` (4 GB), PostgreSQL backend/worker private `MemoryContext`s, LLVM JIT state, and OS file caches are outside `pg_yaap.memory_limit`. See [docs/configuration.md](configuration.md).
 
 ### Execution & Timeout Policy
 

@@ -63,9 +63,9 @@ PostgreSQL 保留解析、Catalog、原生堆表存储、MVCC 与客户端协议
 - **独立查询优化器：** 子查询去相关、公共子计划 / CTE 复用、谓词下推与基于代价的 DP Join 重排序（[详见](docs/pipeline_runtime.md)）。
 - **向量化执行：** 列式 `DataChunk` 批次、向量化表达式求值，支持零拷贝原地过滤与投影（[详见](docs/pipeline_runtime.md)）。
 - **并行 Pipeline 运行时：** 基于 Event DAG 调度 `RUN / COMBINE / FINALIZE`，由动态 worker 与共享内存协同执行（[详见](docs/pipeline_runtime.md)）。
-- **优化的分析算子：** 自适应 Radix 分区 Hybrid Hash Join、Runtime Bloom Filter 与 Hash / Perfect-Hash 聚合（[详见](docs/hybrid_hash_join.md)）。
-- **超内存执行：** 内存感知阻塞算子、分区处理、递归再分区与磁盘落盘（[详见](docs/dsa_memory_limits.md)）。
-- **原生堆表扫描优化：** PostgreSQL `ReadStream` 预取集成与 LLVM JIT 元组解码（[详见](docs/yaap_read_stream.md)）。
+- **优化的分析算子：** 自适应 Radix 分区 Hybrid Hash Join、Runtime Bloom Filter 与 Hash / Perfect-Hash 聚合（[详见](docs/pipeline_runtime.md)）。
+- **超内存执行：** 内存感知阻塞算子、分区处理、递归再分区与磁盘落盘（[详见](docs/configuration.md)）。
+- **原生堆表扫描优化：** PostgreSQL `ReadStream` 预取集成与 LLVM JIT 元组解码（[详见](docs/pipeline_runtime.md)）。
 - **内置执行追踪：** 无锁采集每进程时间线并导出 Chrome Trace / Perfetto JSON（[详见](docs/execution_trace.md)）。
 
 ## 系统架构
@@ -92,7 +92,7 @@ PostgreSQL 保留解析、Catalog、原生堆表存储、MVCC 与客户端协议
 | **SF100** | `pg_duckdb v1.2.2` | **22 / 22** | 0 | 710.2 s | 710.2 s | DuckDB `v2.0.1`，`8GB`，`8` PG 扫描 worker / `2` 拉取线程，`100 s` 上限 |
 | **SF100** | PostgreSQL `18.3` | 16 / 22 | 6 超时 | 501.4 s | 1,101.4 s+ | 原生并行（12 workers）；Q2、Q9、Q17、Q18、Q20、Q21 按 `100 s` 计（`6 × 100 s`） |
 
-超时查询按 `statement_timeout` 上限计入总耗时（SF10 为 `30 s`、SF100 为 `100 s`），总时间后的 `+` 表示实际耗时大于该下界；`pg_yaap.memory_limit` 限制 DSA 中共享 breaker 载荷，而非进程 RSS 或 `shared_buffers`（[docs/dsa_memory_limits.md](docs/dsa_memory_limits.md)）。
+超时查询按 `statement_timeout` 上限计入总耗时（SF10 为 `30 s`、SF100 为 `100 s`），总时间后的 `+` 表示实际耗时大于该下界；`pg_yaap.memory_limit` 限制 DSA 中共享 breaker 载荷，而非进程 RSS 或 `shared_buffers`（[docs/configuration.md](docs/configuration.md)）。
 
 ![TPC-H SF10 总耗时对比](imgs/sf10_total.svg)
 
@@ -199,8 +199,7 @@ Python 集成测试、环境变量与 CI 见 [docs/testing.md](docs/testing.md)�
 
 ## 文档导航
 
-- **架构与优化器：** [AGENTS.md](AGENTS.md) · [src/optimizer/](src/optimizer) · [pg_yaap_executor_design.md](pg_yaap_executor_design.md) · [架构差距分析](docs/executor_architecture_gap_analysis.md)
-- **运行时与算子：** [Pipeline Runtime](docs/pipeline_runtime.md)（[内部架构图](imgs/pipeline_runtime.svg)）· [Hybrid Hash Join](docs/hybrid_hash_join.md) · [Partition Probe](docs/hash_join_partition_probe.md) · [DSA 内存限制](docs/dsa_memory_limits.md) · [ReadStream](docs/yaap_read_stream.md)
+- **核心骨架：** [AGENTS.md](AGENTS.md) · [Pipeline Runtime](docs/pipeline_runtime.md)（[内部架构图](imgs/pipeline_runtime.svg)）
 - **使用与验证：** [配置文档](docs/configuration.md) · [基准测试](docs/benchmark.md) · [执行追踪](docs/execution_trace.md) · [测试指南](docs/testing.md) · [离线 Linux 构建](docs/offline-linux-build.md)
 
 ## 致谢与协议

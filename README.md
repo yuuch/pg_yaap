@@ -63,9 +63,9 @@ PostgreSQL retains parsing, catalogs, native heap storage, MVCC, and client prot
 - **Independent Query Optimizer:** Subquery decorrelation, common subplan / CTE reuse, predicate pushdown, and cost-based DP join ordering ([details](docs/pipeline_runtime.md)).
 - **Vectorized Execution:** Columnar `DataChunk` batches, vectorized expression evaluation, and zero-copy in-place filtering/projection ([details](docs/pipeline_runtime.md)).
 - **Parallel Pipeline Runtime:** Event DAG (`RUN / COMBINE / FINALIZE`) scheduling across dynamic background workers via shared memory ([details](docs/pipeline_runtime.md)).
-- **Optimized Analytical Operators:** Adaptive radix-partitioned Hybrid Hash Join, runtime Bloom filters, and hash / perfect-hash aggregation ([details](docs/hybrid_hash_join.md)).
-- **Larger-than-memory Execution:** Memory-aware pipeline breakers, partitioning, recursive repartitioning, and disk spilling ([details](docs/dsa_memory_limits.md)).
-- **Native Heap Scan Optimization:** PostgreSQL `ReadStream` prefetching and LLVM JIT tuple deformation ([details](docs/yaap_read_stream.md)).
+- **Optimized Analytical Operators:** Adaptive radix-partitioned Hybrid Hash Join, runtime Bloom filters, and hash / perfect-hash aggregation ([details](docs/pipeline_runtime.md)).
+- **Larger-than-memory Execution:** Memory-aware pipeline breakers, partitioning, recursive repartitioning, and disk spilling ([details](docs/configuration.md)).
+- **Native Heap Scan Optimization:** PostgreSQL `ReadStream` prefetching and LLVM JIT tuple deformation ([details](docs/pipeline_runtime.md)).
 - **Built-in Execution Tracing:** Lock-free per-process timelines exported to Chrome Trace / Perfetto JSON ([details](docs/execution_trace.md)).
 
 ## Architecture
@@ -92,7 +92,7 @@ Controlled runs on **Apple M4 Pro (14 cores, 24 GB RAM)** sharing the **same Pos
 | **SF100** | `pg_duckdb v1.2.2` | **22 / 22** | 0 | 710.2 s | 710.2 s | DuckDB `v2.0.1`, `8GB`, `8` PG scan workers / `2` threads, `100 s` cap |
 | **SF100** | PostgreSQL `18.3` | 16 / 22 | 6 TO | 501.4 s | 1,101.4 s+ | Native parallel (`12` workers); Q2, Q9, Q17, Q18, Q20, Q21 counted as `100 s` (`6 × 100 s`) |
 
-Timed-out queries are billed at the `statement_timeout` cap (`30 s` at SF10, `100 s` at SF100), with `+` marking lower-bound totals. `pg_yaap.memory_limit` caps shared breaker payloads in DSA rather than process RSS or `shared_buffers` ([docs/dsa_memory_limits.md](docs/dsa_memory_limits.md)).
+Timed-out queries are billed at the `statement_timeout` cap (`30 s` at SF10, `100 s` at SF100), with `+` marking lower-bound totals. `pg_yaap.memory_limit` caps shared breaker payloads in DSA rather than process RSS or `shared_buffers` ([docs/configuration.md](docs/configuration.md)).
 
 ![TPC-H SF10 total runtime comparison](imgs/sf10_total.svg)
 
@@ -199,8 +199,7 @@ Python suite, environment variables, and CI details: [docs/testing.md](docs/test
 
 ## Documentation
 
-- **Architecture & Optimizer:** [AGENTS.md](AGENTS.md) · [src/optimizer/](src/optimizer) · [pg_yaap_executor_design.md](pg_yaap_executor_design.md) · [Gap Analysis](docs/executor_architecture_gap_analysis.md)
-- **Runtime & Operators:** [Pipeline Runtime](docs/pipeline_runtime.md) ([diagram](imgs/pipeline_runtime.svg)) · [Hybrid Hash Join](docs/hybrid_hash_join.md) · [Partition Probe](docs/hash_join_partition_probe.md) · [DSA Memory Limits](docs/dsa_memory_limits.md) · [ReadStream](docs/yaap_read_stream.md)
+- **Core Architecture:** [AGENTS.md](AGENTS.md) · [Pipeline Runtime](docs/pipeline_runtime.md) ([diagram](imgs/pipeline_runtime.svg))
 - **Usage & Validation:** [Configuration](docs/configuration.md) · [Benchmarks](docs/benchmark.md) · [Execution Tracing](docs/execution_trace.md) · [Testing](docs/testing.md) · [Offline Linux Build](docs/offline-linux-build.md)
 
 ## Acknowledgements & License
