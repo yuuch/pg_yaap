@@ -241,14 +241,17 @@ static void pg_yaap_jit_store_numeric_int64_fast(const char *ptr, int64_t *dst) 
 
 static void pg_yaap_jit_store_stringref(const char *ptr, void *dst) {
 	struct varlena *v = (struct varlena *) ptr;
-	char *vptr = VARDATA_ANY(v);
-	int len = VARSIZE_ANY_EXHDR(v);
+	struct varlena *detoasted = VARATT_IS_EXTENDED(v) ? pg_detoast_datum_packed(v) : v;
+	char *vptr = VARDATA_ANY(detoasted);
+	int len = VARSIZE_ANY_EXHDR(detoasted);
 	uint64_t pref = 0;
 	if (len > 0)
 		memcpy(&pref, vptr, len > 8 ? 8 : len);
 	((uint32_t*)dst)[0] = len;
 	((uint32_t*)dst)[1] = 0;
 	((uint64_t*)((char*)dst + 8))[0] = pref;
+	if (detoasted != v)
+		pfree(detoasted);
 }
 
 static void
@@ -258,6 +261,7 @@ pg_yaap_jit_store_stringref_owned(const char *ptr, void *dst, void *chunk_ptr)
 		reinterpret_cast<DataChunk<DEFAULT_CHUNK_SIZE> *>(chunk_ptr);
 	VecStringRef ref;
 	struct varlena *v;
+	struct varlena *detoasted;
 	char *vptr;
 	int len;
 
@@ -268,10 +272,13 @@ pg_yaap_jit_store_stringref_owned(const char *ptr, void *dst, void *chunk_ptr)
 	}
 
 	v = (struct varlena *) ptr;
-	vptr = VARDATA_ANY(v);
-	len = VARSIZE_ANY_EXHDR(v);
+	detoasted = VARATT_IS_EXTENDED(v) ? pg_detoast_datum_packed(v) : v;
+	vptr = VARDATA_ANY(detoasted);
+	len = VARSIZE_ANY_EXHDR(detoasted);
 	ref = chunk->store_string_bytes(vptr, (uint32_t) len);
 	memcpy(dst, &ref, sizeof(ref));
+	if (detoasted != v)
+		pfree(detoasted);
 }
 
 /*
@@ -1101,10 +1108,15 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 					LLVMBasicBlockRef bb_merge = l_bb_append_v(v_func, "att.%d.varmerge", att_index);
 
 					LLVMValueRef v_byte0 = LLVMBuildLoad2(b, type_i8, v_attdatap, "varhdr_byte0");
-					LLVMValueRef v_is_short = LLVMBuildICmp(b, LLVMIntEQ,
+					LLVMValueRef v_has_1b_tag = LLVMBuildICmp(b, LLVMIntEQ,
 															 LLVMBuildAnd(b, v_byte0, LLVMConstInt(type_i8, 0x01, false), ""),
 															 LLVMConstInt(type_i8, 0x01, false),
 															 "is_1b_hdr");
+					LLVMValueRef v_not_1b_e = LLVMBuildICmp(b, LLVMIntNE,
+														  v_byte0,
+														  LLVMConstInt(type_i8, 0x01, false),
+														  "not_1b_e");
+					LLVMValueRef v_is_short = LLVMBuildAnd(b, v_has_1b_tag, v_not_1b_e, "is_short_1b");
 					LLVMBuildCondBr(b, v_is_short, bb_short, bb_long);
 
 					LLVMPositionBuilderAtEnd(b, bb_short);

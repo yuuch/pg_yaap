@@ -161,10 +161,15 @@ DataChunkDeformer::deform_tuple_header(HeapTupleHeader tuphdr,
 				case DeformDecodeKind::kStringRef:
 				{
 					const struct varlena *vl = (const struct varlena *) attptr;
-					const char *bytes = VARDATA_ANY(vl);
-					uint32_t len = (uint32_t) VARSIZE_ANY_EXHDR(vl);
+					struct varlena *detoasted = VARATT_IS_EXTENDED(vl)
+						? pg_detoast_datum_packed(const_cast<struct varlena *>(vl))
+						: const_cast<struct varlena *>(vl);
+					const char *bytes = VARDATA_ANY(detoasted);
+					uint32_t len = (uint32_t) VARSIZE_ANY_EXHDR(detoasted);
 					VecStringRef ref = bindings.owner_chunk->store_string_bytes(bytes, len);
 					((VecStringRef *) bindings.columns_data[t.dst_col])[row_idx] = ref;
+					if (detoasted != vl)
+						pfree(detoasted);
 					break;
 				}
 			}

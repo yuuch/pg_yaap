@@ -64,6 +64,7 @@ public:
 	uint32_t             partition_mask = 0;
 	uint32_t             partition_shift = 64;
 	uint32_t             max_groups = 256;
+	uint32_t             initial_partition_rows = 0;
 	bool                 use_perfect_hash = false;
 	uint32_t             perfect_capacity = 0;
 	PgVector<uint32_t>   perfect_row_indices;

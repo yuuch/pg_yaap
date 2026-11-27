@@ -169,10 +169,13 @@ TupleDataCollectionGrowHeapCapacity(const TupleDataLayout *layout,
 		const_cast<pg_atomic_uint32 *>(&old_tdc->heap_used));
 	const uint64_t min_required = static_cast<uint64_t>(heap_used) +
 		static_cast<uint64_t>(required_heap_bytes);
-	uint64_t next_capacity = static_cast<uint64_t>(old_tdc->heap_capacity) +
-		std::max<uint64_t>(static_cast<uint64_t>(old_tdc->heap_capacity) / 2u, 1024u * 1024u);
-	if (next_capacity < min_required)
-		next_capacity = min_required;
+	uint64_t next_capacity = static_cast<uint64_t>(old_tdc->heap_capacity);
+	if (min_required > (next_capacity * 3u) / 4u)
+	{
+		next_capacity += std::max<uint64_t>(next_capacity / 2u, 64u * 1024u);
+		if (next_capacity < min_required)
+			next_capacity = min_required + std::max<uint64_t>(min_required / 4u, 64u * 1024u);
+	}
 
 	const uint64_t row_bytes = TupleDataCollectionRowBytes(new_row_capacity,
 		old_tdc->row_width);

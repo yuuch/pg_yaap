@@ -224,17 +224,36 @@ YaapSegmentedTdcAppendWithHeap(dsa_area *dsa, YaapBufferSharedState *state,
 			static_cast<uint32_t>(YaapSharedSegmentState::WRITABLE_LOCAL))
 			AllocateActive(dsa, state, tdc);
 	}
+	auto *active_segment = Resolve(dsa, tdc->arena_dp, tdc->active);
 	auto *store = ResolveStore(dsa, tdc->arena_dp, tdc->active);
-	if (store == nullptr)
+	if (active_segment == nullptr || store == nullptr)
 		return false;
 	if (required_heap_bytes > store->heap_capacity)
 	{
 		/* A single varlena value may be larger than the initial heap grant.
-		 * Grow the writer's heap geometry before allocating the successor; the
-		 * arena capacity check in AllocateActive remains the hard bound. */
+		 * Grow the writer's heap geometry within the backing segment capacity
+		 * and shrink row_capacity if needed so successor allocations fit. */
+		const uint32_t seg_cap = active_segment->capacity;
+		const uint32_t fixed_hdr = static_cast<uint32_t>(offsetof(TupleDataCollection, rows));
+		if (seg_cap <= fixed_hdr + tdc->row_width ||
+			required_heap_bytes > seg_cap - fixed_hdr - tdc->row_width)
+			return false;
 		SealActive(dsa, tdc);
-		tdc->heap_capacity = std::max(required_heap_bytes,
-			tdc->heap_capacity > UINT32_MAX / 2 ? UINT32_MAX : tdc->heap_capacity * 2u);
+		const uint32_t usable = seg_cap - fixed_hdr;
+		const uint32_t three_quarters = (usable * 3u) / 4u;
+		uint32_t new_heap = std::min(
+			tdc->heap_capacity > UINT32_MAX / 2 ? UINT32_MAX : tdc->heap_capacity * 2u,
+			std::max(required_heap_bytes, three_quarters));
+		if (new_heap > usable - tdc->row_width)
+			new_heap = usable - tdc->row_width;
+		if (new_heap < required_heap_bytes)
+			new_heap = required_heap_bytes;
+		tdc->heap_capacity = new_heap;
+		const uint32_t max_rows = (usable - new_heap) / tdc->row_width;
+		if (max_rows == 0)
+			return false;
+		if (tdc->row_capacity > max_rows)
+			tdc->row_capacity = max_rows;
 		AllocateActive(dsa, state, tdc);
 		store = ResolveStore(dsa, tdc->arena_dp, tdc->active);
 	}
@@ -243,7 +262,42 @@ YaapSegmentedTdcAppendWithHeap(dsa_area *dsa, YaapBufferSharedState *state,
 	if (pg_atomic_read_u32(&store->row_count) >= store->row_capacity ||
 		!TupleDataCollectionHasSpaceForAppend(store, required_heap_bytes))
 	{
+		const uint32_t rows_used = pg_atomic_read_u32(&store->row_count);
+		const uint32_t heap_used = pg_atomic_read_u32(&store->heap_used);
+		const uint32_t seg_cap = active_segment->capacity;
+		const uint32_t fixed_hdr = static_cast<uint32_t>(offsetof(TupleDataCollection, rows));
 		SealActive(dsa, tdc);
+		/* Rebalance fixed row slots vs string heap within the segment budget so
+		 * sparse-string layouts (e.g. mostly-empty SearchPhrase) don't seal
+		 * segments with hundreds of KiB of unused heap. */
+		if (seg_cap > fixed_hdr + tdc->row_width && store->heap_capacity > 0)
+		{
+			const uint32_t usable = seg_cap - fixed_hdr;
+			if (rows_used >= store->row_capacity && heap_used < store->heap_capacity / 2u)
+			{
+				uint32_t new_heap = std::max(heap_used * 2u, usable / 4u);
+				new_heap = std::max(new_heap, required_heap_bytes * 2u);
+				new_heap = std::min(new_heap, store->heap_capacity);
+				if (usable > new_heap + tdc->row_width)
+				{
+					const uint32_t max_rows = (usable - new_heap) / tdc->row_width;
+					const uint32_t doubled_rows = tdc->row_capacity > UINT32_MAX / 2
+						? UINT32_MAX : tdc->row_capacity * 2u;
+					tdc->row_capacity = std::min(doubled_rows, max_rows);
+					tdc->heap_capacity = usable - tdc->row_capacity * tdc->row_width;
+				}
+			}
+			else if (rows_used < store->row_capacity / 2u && store->row_capacity > 64u)
+			{
+				uint32_t new_rows = std::max<uint32_t>(rows_used * 2u, 64u);
+				new_rows = std::min(new_rows, store->row_capacity);
+				if (usable > new_rows * tdc->row_width)
+				{
+					tdc->row_capacity = new_rows;
+					tdc->heap_capacity = usable - new_rows * tdc->row_width;
+				}
+			}
+		}
 		AllocateActive(dsa, state, tdc);
 		store = ResolveStore(dsa, tdc->arena_dp, tdc->active);
 	}

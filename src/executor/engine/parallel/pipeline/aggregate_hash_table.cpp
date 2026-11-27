@@ -341,7 +341,7 @@ uint32_t
 AggregateHashTableChooseCapacity(uint32_t max_groups)
 {
 	constexpr uint32_t kMinCapacity = 32;
-	constexpr uint32_t kMaxCapacity = 1u << 22;
+	constexpr uint32_t kMaxCapacity = 1u << 27;
 	uint64_t needed = static_cast<uint64_t>(max_groups < 1 ? 1u : max_groups);
 	needed = needed + (needed >> 1) + 1u;
 	if (needed < kMinCapacity)

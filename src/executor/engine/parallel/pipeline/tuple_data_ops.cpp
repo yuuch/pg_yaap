@@ -700,9 +700,9 @@ Gather(const TupleDataLayout *layout,
 			const int64_t count = ReadInt64At(row_ptr, agg.offset + 16);
 			if (count != 0)
 			{
-				NumericWideInt widened =
-					(sum * WideIntFromInt64(kAvgNumericScaleFactor)) /
-					WideIntFromInt64(count);
+				const NumericWideInt scale = WideIntFromInt64(kAvgNumericScaleFactor);
+				const NumericWideInt cnt = WideIntFromInt64(count);
+				const NumericWideInt widened = (sum / cnt) * scale + ((sum % cnt) * scale) / cnt;
 				chunk.set_wide128(agg_chunk_base + a, row_idx, widened);
 			}
 			else

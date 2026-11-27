@@ -348,13 +348,14 @@ SegmentBackingFits(const ExecCtx &ctx, const TupleDataLayout *layout,
 static bool
 TryInitSegmentBackedTdc(ExecCtx &ctx, HashAggPartition &part,
 						 dsa_pointer layout_dp, const TupleDataLayout *layout,
-							 uint32_t partition_count, uint32_t row_capacity)
+							 uint32_t partition_count, uint32_t row_capacity,
+							 bool allow_wide_worker_strings = false)
 {
 	if (!CanUseSegmentBackedLocalTdc(layout, partition_count) ||
 		ctx.control == nullptr ||
 		!DsaPointerIsValid(ctx.control->shared_segment_arena_root))
 		return false;
-	if (LayoutHasStringRef(layout) && EffectiveWorkerCount(ctx) > 4)
+	if (!allow_wide_worker_strings && LayoutHasStringRef(layout) && EffectiveWorkerCount(ctx) > 4)
 		return false;
 	while (row_capacity >= 256u && !SegmentBackingFits(ctx, layout, row_capacity))
 		row_capacity /= 2u;
@@ -367,15 +368,54 @@ TryInitSegmentBackedTdc(ExecCtx &ctx, HashAggPartition &part,
 	auto *arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, arena_dp);
 	if (arena == nullptr || row_capacity == 0)
 		return false;
-	const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, row_capacity);
+	uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, row_capacity);
 	const uint64_t required_bytes = offsetof(TupleDataCollection, rows) +
 		static_cast<uint64_t>(row_capacity) * layout->row_width + heap_capacity;
 	if (required_bytes > arena->segment_size)
 	{
-		arena_dp = ctx.control->large_shared_segment_arena_root;
-		arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, arena_dp);
-		if (arena == nullptr || required_bytes > arena->segment_size)
+		dsa_pointer large_dp = ctx.control->large_shared_segment_arena_root;
+		auto *large_arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, large_dp);
+		if (large_arena == nullptr || required_bytes > large_arena->segment_size)
 			return false;
+		arena_dp = large_dp;
+		arena = large_arena;
+	}
+	/* Fill the chosen segment's full capacity proportionally so high-cardinality
+	 * string aggregations don't waste the majority of each fixed segment. */
+	const uint64_t fixed_hdr = offsetof(TupleDataCollection, rows);
+	if (arena->segment_size > fixed_hdr + layout->row_width)
+	{
+		const uint64_t usable = arena->segment_size - fixed_hdr;
+		const uint64_t cur_payload = required_bytes > fixed_hdr ? required_bytes - fixed_hdr : 0;
+		if (cur_payload > 0 && cur_payload < usable)
+		{
+			uint64_t scaled_rows = (static_cast<uint64_t>(row_capacity) * usable) / cur_payload;
+			if (scaled_rows > kMaxSegmentBackedRows)
+				scaled_rows = kMaxSegmentBackedRows;
+			if (LayoutHasStringRef(layout))
+			{
+				uint64_t scaled_heap = TupleDataCollectionDefaultHeapCapacity(
+					layout, static_cast<uint32_t>(scaled_rows));
+				while (scaled_rows > row_capacity &&
+					   scaled_rows * layout->row_width + scaled_heap > usable)
+				{
+					scaled_rows = (scaled_rows * 7u) / 8u;
+					scaled_heap = TupleDataCollectionDefaultHeapCapacity(
+						layout, static_cast<uint32_t>(scaled_rows));
+				}
+				if (scaled_rows >= row_capacity &&
+					scaled_rows * layout->row_width + scaled_heap <= usable)
+				{
+					row_capacity = static_cast<uint32_t>(scaled_rows);
+					heap_capacity = static_cast<uint32_t>(usable - scaled_rows * layout->row_width);
+				}
+			}
+			else if (scaled_rows >= row_capacity &&
+					 scaled_rows * layout->row_width <= usable)
+			{
+				row_capacity = static_cast<uint32_t>(scaled_rows);
+			}
+		}
 	}
 	const buffer::YaapSegmentHandle handle = buffer::YaapSharedSegmentArenaAllocate(
 		ctx.dsa, state, arena_dp, ExecutionTaskSlot(ctx));
@@ -771,7 +811,8 @@ ReleaseLocalPartitionArrays(ExecCtx &ctx, HashAggSharedPayload *payload)
 static void GrowLocalTdc(ExecCtx &ctx,
                          HashAggLocalSinkState &local,
 	                         HashAggPartition &part,
-	                         uint32_t required_heap_bytes);
+	                         uint32_t required_heap_bytes,
+	                         uint32_t incoming_rows = 1u);
 
 static uint32_t
 RequiredHeapBytesForChunkRows(const TupleDataLayout *layout,
@@ -1043,14 +1084,22 @@ ResizeAhtForTdc(ExecCtx &ctx,
                 dsa_pointer tdc_dp,
                 TupleDataCollection *tdc,
                 const TupleDataLayout *layout,
-                dsa_pointer *aht_dp)
+                dsa_pointer *aht_dp,
+                uint32_t extra_rows = 0)
 {
 	dsa_pointer old_aht_dp = *aht_dp;
 	AggregateHashTable *old_aht = ResolveAht(ctx.dsa, *aht_dp);
-	if (old_aht == nullptr || !AggregateHashTableShouldResize(old_aht, tdc))
+	if (old_aht == nullptr)
+		return;
+	const uint64_t total_rows = static_cast<uint64_t>(
+		pg_atomic_read_u32(&tdc->row_count)) + extra_rows;
+	if (total_rows * 3u < static_cast<uint64_t>(old_aht->capacity) * 2u)
 		return;
 
-	const uint32_t new_capacity = old_aht->capacity << 1;
+	uint32_t new_capacity = old_aht->capacity << 1;
+	while (total_rows * 3u >= static_cast<uint64_t>(new_capacity) * 2u &&
+		   new_capacity < (1u << 27))
+		new_capacity <<= 1;
 	dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(new_capacity));
 	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
 	AggregateHashTableInit(new_aht, new_capacity, tdc_dp);
@@ -1070,12 +1119,37 @@ ResizeAhtForTdc(ExecCtx &ctx,
 	DestroyAht(ctx, old_aht_dp);
 }
 
+static uint32_t
+NextTdcRowCapacity(const TupleDataCollection *old_tdc,
+                   uint32_t row_width,
+                   uint32_t required_heap_bytes,
+                   uint32_t incoming_rows)
+{
+	const uint32_t old_count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&old_tdc->row_count));
+	const uint64_t needed = static_cast<uint64_t>(old_count) +
+		std::max<uint64_t>(1u, incoming_rows);
+	uint64_t new_capacity = old_tdc->row_capacity;
+	/* Only grow row_capacity when incoming rows exceed remaining slots;
+	 * heap-only overflows must not exponentially bloat sparse row arrays. */
+	while (new_capacity < needed && new_capacity <= UINT32_MAX / 2u)
+		new_capacity <<= 1;
+	if (new_capacity < needed)
+		new_capacity = needed > UINT32_MAX ? UINT32_MAX : needed;
+	return TupleDataCollectionClampRowCapacity(
+		static_cast<uint32_t>(std::min<uint64_t>(new_capacity, UINT32_MAX)),
+		row_width,
+		required_heap_bytes,
+		old_count + 1u);
+}
+
 static void
 GrowTdcForPartition(ExecCtx &ctx,
                     dsa_pointer layout_dp,
                     const TupleDataLayout *layout,
 	                    HashAggPartition &part,
-	                    uint32_t required_heap_bytes)
+	                    uint32_t required_heap_bytes,
+	                    uint32_t incoming_rows = 1u)
 {
 	dsa_pointer old_tdc_dp = part.tdc_dp;
 	dsa_pointer old_aht_dp = part.aht_dp;
@@ -1088,11 +1162,10 @@ GrowTdcForPartition(ExecCtx &ctx,
 		elog(ERROR, "pg_yaap: hash aggregate partition TDC missing");
 
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
-	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+	const uint32_t new_capacity = NextTdcRowCapacity(old_tdc,
 		layout->row_width,
 		required_heap_bytes,
-		old_count + 1u);
+		incoming_rows);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(layout,
 		old_tdc,
 		new_capacity,
@@ -1133,11 +1206,41 @@ GrowTdcForPartition(ExecCtx &ctx,
 		dsa_free(ctx.dsa, old_tdc_dp);
 }
 
+static uint64_t
+LocalPartitionFlushBudgetBytes(const ExecCtx &ctx, uint32_t partition_count)
+{
+	auto *budget = ResolveBufferState(ctx);
+	if (budget == nullptr || budget->hard_limit == 0)
+		return UINT64_MAX;
+	const uint64_t workers = std::max<uint64_t>(1u, EffectiveWorkerCount(ctx));
+	const uint64_t total_parts = workers * std::max<uint64_t>(1u, partition_count);
+	/* Bound combined worker-local hash-table footprint to ~25% of query
+	 * memory_limit so high-cardinality scans flush early into global
+	 * partitions instead of duplicating gigabytes across workers. */
+	return std::max<uint64_t>(256u * 1024u, (budget->hard_limit / 4u) / total_parts);
+}
+
+static uint64_t
+ProjectedLocalGrowBytes(const TupleDataLayout *layout,
+						const TupleDataCollection *old_tdc,
+						uint32_t required_heap_bytes,
+						uint32_t incoming_rows)
+{
+	const uint32_t new_capacity = NextTdcRowCapacity(old_tdc,
+		layout->row_width, required_heap_bytes, incoming_rows);
+	const uint32_t new_heap = TupleDataCollectionGrowHeapCapacity(layout,
+		old_tdc, new_capacity, required_heap_bytes);
+	const uint32_t new_aht_cap = AggregateHashTableChooseCapacity(new_capacity);
+	return TupleDataCollectionAllocSize(new_capacity, layout->row_width, new_heap) +
+		AggregateHashTableAllocSize(new_aht_cap);
+}
+
 static void
 GrowLocalTdc(ExecCtx &ctx,
              HashAggLocalSinkState &local,
 	             HashAggPartition &part,
-	             uint32_t required_heap_bytes)
+	             uint32_t required_heap_bytes,
+	             uint32_t incoming_rows)
 {
 	dsa_pointer old_tdc_dp = part.tdc_dp;
 	dsa_pointer old_aht_dp = part.aht_dp;
@@ -1149,11 +1252,10 @@ GrowLocalTdc(ExecCtx &ctx,
 	if (old_tdc == nullptr)
 		elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
-	uint32_t new_capacity = std::max(old_tdc->row_capacity * 2u, old_count + 1u);
-	new_capacity = TupleDataCollectionClampRowCapacity(new_capacity,
+	const uint32_t new_capacity = NextTdcRowCapacity(old_tdc,
 		local.layout->row_width,
 		required_heap_bytes,
-		old_count + 1u);
+		incoming_rows);
 	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(local.layout,
 		old_tdc,
 		new_capacity,
@@ -1245,7 +1347,8 @@ SinkChunkDistinctCountShared(ExecCtx &ctx, HashAggLocalSinkState &local,
 				in, rows.data(), count))
 			{
 				GrowTdcForPartition(ctx, global.layout_dp, local.layout, group_part,
-					RequiredHeapBytesForChunkRows(local.layout, in, rows.data(), count));
+					RequiredHeapBytesForChunkRows(local.layout, in, rows.data(), count),
+					count);
 				group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
 			}
 			for (uint16_t i = 0; i < count; ++i)
@@ -1400,9 +1503,12 @@ SinkChunkDistinctCountShared(ExecCtx &ctx, HashAggLocalSinkState &local,
 					GrowTdcForPartition(ctx, global.distinct_layout_dp, global.distinct_layout,
 						distinct_part,
 						RequiredHeapBytesForChunkRows(global.distinct_layout, in,
-							distinct_rows.data(), distinct_count));
+							distinct_rows.data(), distinct_count),
+						distinct_count);
 					distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
 				}
+				ResizeAhtForTdc(ctx, distinct_part.tdc_dp, distinct_tdc,
+					global.distinct_layout, &distinct_part.aht_dp, distinct_count);
 				AggregateHashTableFindOrInsertBatch(ResolveAht(ctx.dsa, distinct_part.aht_dp),
 					distinct_tdc, global.distinct_layout, in, distinct_inputs.data(),
 					distinct_count, distinct_results.data());
@@ -1542,9 +1648,9 @@ GatherDenseAggregateOutput(const TupleDataLayout *layout,
 			std::memcpy(&count, row_ptr + agg.offset + 16, sizeof(count));
 			if (count != 0)
 			{
-				NumericWideInt widened =
-					(sum * WideIntFromInt64(kDenseAggAvgScaleFactor)) /
-					WideIntFromInt64(count);
+				const NumericWideInt scale = WideIntFromInt64(kDenseAggAvgScaleFactor);
+				const NumericWideInt cnt = WideIntFromInt64(count);
+				const NumericWideInt widened = (sum / cnt) * scale + ((sum % cnt) * scale) / cnt;
 				chunk.set_wide128(layout->column_count + a, row_idx, widened);
 			}
 			else
@@ -1714,7 +1820,7 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			HashAggPartition &part = state->partitions[part_idx];
 			LWLockInitialize(&part.mutex, LWTRANCHE_PARALLEL_QUERY_DSA);
 			if (!has_distinct_count && TryInitSegmentBackedTdc(ctx, part, state->layout_dp, state->layout,
-								state->partition_count, initial_global_partition_rows))
+								state->partition_count, initial_global_partition_rows, true))
 			{
 				AggregateHashTable *aht = nullptr;
 				AllocAhtForTdc(ctx, part.tdc_dp, initial_global_partition_rows,
@@ -1814,6 +1920,7 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		(static_cast<uint64_t>(state->max_groups) + workers - 1u) / workers);
 	const uint32_t initial_local_partition_rows = InitialPartitionRows(ctx, state->layout,
 		local_groups, state->partition_count, workers);
+	state->initial_partition_rows = initial_local_partition_rows;
 
 	state->local_partitions_dp = dsa_allocate0(ctx.dsa,
 		static_cast<size_t>(state->partition_count) * sizeof(HashAggPartition));
@@ -1876,13 +1983,20 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	return state;
 }
 
+static void
+FlushLocalPartitionToGlobal(ExecCtx &ctx,
+                            HashAggGlobalSinkState &global,
+                            HashAggLocalSinkState &local,
+                            uint32_t part_idx,
+                            uint64_t budget_bytes);
+
 SinkResultType
 PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
+	auto &global = static_cast<HashAggGlobalSinkState &>(input.global_state);
 	auto &local = static_cast<HashAggLocalSinkState &>(input.local_state);
 	if (local.has_distinct_count)
-		return SinkChunkDistinctCountShared(ctx, local,
-			static_cast<HashAggGlobalSinkState &>(input.global_state), in);
+		return SinkChunkDistinctCountShared(ctx, local, global, in);
 	if (local.layout->column_count == 0 && local.layout->aggregate_count > 0)
 		elog(LOG,
 		     "pg_yaap: HashAgg.SinkChunk in_count=%u partitions=%u perfect=%d",
@@ -1938,6 +2052,7 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 			probe_rows[part_write[partitions[row_idx]]++] = row_idx;
 	}
 
+	const uint64_t local_flush_budget = LocalPartitionFlushBudgetBytes(ctx, local.partition_count);
 	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
 	{
 		if (PipelineCancelRequestedEvery(ctx, part_idx))
@@ -2002,12 +2117,26 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 		if (tdc == nullptr)
 			elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
+		if (PartitionNeedsGrowForChunkBatch(local.layout, tdc, in, part_rows, probe_count))
+		{
+			const uint32_t req_heap = RequiredHeapBytesForChunkRows(local.layout,
+				in, part_rows, probe_count);
+			if (pg_atomic_read_u32(&tdc->row_count) > 0 &&
+				ProjectedLocalGrowBytes(local.layout, tdc, req_heap, probe_count) > local_flush_budget)
+			{
+				FlushLocalPartitionToGlobal(ctx, global, local, part_idx, local_flush_budget);
+				tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+				if (tdc == nullptr)
+					elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing after flush");
+			}
+		}
 		while (PartitionNeedsGrowForChunkBatch(local.layout, tdc, in, part_rows, probe_count))
 		{
 			GrowLocalTdc(ctx,
 				local,
 				part,
-				RequiredHeapBytesForChunkRows(local.layout, in, part_rows, probe_count));
+				RequiredHeapBytesForChunkRows(local.layout, in, part_rows, probe_count),
+				probe_count);
 			tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 			if (tdc == nullptr)
 				elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing after grow");
@@ -2126,7 +2255,7 @@ CombineTdcIntoGlobal(ExecCtx &ctx, HashAggGlobalSinkState &global,
 		{
 			const uint32_t prev_cap = tdc->row_capacity;
 			const uint32_t prev_heap = tdc->heap_capacity;
-			GrowTdcForPartition(ctx, global.layout_dp, global.layout, global_part, req_heap);
+			GrowTdcForPartition(ctx, global.layout_dp, global.layout, global_part, req_heap, batch);
 			tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
 			aht = ResolveAht(ctx.dsa, global_part.aht_dp);
 			if (tdc == nullptr || aht == nullptr)
@@ -2152,6 +2281,66 @@ CombineTdcIntoGlobal(ExecCtx &ctx, HashAggGlobalSinkState &global,
 		AggregateHashTableCombineRowBatchFlat(aht, tdc, global.layout, local_tdc,
 			base, batch, hashes.data());
 	}
+}
+
+static void
+FlushLocalPartitionToGlobal(ExecCtx &ctx,
+                            HashAggGlobalSinkState &global,
+                            HashAggLocalSinkState &local,
+                            uint32_t part_idx,
+                            uint64_t budget_bytes)
+{
+	HashAggPartition &local_part = local.local_partitions[part_idx];
+	TupleDataCollection *tdc = ResolveTdc(ctx.dsa, local_part.tdc_dp);
+	AggregateHashTable *aht = ResolveAht(ctx.dsa, local_part.aht_dp);
+	if (tdc == nullptr || aht == nullptr)
+		return;
+	const uint32_t prev_rows = pg_atomic_read_u32(&tdc->row_count);
+	if (prev_rows == 0)
+		return;
+
+	HashAggPartition &global_part =
+		global.partitions[part_idx & global.payload->partition_mask];
+	LWLockAcquire(&global_part.mutex, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		CombineTdcIntoGlobal(ctx, global, global_part, tdc);
+	}
+	PG_CATCH();
+	{
+		LWLockRelease(&global_part.mutex);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockRelease(&global_part.mutex);
+
+	const uint64_t current_bytes =
+		TupleDataCollectionAllocSize(tdc->row_capacity, tdc->row_width, tdc->heap_capacity) +
+		AggregateHashTableAllocSize(aht->capacity);
+	if (current_bytes <= budget_bytes)
+	{
+		/* Clear previously used row slots because flat TDC aggregate states
+		 * (COUNT/SUM/AVG) assume zero-initialized backing on append. */
+		std::memset(tdc->rows, 0, static_cast<size_t>(prev_rows) * tdc->row_width);
+		pg_atomic_write_u32(&tdc->row_count, 0);
+		pg_atomic_write_u32(&tdc->heap_used, 0);
+		AggregateHashTableInit(aht, aht->capacity, local_part.tdc_dp);
+		return;
+	}
+
+	/* An oversized local partition (e.g. a single large string batch) must
+	 * release its surplus DSA instead of keeping it pinned across workers. */
+	ReleasePartitionBacking(ctx, local_part);
+	const uint32_t init_rows = local.initial_partition_rows > 0
+		? local.initial_partition_rows : 256u;
+	const uint32_t init_heap = TupleDataCollectionDefaultHeapCapacity(local.layout, init_rows);
+	local_part.tdc_dp = TupleDataCollectionAllocate(ctx.dsa, init_rows,
+		local.layout->row_width, init_heap);
+	auto *fresh_tdc = ResolveTdc(ctx.dsa, local_part.tdc_dp);
+	TupleDataCollectionInit(fresh_tdc, init_rows, local.layout->row_width,
+		global.layout_dp, init_heap);
+	AggregateHashTable *fresh_aht = nullptr;
+	AllocAhtForTdc(ctx, local_part.tdc_dp, init_rows, &local_part.aht_dp, &fresh_aht);
 }
 
 static void
