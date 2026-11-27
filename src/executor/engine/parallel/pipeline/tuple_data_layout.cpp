@@ -30,6 +30,7 @@ TupleDataLayoutColumnWidth(TdcColumnKind kind)
 	case TdcColumnKind::INT64:  return 8;
 	case TdcColumnKind::DOUBLE: return 8;
 	case TdcColumnKind::STRING_REF: return sizeof(VecStringRef);
+	case TdcColumnKind::INT128: return sizeof(NumericWideInt);
 	}
 	elog(ERROR, "pg_yaap: TupleDataLayoutColumnWidth: unknown TdcColumnKind %u",
 		 static_cast<unsigned>(kind));
@@ -45,8 +46,8 @@ TupleDataLayoutAggregateWidth(TdcAggKind kind)
 		case TdcAggKind::COUNT_STAR:   return 8;
 		case TdcAggKind::COUNT_NONNULL:return 8;
 		case TdcAggKind::COUNT_DISTINCT_NONNULL:return 8;
-		case TdcAggKind::SUM_NUMERIC:  return 8;
-		case TdcAggKind::AVG_NUMERIC:  return 16;
+		case TdcAggKind::SUM_NUMERIC:  return 16;
+		case TdcAggKind::AVG_NUMERIC:  return 24;
 		case TdcAggKind::MIN_INT64:    return 8;
 		case TdcAggKind::MIN_NUMERIC:  return 8;
 		case TdcAggKind::MAX_INT64:    return 8;

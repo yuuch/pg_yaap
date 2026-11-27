@@ -85,6 +85,31 @@ ReadInt64At(const uint8_t *row_ptr, uint16_t offset)
 	return value;
 }
 
+static inline void
+AddWide128At(uint8_t *row_ptr, uint16_t offset, NumericWideInt add)
+{
+	NumericWideInt acc;
+	std::memcpy(&acc, row_ptr + offset, sizeof(acc));
+	acc += add;
+	std::memcpy(row_ptr + offset, &acc, sizeof(acc));
+}
+
+static inline NumericWideInt
+ReadWide128At(const uint8_t *row_ptr, uint16_t offset)
+{
+	NumericWideInt value;
+	std::memcpy(&value, row_ptr + offset, sizeof(value));
+	return value;
+}
+
+static inline uint64_t
+HashWideIntValue(NumericWideInt value)
+{
+	if (WideIntFitsInt64(value))
+		return static_cast<uint64_t>(static_cast<int64_t>(WideIntLow64(value)));
+	return Mix64(WideIntLow64(value) ^ Mix64(static_cast<uint64_t>(WideIntHigh64(value))));
+}
+
 static inline bool
 LayoutHasStringColumns(const TupleDataLayout *layout)
 {
@@ -163,10 +188,28 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 		switch (agg.kind)
 		{
 			case TdcAggKind::SUM_INT64:
-			case TdcAggKind::SUM_NUMERIC:
 				Assert(agg.src_col_idx < 16);
 				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
 				break;
+			case TdcAggKind::SUM_NUMERIC:
+			{
+				Assert(agg.src_col_idx < 16);
+				if (chunk.has_wide128(agg.src_col_idx))
+				{
+					AddWide128At(delta.row_ptr, agg.offset, chunk.get_wide128(agg.src_col_idx, row_idx));
+					break;
+				}
+				const int64_t val = chunk.get_int64(agg.src_col_idx, row_idx);
+				int64_t next = 0;
+				if (__builtin_add_overflow(delta.values[a], val, &next))
+				{
+					AddWide128At(delta.row_ptr, agg.offset, WideIntFromInt64(delta.values[a]));
+					delta.values[a] = val;
+				}
+				else
+					delta.values[a] = next;
+				break;
+			}
 			case TdcAggKind::COUNT_STAR:
 				delta.values[a] += 1;
 				break;
@@ -177,10 +220,26 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 					delta.values[a] += 1;
 				break;
 			case TdcAggKind::AVG_NUMERIC:
+			{
 				Assert(agg.src_col_idx < 16);
-				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
+				if (chunk.has_wide128(agg.src_col_idx))
+				{
+					AddWide128At(delta.row_ptr, agg.offset, chunk.get_wide128(agg.src_col_idx, row_idx));
+					delta.counts[a] += 1;
+					break;
+				}
+				const int64_t val = chunk.get_int64(agg.src_col_idx, row_idx);
+				int64_t next = 0;
+				if (__builtin_add_overflow(delta.values[a], val, &next))
+				{
+					AddWide128At(delta.row_ptr, agg.offset, WideIntFromInt64(delta.values[a]));
+					delta.values[a] = val;
+				}
+				else
+					delta.values[a] = next;
 				delta.counts[a] += 1;
 				break;
+			}
 			case TdcAggKind::MIN_INT64:
 			case TdcAggKind::MIN_NUMERIC:
 			{
@@ -214,15 +273,17 @@ ApplyAggDelta(const TupleDataLayout *layout, const AggDelta &delta)
 		switch (agg.kind)
 		{
 			case TdcAggKind::SUM_INT64:
-			case TdcAggKind::SUM_NUMERIC:
 			case TdcAggKind::COUNT_STAR:
 			case TdcAggKind::COUNT_NONNULL:
 			case TdcAggKind::COUNT_DISTINCT_NONNULL:
 				AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
 				break;
+			case TdcAggKind::SUM_NUMERIC:
+				AddWide128At(delta.row_ptr, agg.offset, WideIntFromInt64(delta.values[a]));
+				break;
 			case TdcAggKind::AVG_NUMERIC:
-				AddInt64At(delta.row_ptr, agg.offset, delta.values[a]);
-				AddInt64At(delta.row_ptr, agg.offset + 8, delta.counts[a]);
+				AddWide128At(delta.row_ptr, agg.offset, WideIntFromInt64(delta.values[a]));
+				AddInt64At(delta.row_ptr, agg.offset + 16, delta.counts[a]);
 				break;
 			case TdcAggKind::MIN_INT64:
 			case TdcAggKind::MIN_NUMERIC:
@@ -363,7 +424,16 @@ ScatterGroupColumns(const TupleDataLayout *layout,
 			}
 			case TdcColumnKind::INT64:
 			{
-				int64_t v = chunk.get_int64(col.src_col_idx, row_idx);
+				int64_t v = unlikely(chunk.has_wide128(col.src_col_idx))
+					? WideIntToInt64Checked(chunk.get_wide128(col.src_col_idx, row_idx),
+						"int64 row store scatter")
+					: chunk.get_int64(col.src_col_idx, row_idx);
+				std::memcpy(row_ptr + col.offset, &v, sizeof(v));
+				break;
+			}
+			case TdcColumnKind::INT128:
+			{
+				NumericWideInt v = chunk.get_wide128(col.src_col_idx, row_idx);
 				std::memcpy(row_ptr + col.offset, &v, sizeof(v));
 				break;
 			}
@@ -447,12 +517,22 @@ Scatter(const TupleDataLayout *layout,
 	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[a];
-		int64_t v = chunk.get_int64(agg_chunk_base + a, row_idx);
-		std::memcpy(row_ptr + agg.offset, &v, sizeof(v));
-		if (agg.kind == TdcAggKind::AVG_NUMERIC)
+		if (agg.kind == TdcAggKind::SUM_NUMERIC)
 		{
+			NumericWideInt v = chunk.get_wide128(agg_chunk_base + a, row_idx);
+			std::memcpy(row_ptr + agg.offset, &v, sizeof(v));
+		}
+		else if (agg.kind == TdcAggKind::AVG_NUMERIC)
+		{
+			NumericWideInt v = chunk.get_wide128(agg_chunk_base + a, row_idx);
+			std::memcpy(row_ptr + agg.offset, &v, sizeof(v));
 			const int64_t one = 1;
-			std::memcpy(row_ptr + agg.offset + 8, &one, sizeof(one));
+			std::memcpy(row_ptr + agg.offset + 16, &one, sizeof(one));
+		}
+		else
+		{
+			int64_t v = chunk.get_int64(agg_chunk_base + a, row_idx);
+			std::memcpy(row_ptr + agg.offset, &v, sizeof(v));
 		}
 	}
 }
@@ -489,6 +569,13 @@ Gather(const TupleDataLayout *layout,
 				chunk.int64_columns[col.src_col_idx][row_idx] = v;
 				break;
 			}
+			case TdcColumnKind::INT128:
+			{
+				NumericWideInt v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				chunk.set_wide128(col.src_col_idx, row_idx, v);
+				break;
+			}
 				case TdcColumnKind::DOUBLE:
 				{
 					double v;
@@ -514,48 +601,35 @@ Gather(const TupleDataLayout *layout,
 					TupleDataLayoutColumnIsNull(layout, row_ptr, i) ? 1 : 0;
 	}
 
-	/* Aggregate state columns: chunk col N+a = aggregate a (always int64). */
+	/* Aggregate state columns: chunk col N+a = aggregate a. */
 	const uint16_t agg_chunk_base = layout->column_count;
 	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[a];
-		int64_t v;
-		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
-
-		/* AVG_NUMERIC stores {sum:int64, count:int64} as a 16B pair; the
-		 * downstream chunk only has one slot per aggregate, and Scatter only
-		 * round-trips the first 8B. Finalize the average here so the count
-		 * half is consumed at the producer (HashAgg) where it is still
-		 * authoritative, instead of trying to thread a second chunk slot
-		 * through Order/Output. AVG descriptors publish an output scale with
-		 * extra fractional digits; convert the stored sum to that output scale
-		 * here before dividing. Div-by-zero becomes 0 to match SQL's "no rows
-		 * produces NULL" only at the EncodeColumn boundary - here we still
-		 * emit 0, and OutputSink turns the NULL signal off via tts_isnull
-		 * (currently hardcoded false; if we later add NULL tracking the
-		 * count==0 case is the place to flip it). */
+		if (agg.kind == TdcAggKind::SUM_NUMERIC)
+		{
+			const NumericWideInt sum = ReadWide128At(row_ptr, agg.offset);
+			chunk.set_wide128(agg_chunk_base + a, row_idx, sum);
+			continue;
+		}
 		if (agg.kind == TdcAggKind::AVG_NUMERIC)
 		{
-			int64_t count;
-			std::memcpy(&count, row_ptr + agg.offset + 8, sizeof(count));
+			const NumericWideInt sum = ReadWide128At(row_ptr, agg.offset);
+			const int64_t count = ReadInt64At(row_ptr, agg.offset + 16);
 			if (count != 0)
 			{
 				NumericWideInt widened =
-					(WideIntFromInt64(v) * WideIntFromInt64(kAvgNumericScaleFactor)) /
+					(sum * WideIntFromInt64(kAvgNumericScaleFactor)) /
 					WideIntFromInt64(count);
-				if (!WideIntFitsInt64(widened))
-					elog(ERROR,
-						 "pg_yaap: finalized AVG numeric exceeds int64 range agg=%u sum=%lld count=%lld scale=%d",
-						 static_cast<unsigned>(a),
-						 static_cast<long long>(v),
-						 static_cast<long long>(count),
-						 static_cast<int>(agg.numeric_scale));
-				v = WideIntToInt64Checked(widened, "pg_yaap: finalized AVG numeric");
+				chunk.set_wide128(agg_chunk_base + a, row_idx, widened);
 			}
 			else
-				v = 0;
+				chunk.set_wide128(agg_chunk_base + a, row_idx, WideIntFromInt64(0));
+			continue;
 		}
 
+		int64_t v;
+		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
 		chunk.int64_columns[agg_chunk_base + a][row_idx] = v;
 	}
 }
@@ -578,6 +652,8 @@ HashGroup(const TupleDataLayout *layout,
 				return HashSingleGroupInt32Value(chunk.get_int32(col.src_col_idx, row_idx));
 			case TdcColumnKind::INT64:
 				return HashSingleGroupInt64Value(chunk.get_int64(col.src_col_idx, row_idx));
+			case TdcColumnKind::INT128:
+				return HashSingleGroupInt64Value(static_cast<int64_t>(HashWideIntValue(chunk.get_wide128(col.src_col_idx, row_idx))));
 			default:
 				break;
 		}
@@ -601,6 +677,11 @@ HashGroup(const TupleDataLayout *layout,
 			case TdcColumnKind::INT64:
 			{
 				value = static_cast<uint64_t>(chunk.get_int64(col.src_col_idx, row_idx));
+				break;
+			}
+			case TdcColumnKind::INT128:
+			{
+				value = HashWideIntValue(chunk.get_wide128(col.src_col_idx, row_idx));
 				break;
 			}
 			case TdcColumnKind::DOUBLE:
@@ -668,6 +749,11 @@ HashGroupRow(const TupleDataLayout *layout,
 				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
 				return HashSingleGroupInt64Value(v);
 			}
+			case TdcColumnKind::INT128:
+			{
+				NumericWideInt v = ReadWide128At(row_ptr, col.offset);
+				return HashSingleGroupInt64Value(static_cast<int64_t>(HashWideIntValue(v)));
+			}
 			default:
 				break;
 		}
@@ -694,6 +780,11 @@ HashGroupRow(const TupleDataLayout *layout,
 				int64_t v;
 				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
 				value = static_cast<uint64_t>(v);
+				break;
+			}
+			case TdcColumnKind::INT128:
+			{
+				value = HashWideIntValue(ReadWide128At(row_ptr, col.offset));
 				break;
 			}
 				case TdcColumnKind::DOUBLE:
@@ -751,6 +842,13 @@ MatchGroup(const TupleDataLayout *layout,
 					return false;
 				break;
 			}
+			case TdcColumnKind::INT128:
+			{
+				const NumericWideInt row_v = ReadWide128At(row_ptr, col.offset);
+				if (row_v != chunk.get_wide128(col.src_col_idx, row_idx))
+					return false;
+				break;
+			}
 				case TdcColumnKind::DOUBLE:
 				{
 					uint64_t row_v;
@@ -799,6 +897,17 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 	{
 		const TdcColumnDesc &row_col = row_layout->columns[0];
 		const TdcColumnDesc &chunk_col = chunk_layout->columns[0];
+		if ((row_col.kind == TdcColumnKind::INT128 || chunk_col.kind == TdcColumnKind::INT128) &&
+			(row_col.kind == TdcColumnKind::INT128 || row_col.kind == TdcColumnKind::INT64) &&
+			(chunk_col.kind == TdcColumnKind::INT128 || chunk_col.kind == TdcColumnKind::INT64))
+		{
+			Assert(chunk_col.src_col_idx < 16);
+			const NumericWideInt row_v = row_col.kind == TdcColumnKind::INT128
+				? ReadWide128At(row_ptr, row_col.offset)
+				: WideIntFromInt64(ReadInt64At(row_ptr, row_col.offset));
+			const NumericWideInt chunk_v = chunk.get_wide128(chunk_col.src_col_idx, row_idx);
+			return row_v == chunk_v;
+		}
 		if (row_col.kind != chunk_col.kind || row_col.width != chunk_col.width)
 			return false;
 		Assert(chunk_col.src_col_idx < 16);
@@ -816,6 +925,9 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
 				return row_v == chunk.get_int64(chunk_col.src_col_idx, row_idx);
 			}
+			case TdcColumnKind::INT128:
+				return ReadWide128At(row_ptr, row_col.offset) ==
+					chunk.get_wide128(chunk_col.src_col_idx, row_idx);
 			case TdcColumnKind::DOUBLE:
 			{
 				uint64_t row_v;
@@ -852,6 +964,18 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 	{
 		const TdcColumnDesc &row_col = row_layout->columns[i];
 		const TdcColumnDesc &chunk_col = chunk_layout->columns[i];
+		if ((row_col.kind == TdcColumnKind::INT128 || chunk_col.kind == TdcColumnKind::INT128) &&
+			(row_col.kind == TdcColumnKind::INT128 || row_col.kind == TdcColumnKind::INT64) &&
+			(chunk_col.kind == TdcColumnKind::INT128 || chunk_col.kind == TdcColumnKind::INT64))
+		{
+			Assert(chunk_col.src_col_idx < 16);
+			const NumericWideInt row_v = row_col.kind == TdcColumnKind::INT128
+				? ReadWide128At(row_ptr, row_col.offset)
+				: WideIntFromInt64(ReadInt64At(row_ptr, row_col.offset));
+			if (row_v != chunk.get_wide128(chunk_col.src_col_idx, row_idx))
+				return false;
+			continue;
+		}
 		if (row_col.kind != chunk_col.kind || row_col.width != chunk_col.width)
 			return false;
 		Assert(chunk_col.src_col_idx < 16);
@@ -871,6 +995,12 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 				int64_t row_v;
 				std::memcpy(&row_v, row_ptr + row_col.offset, sizeof(row_v));
 				if (row_v != chunk.get_int64(chunk_col.src_col_idx, row_idx))
+					return false;
+				break;
+			}
+			case TdcColumnKind::INT128:
+			{
+				if (ReadWide128At(row_ptr, row_col.offset) != chunk.get_wide128(chunk_col.src_col_idx, row_idx))
 					return false;
 				break;
 			}
@@ -1093,11 +1223,16 @@ UpdateAggregates(const TupleDataLayout *layout,
 		switch (agg.kind)
 		{
 		case TdcAggKind::SUM_INT64:
-		case TdcAggKind::SUM_NUMERIC:
 			Assert(agg.src_col_idx < 16);
 			AddInt64At(row_ptr,
 			           agg.offset,
 			           chunk.get_int64(agg.src_col_idx, row_idx));
+			break;
+		case TdcAggKind::SUM_NUMERIC:
+			Assert(agg.src_col_idx < 16);
+			AddWide128At(row_ptr,
+			             agg.offset,
+			             chunk.get_wide128(agg.src_col_idx, row_idx));
 			break;
 			case TdcAggKind::COUNT_STAR:
 				AddInt64At(row_ptr, agg.offset, 1);
@@ -1110,10 +1245,10 @@ UpdateAggregates(const TupleDataLayout *layout,
 				break;
 		case TdcAggKind::AVG_NUMERIC:
 			Assert(agg.src_col_idx < 16);
-			AddInt64At(row_ptr,
-			           agg.offset,
-			           chunk.get_int64(agg.src_col_idx, row_idx));
-			AddInt64At(row_ptr, agg.offset + 8, 1);
+			AddWide128At(row_ptr,
+			             agg.offset,
+			             chunk.get_wide128(agg.src_col_idx, row_idx));
+			AddInt64At(row_ptr, agg.offset + 16, 1);
 			break;
 		case TdcAggKind::MIN_INT64:
 		case TdcAggKind::MIN_NUMERIC:
@@ -1181,13 +1316,31 @@ UpdateAggregatesGather(const TupleDataLayout *layout,
 			switch (agg.kind)
 			{
 				case TdcAggKind::SUM_INT64:
-				case TdcAggKind::SUM_NUMERIC:
 				{
 					const int64_t *src = chunk.int64_columns[agg.src_col_idx];
 					for (uint16_t i = 0; i < count; ++i)
 						AddInt64At(tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
 						           agg_off,
 						           src[row_indices[i]]);
+					return;
+				}
+				case TdcAggKind::SUM_NUMERIC:
+				{
+					if (chunk.has_wide128(agg.src_col_idx))
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							AddWide128At(tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+							             agg_off,
+							             chunk.get_wide128(agg.src_col_idx, row_indices[i]));
+					}
+					else
+					{
+						const int64_t *src = chunk.int64_columns[agg.src_col_idx];
+						for (uint16_t i = 0; i < count; ++i)
+							AddWide128At(tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+							             agg_off,
+							             WideIntFromInt64(src[row_indices[i]]));
+					}
 					return;
 				}
 				case TdcAggKind::COUNT_STAR:
@@ -1283,7 +1436,6 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
 		switch (agg.kind)
 		{
 			case TdcAggKind::SUM_INT64:
-			case TdcAggKind::SUM_NUMERIC:
 			{
 				const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
 				int64_t acc[64]{};
@@ -1299,6 +1451,41 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
 				}
 				for (uint32_t g = 0; g < distinct_count; ++g)
 					AddInt64At(tdc_base + static_cast<size_t>(g) * row_width, agg_off, acc[g]);
+				break;
+			}
+			case TdcAggKind::SUM_NUMERIC:
+			{
+				NumericWideInt acc[64]{};
+				if (chunk.has_wide128(agg.src_col_idx))
+				{
+					const NumericWideInt *const wsrc = chunk.wide128_slot_data(agg.src_col_idx);
+					if (row_indices == nullptr)
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += wsrc[i];
+					}
+					else
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += wsrc[row_indices[i]];
+					}
+				}
+				else
+				{
+					const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
+					if (row_indices == nullptr)
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += WideIntFromInt64(src[i]);
+					}
+					else
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += WideIntFromInt64(src[row_indices[i]]);
+					}
+				}
+				for (uint32_t g = 0; g < distinct_count; ++g)
+					AddWide128At(tdc_base + static_cast<size_t>(g) * row_width, agg_off, acc[g]);
 				break;
 			}
 			case TdcAggKind::COUNT_STAR:
@@ -1334,17 +1521,34 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
 			}
 			case TdcAggKind::AVG_NUMERIC:
 			{
-				const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
-				int64_t acc[64]{};
-				if (row_indices == nullptr)
+				NumericWideInt acc[64]{};
+				if (chunk.has_wide128(agg.src_col_idx))
 				{
-					for (uint16_t i = 0; i < count; ++i)
-						acc[canonical_row_indices[i]] += src[i];
+					const NumericWideInt *const wsrc = chunk.wide128_slot_data(agg.src_col_idx);
+					if (row_indices == nullptr)
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += wsrc[i];
+					}
+					else
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += wsrc[row_indices[i]];
+					}
 				}
 				else
 				{
-					for (uint16_t i = 0; i < count; ++i)
-						acc[canonical_row_indices[i]] += src[row_indices[i]];
+					const int64_t *const src = chunk.int64_columns[agg.src_col_idx];
+					if (row_indices == nullptr)
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += WideIntFromInt64(src[i]);
+					}
+					else
+					{
+						for (uint16_t i = 0; i < count; ++i)
+							acc[canonical_row_indices[i]] += WideIntFromInt64(src[row_indices[i]]);
+					}
 				}
 				if (!have_group_counts)
 				{
@@ -1355,8 +1559,8 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
 				for (uint32_t g = 0; g < distinct_count; ++g)
 				{
 					uint8_t *row_ptr = tdc_base + static_cast<size_t>(g) * row_width;
-					AddInt64At(row_ptr, agg_off, acc[g]);
-					AddInt64At(row_ptr, agg_off + 8, group_counts[g]);
+					AddWide128At(row_ptr, agg_off, acc[g]);
+					AddInt64At(row_ptr, agg_off + 16, group_counts[g]);
 				}
 				break;
 			}
@@ -1442,12 +1646,14 @@ CombineAggregates(const TupleDataLayout *layout,
 			case TdcAggKind::COUNT_STAR:
 			case TdcAggKind::COUNT_NONNULL:
 			case TdcAggKind::COUNT_DISTINCT_NONNULL:
-			case TdcAggKind::SUM_NUMERIC:
 				AddInt64At(dst_row, agg.offset, ReadInt64At(src_row, agg.offset));
 				break;
+			case TdcAggKind::SUM_NUMERIC:
+				AddWide128At(dst_row, agg.offset, ReadWide128At(src_row, agg.offset));
+				break;
 			case TdcAggKind::AVG_NUMERIC:
-				AddInt64At(dst_row, agg.offset, ReadInt64At(src_row, agg.offset));
-				AddInt64At(dst_row, agg.offset + 8, ReadInt64At(src_row, agg.offset + 8));
+				AddWide128At(dst_row, agg.offset, ReadWide128At(src_row, agg.offset));
+				AddInt64At(dst_row, agg.offset + 16, ReadInt64At(src_row, agg.offset + 16));
 				break;
 			case TdcAggKind::MIN_INT64:
 			case TdcAggKind::MIN_NUMERIC:

@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include "core/data_chunk.hpp"
+#include "core/dsa_allocation.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/tuple_data_collection.hpp"
 #include "parallel/pipeline/tuple_data_layout.hpp"
@@ -56,7 +57,9 @@ ResolveRowValueLocation(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		if (layout->columns[i].src_col_idx == chunk_slot &&
-			layout->columns[i].kind == expected_kind)
+			(layout->columns[i].kind == expected_kind ||
+			 (expected_kind == TdcColumnKind::INT64 &&
+			  layout->columns[i].kind == TdcColumnKind::INT128)))
 		{
 			column = &layout->columns[i];
 			return true;
@@ -192,6 +195,15 @@ EncodeColumnFromRow(const ColumnSchema &col,
 		{
 			const uint16_t offset = layout_col != nullptr ? layout_col->offset : layout_agg->offset;
 			const int16_t scale = layout_col != nullptr ? layout_col->numeric_scale : layout_agg->numeric_scale;
+			const bool is_wide = (layout_col != nullptr && layout_col->kind == TdcColumnKind::INT128) ||
+				(layout_agg != nullptr &&
+				 (layout_agg->kind == TdcAggKind::SUM_NUMERIC || layout_agg->kind == TdcAggKind::AVG_NUMERIC));
+			if (is_wide)
+			{
+				NumericWideInt value;
+				std::memcpy(&value, row_ptr + offset, sizeof(value));
+				return NumericGetDatum(WideIntToNumeric(value, scale));
+			}
 			int64_t value;
 			std::memcpy(&value, row_ptr + offset, sizeof(value));
 			return NumericGetDatum(int64_div_fast_to_numeric(value, scale));
@@ -297,6 +309,13 @@ CompareOutputKeyColumn(const TupleDataCollection *tdc,
 			std::memcpy(&vb, b, sizeof(int64_t));
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
+		case TdcColumnKind::INT128:
+		{
+			NumericWideInt va, vb;
+			std::memcpy(&va, a, sizeof(NumericWideInt));
+			std::memcpy(&vb, b, sizeof(NumericWideInt));
+			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+		}
 		case TdcColumnKind::DOUBLE:
 		{
 			double va, vb;
@@ -390,6 +409,14 @@ CompareChunkRowToStoredRow(const OutputGlobalState &global,
 				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
 				break;
 			}
+			case TdcColumnKind::INT128:
+			{
+				const NumericWideInt lhs = chunk.get_wide128(schema_col.chunk_slot, row_idx);
+				NumericWideInt rhs = 0;
+				std::memcpy(&rhs, stored_row + layout_col.offset, sizeof(rhs));
+				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+				break;
+			}
 			case TdcColumnKind::DOUBLE:
 			{
 				const double lhs = chunk.get_double(schema_col.chunk_slot, row_idx);
@@ -472,7 +499,7 @@ CopyTdcRow(const TupleDataLayout *layout,
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
-		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
+		const uint16_t width = TupleDataLayoutAggregateWidth(agg.kind);
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
 	if (layout->validity_width > 0)
@@ -933,7 +960,7 @@ OutputSink::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 		if (global.n_sort_keys != 0)
 		{
 			const uint32_t count = pg_atomic_read_u32(&global.global_tdc->row_count);
-			const dsa_pointer order_dp = dsa_allocate0(ctx.dsa,
+			const dsa_pointer order_dp = YaapDsaAllocateZero(ctx.dsa,
 				sizeof(OrderSortIndices) + static_cast<Size>(count) * sizeof(uint32_t));
 			auto *order = static_cast<OrderSortIndices *>(dsa_get_address(ctx.dsa, order_dp));
 			order->count = count;

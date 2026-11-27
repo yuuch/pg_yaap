@@ -302,6 +302,17 @@ ColumnDecodeKindToTdc(ColumnDecodeKind dk, TdcColumnKind &out)
 	return false;
 }
 
+static bool
+ColumnSchemaToTdc(const ColumnSchema &cs, TdcColumnKind &out)
+{
+	if (ColumnSchemaIsWideNumeric(cs))
+	{
+		out = TdcColumnKind::INT128;
+		return true;
+	}
+	return ColumnDecodeKindToTdc(cs.decode_kind, out);
+}
+
 dsa_pointer
 BuildSchemaDescriptorFromColumns(const std::vector<ColumnSchema> &columns, dsa_area *dsa)
 {
@@ -330,7 +341,7 @@ BuildColumnOnlyLayout(const std::vector<ColumnSchema> &columns, TupleDataLayout 
 	{
 		TdcColumnKind tdc_kind;
 		int8_t numeric_scale = 0;
-		if (!ColumnDecodeKindToTdc(cs.decode_kind, tdc_kind) || !ColumnNumericScale(cs, numeric_scale))
+		if (!ColumnSchemaToTdc(cs, tdc_kind) || !ColumnNumericScale(cs, numeric_scale))
 			return false;
 		(void) TupleDataLayoutAppendColumn(&out, tdc_kind, cs.chunk_slot, cs.type_oid, numeric_scale);
 	}
@@ -502,7 +513,7 @@ BuildHashGroupLayout(const std::vector<ColumnRef> &group_cols,
 		const ColumnSchema &cs = input_columns[src_idx];
 		TdcColumnKind tdc_kind;
 		int8_t numeric_scale = 0;
-		if (!ColumnDecodeKindToTdc(cs.decode_kind, tdc_kind) || !ColumnNumericScale(cs, numeric_scale))
+		if (!ColumnSchemaToTdc(cs, tdc_kind) || !ColumnNumericScale(cs, numeric_scale))
 			return false;
 		(void) TupleDataLayoutAppendColumn(&out, tdc_kind, cs.chunk_slot, cs.type_oid, numeric_scale);
 	}
@@ -544,6 +555,12 @@ AppendAggOutputColumn(TdcAggKind kind,
 			cs.decode_kind = ColumnDecodeKind::INT64_INT8;
 			break;
 		case TdcAggKind::SUM_NUMERIC:
+			cs.type_oid = NUMERICOID;
+			cs.typmod = MakeNumericTypmod(38, numeric_scale);
+			cs.typlen = -1;
+			cs.typbyval = false;
+			cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+			break;
 		case TdcAggKind::AVG_NUMERIC:
 			cs.type_oid = NUMERICOID;
 			cs.typmod = -1;
@@ -556,7 +573,7 @@ AppendAggOutputColumn(TdcAggKind kind,
 	}
 	out_schema_col = cs;
 	(void) TupleDataLayoutAppendColumn(&out_layout,
-		TdcColumnKind::INT64,
+		kind == TdcAggKind::SUM_NUMERIC ? TdcColumnKind::INT128 : TdcColumnKind::INT64,
 		payload_slot,
 		cs.type_oid,
 		numeric_scale);

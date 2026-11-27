@@ -48,7 +48,7 @@ Pow10Int64Local(uint8_t exp, int64_t &out)
 	return true;
 }
 
-static inline bool
+static inline bool __attribute__((unused))
 RescaleNumericForCompare(int64_t value, uint8_t from_scale, uint8_t to_scale, int64_t &out)
 {
 	if (from_scale == to_scale)
@@ -157,8 +157,8 @@ EvalFilterStepAtRow(const FilterStep &step,
 		{
 			if (!filter_chunk.nulls[step.left_idx][row_idx])
 			{
-				const int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
-				const int64_t r = static_cast<int64_t>(step.const_value);
+				const NumericWideInt l = filter_chunk.get_wide128(step.left_idx, row_idx);
+				const NumericWideInt r = WideIntFromInt64(static_cast<int64_t>(step.const_value));
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: result = l <= r; break;
@@ -193,8 +193,8 @@ EvalFilterStepAtRow(const FilterStep &step,
 		{
 			if (!filter_chunk.nulls[step.left_idx][row_idx] && !filter_chunk.nulls[step.right_idx][row_idx])
 			{
-				int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
-				int64_t r = filter_chunk.get_int64(step.right_idx, row_idx);
+				NumericWideInt l = filter_chunk.get_wide128(step.left_idx, row_idx);
+				NumericWideInt r = filter_chunk.get_wide128(step.right_idx, row_idx);
 				if (step.left_idx < inputs.size() &&
 					step.right_idx < inputs.size() &&
 					inputs[step.left_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
@@ -203,9 +203,10 @@ EvalFilterStepAtRow(const FilterStep &step,
 					const uint8_t target_scale =
 						std::max(inputs[step.left_idx].numeric_scale,
 								 inputs[step.right_idx].numeric_scale);
-					if (!RescaleNumericForCompare(l, inputs[step.left_idx].numeric_scale, target_scale, l) ||
-						!RescaleNumericForCompare(r, inputs[step.right_idx].numeric_scale, target_scale, r))
-						elog(ERROR, "pg_yaap: filter numeric compare rescale failed");
+					for (uint8_t s = inputs[step.left_idx].numeric_scale; s < target_scale; ++s)
+						l *= WideIntFromInt64(10);
+					for (uint8_t s = inputs[step.right_idx].numeric_scale; s < target_scale; ++s)
+						r *= WideIntFromInt64(10);
 				}
 				switch (step.cmp_op)
 				{
@@ -369,8 +370,8 @@ EvalSimpleFilterStepAtRow(const FilterStep &step,
 		case FilterStepOp::INT64_CMP_CONST:
 			if (!filter_chunk.nulls[step.left_idx][row_idx])
 			{
-				const int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
-				const int64_t r = static_cast<int64_t>(step.const_value);
+				const NumericWideInt l = filter_chunk.get_wide128(step.left_idx, row_idx);
+				const NumericWideInt r = WideIntFromInt64(static_cast<int64_t>(step.const_value));
 				switch (step.cmp_op)
 				{
 					case QualOp::LE: return l <= r;
@@ -401,8 +402,8 @@ EvalSimpleFilterStepAtRow(const FilterStep &step,
 		case FilterStepOp::INT64_CMP_VAR:
 			if (!filter_chunk.nulls[step.left_idx][row_idx] && !filter_chunk.nulls[step.right_idx][row_idx])
 			{
-				int64_t l = filter_chunk.get_int64(step.left_idx, row_idx);
-				int64_t r = filter_chunk.get_int64(step.right_idx, row_idx);
+				NumericWideInt l = filter_chunk.get_wide128(step.left_idx, row_idx);
+				NumericWideInt r = filter_chunk.get_wide128(step.right_idx, row_idx);
 				if (step.left_idx < inputs.size() &&
 					step.right_idx < inputs.size() &&
 					inputs[step.left_idx].decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
@@ -411,9 +412,10 @@ EvalSimpleFilterStepAtRow(const FilterStep &step,
 					const uint8_t target_scale =
 						std::max(inputs[step.left_idx].numeric_scale,
 								 inputs[step.right_idx].numeric_scale);
-					if (!RescaleNumericForCompare(l, inputs[step.left_idx].numeric_scale, target_scale, l) ||
-						!RescaleNumericForCompare(r, inputs[step.right_idx].numeric_scale, target_scale, r))
-						elog(ERROR, "pg_yaap: filter numeric compare rescale failed");
+					for (uint8_t s = inputs[step.left_idx].numeric_scale; s < target_scale; ++s)
+						l *= WideIntFromInt64(10);
+					for (uint8_t s = inputs[step.right_idx].numeric_scale; s < target_scale; ++s)
+						r *= WideIntFromInt64(10);
 				}
 				switch (step.cmp_op)
 				{
@@ -514,6 +516,8 @@ PopulateFilterChunk(const PgVector<FilterInputDesc> &inputs,
 						input.source_decode_kind == ColumnDecodeKind::INT32_CHAR ||
 						input.source_decode_kind == ColumnDecodeKind::INT32_DATE)
 						filter_chunk.int64_columns[dst_slot][row] = static_cast<int64_t>(in.get_int32(src_slot, row));
+					else if (in.has_wide128(src_slot))
+						filter_chunk.set_wide128(dst_slot, row, in.get_wide128(src_slot, row));
 					else
 						filter_chunk.int64_columns[dst_slot][row] = in.get_int64(src_slot, row);
 					break;
@@ -536,6 +540,8 @@ PopulateFilterChunk(const PgVector<FilterInputDesc> &inputs,
 						filter_chunk.int64_columns[dst_slot][row] =
 							in.get_int64(src_slot, row) * factor;
 					}
+					else if (in.has_wide128(src_slot))
+						filter_chunk.set_wide128(dst_slot, row, in.get_wide128(src_slot, row));
 					else
 						filter_chunk.int64_columns[dst_slot][row] = in.get_int64(src_slot, row);
 					break;
@@ -570,6 +576,8 @@ CompactSelectedRows(PipelineChunk &out, const uint16_t *selected_rows, uint16_t 
 			out.int32_columns[slot][write_idx] = out.int32_columns[slot][row];
 			out.string_columns[slot][write_idx] = out.string_columns[slot][row];
 			out.nulls[slot][write_idx] = out.nulls[slot][row];
+			if (NumericWideInt *w = out.wide128_slot_data(slot))
+				w[write_idx] = w[row];
 		}
 	}
 	out.count = selected_count;

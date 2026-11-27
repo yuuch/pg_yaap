@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="388" viewBox="0 0 980 388">
+
+  <defs>
+    <pattern id="dots_cyan" width="12" height="12" patternUnits="userSpaceOnUse">
+      <circle cx="3" cy="3" r="2.1" fill="#25E2FF" fill-opacity="0.45"/>
+    </pattern>
+    <pattern id="timeout_hatch" width="8" height="8" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <rect width="8" height="8" fill="#F1F5F9"/>
+      <rect width="3.5" height="8" fill="#64748B"/>
+    </pattern>
+    <pattern id="crash_hatch" width="8" height="8" patternTransform="rotate(-45)" patternUnits="userSpaceOnUse">
+      <rect width="8" height="8" fill="#FFE4E6"/>
+      <rect width="3.5" height="8" fill="#FF2E63"/>
+    </pattern>
+  </defs>
+
+  <rect width="980" height="388" fill="#FFFDF4"/>
+  <polygon points="0,0 240,0 130,96 0,96" fill="#FFD600"/>
+  <polygon points="240,0 264,0 154,96 130,96" fill="#25E2FF"/>
+  <rect x="810" y="0" width="170" height="86" fill="url(#dots_cyan)"/>
+  <polygon points="0,362 310,362 275,388 0,388" fill="#FF2E63"/>
+  <polygon points="720,364 980,364 980,388 692,388" fill="#FFD600"/>
+
+  <polygon points="42,22 950,22 968,40 968,354 950,372 42,372 24,354 24,40" fill="#111111"/>
+  <polygon points="36,16 944,16 962,34 962,348 944,366 36,366 18,348 18,34" fill="#FFFFFF"/>
+  <polygon points="36,16 944,16 962,34 962,96 18,96 18,34" fill="#25E2FF" fill-opacity="0.24"/>
+  <polygon points="740,16 944,16 962,34 962,96 740,96" fill="url(#dots_cyan)"/>
+  <line x1="18" y1="96" x2="962" y2="96" stroke="#111111" stroke-width="3"/>
+  <polygon points="36,16 944,16 962,34 962,348 944,366 36,366 18,348 18,34" fill="none" stroke="#111111" stroke-width="3.5"/>
+
+  <g transform="translate(42,30)">
+    <polygon points="8,4 132,4 124,34 0,34" fill="#111111"/>
+    <polygon points="4,0 128,0 120,30 -4,30" fill="#FFD600" stroke="#111111" stroke-width="2.5"/>
+    <text x="62.0" y="21.0" text-anchor="middle" font-family="'Arial Black', 'Impact', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="900" font-style="italic" fill="#111111">TPC-H SF10</text>
+  </g>
+  <polygon points="184,29 198,22 190,39" fill="#FF2E63" stroke="#111111" stroke-width="1.5"/>
+  <polygon points="196,39 214,35 200,47" fill="#FFD600" stroke="#111111" stroke-width="1.5"/>
+  <text x="224" y="52" font-family="'Arial Black', 'Impact', 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="900" fill="#111111">TOTAL RUNTIME (Q1–Q22, CONTROLLED)</text>
+  <text x="42" y="81" font-family="'Helvetica Neue', Arial, Helvetica, sans-serif" font-size="12.5" font-weight="600" fill="#1E293B">Apple M4 Pro (24 GB) · Identical PG 18.3 server (4GB SB, 12 workers, 30s timeout) · pg_duckdb v1.2.2 vs pg_yaap</text>
+
+  <g font-family="'Helvetica Neue', Arial, Helvetica, sans-serif" font-size="11.5" font-weight="700" fill="#111111">
+    <rect x="230" y="112" width="14" height="14" fill="#2463B8" stroke="#111111" stroke-width="1.8"/>
+    <text x="250" y="123">PostgreSQL (SQL)</text>
+    <rect x="380" y="112" width="14" height="14" fill="url(#timeout_hatch)" stroke="#111111" stroke-width="1.8"/>
+    <text x="400" y="123">Timeout penalty (3 × 30s)</text>
+    <rect x="572" y="112" width="14" height="14" fill="#FFB703" stroke="#111111" stroke-width="1.8"/>
+    <text x="592" y="123">pg_duckdb v1.2.2</text>
+    <rect x="728" y="112" width="14" height="14" fill="#FF2E63" stroke="#111111" stroke-width="1.8"/>
+    <text x="748" y="123">pg_yaap (22/22 exact)</text>
+  </g>
+
+  <rect x="34" y="138" width="912" height="170" fill="#FFFDF8" stroke="#111111" stroke-width="2.2"/>
+  <rect x="34" y="138" width="912" height="52" fill="#FAF6E6" fill-opacity="0.7"/>
+  <rect x="34" y="242" width="912" height="66" fill="#FFF5F7"/>
+
+  <line x1="230.0" y1="142" x2="230.0" y2="296" stroke="#111111" stroke-width="2"/>
+  <line x1="400.0" y1="142" x2="400.0" y2="296" stroke="#CBD5E1" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <line x1="570.0" y1="142" x2="570.0" y2="296" stroke="#CBD5E1" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <line x1="740.0" y1="142" x2="740.0" y2="296" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="230.0" y="326" text-anchor="middle" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#111111">0s</text>
+  <text x="400.0" y="326" text-anchor="middle" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#475569">50s</text>
+  <text x="570.0" y="326" text-anchor="middle" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#475569">100s</text>
+  <text x="740.0" y="326" text-anchor="middle" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#475569">150s</text>
+
+  <text x="214" y="162" text-anchor="end" font-family="'Arial Black', 'Impact', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="900" fill="#111111">PostgreSQL 18.3</text>
+  <text x="214" y="177" text-anchor="end" font-family="'Helvetica Neue', Arial, Helvetica, sans-serif" font-size="11" font-weight="600" fill="#475569">19/22 OK · 3 timeouts @ 30s</text>
+  <rect x="233" y="152" width="496.4" height="24" fill="#111111"/>
+  <rect x="230.0" y="149" width="190.4" height="24" fill="#2463B8" stroke="#111111" stroke-width="2"/>
+  <rect x="420.4" y="149" width="306.0" height="24" fill="url(#timeout_hatch)" stroke="#111111" stroke-width="2"/>
+  <text x="736.4" y="166" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#111111">56.0s + 3×30s = 146.0s+</text>
+
+  <text x="214" y="214" text-anchor="end" font-family="'Arial Black', 'Impact', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="900" fill="#111111">pg_duckdb v1.2.2</text>
+  <text x="214" y="229" text-anchor="end" font-family="'Helvetica Neue', Arial, Helvetica, sans-serif" font-size="11" font-weight="600" fill="#475569">22/22 OK · 8w scan / 8GB</text>
+  <rect x="233" y="204" width="215.1" height="24" fill="#111111"/>
+  <rect x="230.0" y="201" width="215.1" height="24" fill="#FFB703" stroke="#111111" stroke-width="2"/>
+  <text x="455.1" y="218" font-family="'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.5" font-weight="700" fill="#111111">63.3 s (63.5 s wall)</text>
+
+  <text x="214" y="266" text-anchor="end" font-family="'Arial Black', 'Impact', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="900" fill="#FF2E63">pg_yaap</text>
+  <text x="214" y="281" text-anchor="end" font-family="'Helvetica Neue', Arial, Helvetica, sans-serif" font-size="11" font-weight="700" fill="#111111">22/22 exact · 12w / 8GB</text>
+  <rect x="233" y="256" width="70.8" height="24" fill="#25E2FF"/>
+  <rect x="230.0" y="253" width="70.8" height="24" fill="#FF2E63" stroke="#111111" stroke-width="2.2"/>
+  <g transform="translate(314.757366,252)">
+    <polygon points="8,4 236,4 228,28 0,28" fill="#25E2FF"/>
+    <polygon points="4,0 232,0 224,24 -4,24" fill="#FFD600" stroke="#111111" stroke-width="2.5"/>
+    <text x="114.0" y="16.8" text-anchor="middle" font-family="'Arial Black', 'Impact', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="900" font-style="italic" fill="#111111">20.8 s SQL (21.3 s wall)</text>
+  </g>
+
+  <text x="36" y="347" font-family="'Helvetica Neue', Arial, Helvetica, sans-serif" font-size="10" font-weight="600" fill="#475569">Controlled run on identical PG 18.3 server (UTF8 tpch, 4GB shared_buffers, 12 parallel workers, 30s cap). See docs/benchmark.md.</text>
+</svg>

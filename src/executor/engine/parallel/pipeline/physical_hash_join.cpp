@@ -1116,6 +1116,7 @@ TryHashSingleJoinKeyRow(const TupleDataLayout *layout,
 			out_hash = HashSingleGroupInt64Value(v);
 			return true;
 		}
+		case TdcColumnKind::INT128:
 		case TdcColumnKind::DOUBLE:
 		case TdcColumnKind::STRING_REF:
 			return false;
@@ -1142,6 +1143,7 @@ TryHashSingleJoinKeyChunkRow(const TupleDataLayout *layout,
 		case TdcColumnKind::INT64:
 			out_hash = HashSingleGroupInt64Value(chunk.get_int64(col.src_col_idx, row_idx));
 			return true;
+		case TdcColumnKind::INT128:
 		case TdcColumnKind::DOUBLE:
 		case TdcColumnKind::STRING_REF:
 			return false;
@@ -1406,7 +1408,10 @@ FindRightColumnBySlotAndKind(const TupleDataLayout *right_layout,
 	for (uint16_t col_idx = 0; col_idx < right_layout->column_count; ++col_idx)
 	{
 		const TdcColumnDesc &col = right_layout->columns[col_idx];
-		if (col.src_col_idx == input_chunk_slot && col.kind == expected_kind)
+		if (col.src_col_idx == input_chunk_slot &&
+			(col.kind == expected_kind ||
+			 (decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+			  col.kind == TdcColumnKind::INT128)))
 			return &col;
 	}
 	return nullptr;
@@ -1465,6 +1470,13 @@ ReadPromotedFilterInt64FromBuild(const HashJoinFilterInputDesc &input,
 		}
 		case ColumnDecodeKind::INT64_INT8:
 		case ColumnDecodeKind::INT64_NUMERIC_SCALED:
+			if (right_col->kind == TdcColumnKind::INT128)
+			{
+				NumericWideInt wide_val;
+				std::memcpy(&wide_val, build_row + right_col->offset, sizeof(wide_val));
+				out_value = WideIntToInt64Checked(wide_val, "hash join filter build numeric");
+				return true;
+			}
 			std::memcpy(&out_value, build_row + right_col->offset, sizeof(out_value));
 			return true;
 		default:

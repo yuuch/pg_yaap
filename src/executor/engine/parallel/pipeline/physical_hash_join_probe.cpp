@@ -320,12 +320,26 @@ BatchPlan DescribeBatch(ExecCtx &ctx, PhysicalHashJoin &join, HashJoinSharedPayl
 	const uint64_t entries = std::max<uint64_t>(1, plan.rows);
 	if (HashJoinTracksBuildMatches(join.join_mode()))
 		plan.matched_word_count = static_cast<uint32_t>((entries + 31u) / 32u);
-	plan.directory_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32) +
-		entries * (sizeof(uint32_t) + sizeof(uint16_t) +
-			(build->build_rows_use_keys ? 1u : 2u) * sizeof(HashJoinBatchRowRef)) +
-		static_cast<uint64_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32) +
-		static_cast<uint64_t>(plan.segments) * sizeof(HashJoinBatchSegment) +
-		static_cast<uint64_t>(plan.map_count) * sizeof(uint32_t);
+	const uint64_t hash_table_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32);
+	const uint64_t hash_links_bytes = entries * sizeof(uint32_t);
+	const uint64_t hash_salts_bytes = entries * sizeof(uint16_t);
+	const uint64_t row_refs_bytes = entries * sizeof(HashJoinBatchRowRef);
+	const uint64_t matched_bytes = static_cast<uint64_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32);
+	const uint64_t segments_bytes = static_cast<uint64_t>(plan.segments) * sizeof(HashJoinBatchSegment);
+	const uint64_t map_bytes = static_cast<uint64_t>(plan.map_count) * sizeof(uint32_t);
+	if (hash_table_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		hash_links_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		hash_salts_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		row_refs_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		matched_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		segments_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		map_bytes > kYaapMaxSafeDsaSingleAllocBytes) {
+		plan.directory_bytes = UINT64_MAX;
+		return plan;
+	}
+	plan.directory_bytes = hash_table_bytes + hash_links_bytes + hash_salts_bytes +
+		(build->build_rows_use_keys ? 1u : 2u) * row_refs_bytes +
+		matched_bytes + segments_bytes + map_bytes;
 	return plan;
 }
 
@@ -535,12 +549,26 @@ BatchPlan DescribeSubPartitionBatch(ExecCtx &ctx, PhysicalHashJoin &join,
 	const uint64_t entries = std::max<uint64_t>(1, plan.rows);
 	if (HashJoinTracksBuildMatches(join.join_mode()))
 		plan.matched_word_count = static_cast<uint32_t>((entries + 31u) / 32u);
-	plan.directory_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32) +
-		entries * (sizeof(uint32_t) + sizeof(uint16_t) +
-			(build->build_rows_use_keys ? 1u : 2u) * sizeof(HashJoinBatchRowRef)) +
-		static_cast<uint64_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32) +
-		static_cast<uint64_t>(plan.segments) * sizeof(HashJoinBatchSegment) +
-		static_cast<uint64_t>(plan.map_count) * sizeof(uint32_t);
+	const uint64_t hash_table_bytes = static_cast<uint64_t>(plan.capacity) * sizeof(pg_atomic_uint32);
+	const uint64_t hash_links_bytes = entries * sizeof(uint32_t);
+	const uint64_t hash_salts_bytes = entries * sizeof(uint16_t);
+	const uint64_t row_refs_bytes = entries * sizeof(HashJoinBatchRowRef);
+	const uint64_t matched_bytes = static_cast<uint64_t>(plan.matched_word_count) * sizeof(pg_atomic_uint32);
+	const uint64_t segments_bytes = static_cast<uint64_t>(plan.segments) * sizeof(HashJoinBatchSegment);
+	const uint64_t map_bytes = static_cast<uint64_t>(plan.map_count) * sizeof(uint32_t);
+	if (hash_table_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		hash_links_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		hash_salts_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		row_refs_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		matched_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		segments_bytes > kYaapMaxSafeDsaSingleAllocBytes ||
+		map_bytes > kYaapMaxSafeDsaSingleAllocBytes) {
+		plan.directory_bytes = UINT64_MAX;
+		return plan;
+	}
+	plan.directory_bytes = hash_table_bytes + hash_links_bytes + hash_salts_bytes +
+		(build->build_rows_use_keys ? 1u : 2u) * row_refs_bytes +
+		matched_bytes + segments_bytes + map_bytes;
 	return plan;
 }
 
@@ -1279,6 +1307,7 @@ void CopyHybridInputRow(ExecCtx &ctx, PhysicalHashJoin &join, HybridProbeState &
 		switch (col.kind) {
 			case TdcColumnKind::INT32: out.int32_columns[slot][dst] = in.get_int32(slot, row); break;
 			case TdcColumnKind::INT64: out.int64_columns[slot][dst] = in.get_int64(slot, row); break;
+			case TdcColumnKind::INT128: out.set_wide128(slot, dst, in.get_wide128(slot, row)); break;
 			case TdcColumnKind::DOUBLE: out.double_columns[slot][dst] = in.get_double(slot, row); break;
 			case TdcColumnKind::STRING_REF:
 				if (in.nulls[slot][row]) out.string_columns[slot][dst] = out.store_string_bytes("", 0);

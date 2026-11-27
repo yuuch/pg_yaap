@@ -60,7 +60,10 @@ FindRightColumnBySlotAndKind(const TupleDataLayout *right_layout,
 	for (uint16_t col_idx = 0; col_idx < right_layout->column_count; ++col_idx)
 	{
 		const TdcColumnDesc &col = right_layout->columns[col_idx];
-		if (col.src_col_idx == input_chunk_slot && col.kind == expected_kind)
+		if (col.src_col_idx == input_chunk_slot &&
+			(col.kind == expected_kind ||
+			 (decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED &&
+			  col.kind == TdcColumnKind::INT128)))
 			return &col;
 	}
 	return nullptr;
@@ -123,8 +126,12 @@ CopyResolvedJoinRow(const PipelineChunk *left_chunk,
 				{
 					if (left_chunk != nullptr)
 					{
-						out.int64_columns[desc.output_chunk_slot][out_row_idx] =
-							left_chunk->get_int64(desc.input_chunk_slot, left_row_idx);
+						if (left_chunk->has_wide128(desc.input_chunk_slot))
+							out.set_wide128(desc.output_chunk_slot, out_row_idx,
+								left_chunk->get_wide128(desc.input_chunk_slot, left_row_idx));
+						else
+							out.int64_columns[desc.output_chunk_slot][out_row_idx] =
+								left_chunk->get_int64(desc.input_chunk_slot, left_row_idx);
 						out.nulls[desc.output_chunk_slot][out_row_idx] =
 							left_chunk->nulls[desc.input_chunk_slot][left_row_idx];
 					}
@@ -138,6 +145,13 @@ CopyResolvedJoinRow(const PipelineChunk *left_chunk,
 				{
 					out.int64_columns[desc.output_chunk_slot][out_row_idx] = 0;
 					out.nulls[desc.output_chunk_slot][out_row_idx] = 1;
+				}
+				else if (desc.right_col->kind == TdcColumnKind::INT128)
+				{
+					NumericWideInt value;
+					std::memcpy(&value, right_row + desc.right_col->offset, sizeof(value));
+					out.set_wide128(desc.output_chunk_slot, out_row_idx, value);
+					out.nulls[desc.output_chunk_slot][out_row_idx] = 0;
 				}
 				else
 				{

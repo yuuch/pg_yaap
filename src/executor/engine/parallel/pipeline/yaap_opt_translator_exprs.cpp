@@ -1193,6 +1193,12 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 				cs.decode_kind = ColumnDecodeKind::INT64_INT8;
 				break;
 			case TdcAggKind::SUM_NUMERIC:
+				cs.type_oid = NUMERICOID;
+				cs.typmod = MakeNumericTypmod(38, agg_state.agg_numeric_scales[i]);
+				cs.typlen = -1;
+				cs.typbyval = false;
+				cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
+				break;
 			case TdcAggKind::AVG_NUMERIC:
 			case TdcAggKind::MIN_NUMERIC:
 			case TdcAggKind::MAX_NUMERIC:

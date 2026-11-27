@@ -166,7 +166,7 @@ CopyTdcRow(const TupleDataLayout *layout,
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[agg_idx];
-		const uint16_t width = agg.kind == TdcAggKind::AVG_NUMERIC ? 16 : 8;
+		const uint16_t width = TupleDataLayoutAggregateWidth(agg.kind);
 		std::memcpy(dst_row + agg.offset, src_row + agg.offset, width);
 	}
 }
@@ -1337,6 +1337,13 @@ GatherDenseAggregateOutput(const TupleDataLayout *layout,
 				chunk.int64_columns[i][row_idx] = v;
 				break;
 			}
+			case TdcColumnKind::INT128:
+			{
+				NumericWideInt v;
+				std::memcpy(&v, row_ptr + col.offset, sizeof(v));
+				chunk.set_wide128(i, row_idx, v);
+				break;
+			}
 			case TdcColumnKind::DOUBLE:
 			{
 				double v;
@@ -1362,28 +1369,32 @@ GatherDenseAggregateOutput(const TupleDataLayout *layout,
 	for (uint16_t a = 0; a < layout->aggregate_count; ++a)
 	{
 		const TdcAggregateDesc &agg = layout->aggregates[a];
-		int64_t v;
-		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
+		if (agg.kind == TdcAggKind::SUM_NUMERIC)
+		{
+			NumericWideInt sum;
+			std::memcpy(&sum, row_ptr + agg.offset, sizeof(sum));
+			chunk.set_wide128(layout->column_count + a, row_idx, sum);
+			continue;
+		}
 		if (agg.kind == TdcAggKind::AVG_NUMERIC)
 		{
+			NumericWideInt sum;
 			int64_t count;
-			std::memcpy(&count, row_ptr + agg.offset + 8, sizeof(count));
+			std::memcpy(&sum, row_ptr + agg.offset, sizeof(sum));
+			std::memcpy(&count, row_ptr + agg.offset + 16, sizeof(count));
 			if (count != 0)
 			{
 				NumericWideInt widened =
-					(WideIntFromInt64(v) * WideIntFromInt64(kDenseAggAvgScaleFactor)) /
+					(sum * WideIntFromInt64(kDenseAggAvgScaleFactor)) /
 					WideIntFromInt64(count);
-				if (!WideIntFitsInt64(widened))
-						ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-							errmsg("pg_yaap: dense hashagg finalized AVG numeric exceeds int64 range (agg=%u source=%u group-cols=%u row-width=%u sum=%lld count=%lld scale=%d)",
-								(unsigned) a, (unsigned) agg.src_col_idx,
-								(unsigned) layout->column_count, layout->row_width,
-								(long long) v, (long long) count, (int) agg.numeric_scale)));
-				v = WideIntToInt64Checked(widened, "pg_yaap: dense hashagg finalized AVG numeric");
+				chunk.set_wide128(layout->column_count + a, row_idx, widened);
 			}
 			else
-				v = 0;
+				chunk.set_wide128(layout->column_count + a, row_idx, WideIntFromInt64(0));
+			continue;
 		}
+		int64_t v;
+		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
 		chunk.int64_columns[layout->column_count + a][row_idx] = v;
 	}
 }

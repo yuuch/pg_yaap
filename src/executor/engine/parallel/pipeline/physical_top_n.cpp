@@ -14,6 +14,7 @@ extern int pg_yaap_parallel_max_workers;
 #include <algorithm>
 #include <cstring>
 
+#include "core/dsa_allocation.hpp"
 #include "parallel/pipeline/cancel.hpp"
 #include "parallel/pipeline/pipeline_descriptor.hpp"
 #include "parallel/pipeline/tuple_data_ops.hpp"
@@ -76,6 +77,15 @@ CompareStoredRows(const TupleDataLayout *layout,
 			{
 				int64_t lhs = 0;
 				int64_t rhs = 0;
+				std::memcpy(&lhs, lhs_row + col.offset, sizeof(lhs));
+				std::memcpy(&rhs, rhs_row + col.offset, sizeof(rhs));
+				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+				break;
+			}
+			case TdcColumnKind::INT128:
+			{
+				NumericWideInt lhs = 0;
+				NumericWideInt rhs = 0;
 				std::memcpy(&lhs, lhs_row + col.offset, sizeof(lhs));
 				std::memcpy(&rhs, rhs_row + col.offset, sizeof(rhs));
 				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
@@ -156,6 +166,14 @@ CompareChunkRowToStoredRow(const SchemaDescriptor *input_schema,
 			{
 				const int64_t lhs = chunk.int64_columns[schema_col.chunk_slot][row_idx];
 				int64_t rhs = 0;
+				std::memcpy(&rhs, stored_row + col.offset, sizeof(rhs));
+				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
+				break;
+			}
+			case TdcColumnKind::INT128:
+			{
+				const NumericWideInt lhs = chunk.get_wide128(schema_col.chunk_slot, row_idx);
+				NumericWideInt rhs = 0;
 				std::memcpy(&rhs, stored_row + col.offset, sizeof(rhs));
 				cmp = (lhs < rhs) ? -1 : (lhs > rhs) ? 1 : 0;
 				break;
@@ -692,7 +710,7 @@ PhysicalTopN::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 		elog(ERROR, "pg_yaap: top-N finalize missing global TDC");
 	const uint32_t row_count = pg_atomic_read_u32(&global.global_tdc->row_count);
 	const Size indices_bytes = sizeof(OrderSortIndices) + static_cast<Size>(row_count) * sizeof(uint32_t);
-	global.sort_indices_dp = dsa_allocate0(ctx.dsa, indices_bytes);
+	global.sort_indices_dp = YaapDsaAllocateZero(ctx.dsa, indices_bytes);
 	auto *indices_obj = static_cast<OrderSortIndices *>(dsa_get_address(ctx.dsa, global.sort_indices_dp));
 	indices_obj->count = row_count;
 	for (uint32_t i = 0; i < row_count; ++i)

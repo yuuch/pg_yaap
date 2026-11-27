@@ -61,6 +61,7 @@ enum class TdcColumnKind : uint8_t {
 	INT64  = 1,
 	DOUBLE = 2,
 	STRING_REF = 3,
+	INT128 = 4,
 };
 
 /*

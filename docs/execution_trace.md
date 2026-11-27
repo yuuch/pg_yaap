@@ -131,3 +131,18 @@ Files are created exclusively (`O_CREAT | O_EXCL`, mode `0600`) with unique name
 - **Query cancellation / SQL error**: Leader shuts down workers, collects whatever events were published before the abort, exports a trace marked `"complete": false`, and re-throws the original PostgreSQL error untouched.
 - **Abrupt worker termination (`SIGKILL` / `pg_terminate_backend`)**: Because workers publish events with a write barrier before advancing `event_count`, all events recorded prior to termination remain intact. The leader detects the non-`FINALIZED` buffer state, increments `abnormal_processes`, and marks `"complete": false`.
 - **Trace export failure**: Caught internally and downgraded to a `WARNING`; never fails a completed SQL query or masks a query error.
+
+---
+
+## Case Study: TPC-H SF10 Q18
+
+Raw trace file: [`docs/tpch_sf10_q18_trace.json`](tpch_sf10_q18_trace.json) (rendered visually in [`imgs/execution_trace_q18.svg`](../imgs/execution_trace_q18.svg)).
+
+- **Summary metadata**: `execution_id = 83111912144897`, `leader_pid = 19351`, `worker_count = 12`, `query_duration_ns = 1287132000` (`1287.13 ms`), `total_events = 1755`, `dropped_events = 0`, `abnormal_processes = 0`, `complete = true`.
+- **Leader coordination**: `Leader (pid 19351)` waits for all 12 background workers to register and attach (`Leader Wait Workers Ready` across `5.37–21.91 ms`), blocks in `Leader Wait Event DAG` (`21.94–1268.64 ms`), and executes `Output Emit` (`1286.95–1287.00 ms`).
+- **Stage & dependency timeline**:
+  - `Pipeline 5` (`SEQ_SCAN -> HASH_AGGREGATE`): 12 `RUN` tasks (`23.6–781.1 ms`), 64 partitioned `COMBINE` tasks (`781.1–1036.8 ms`), and 1 `FINALIZE` task (`1036.9–1038.3 ms`).
+  - `Pipeline 4` (`HASH_AGGREGATE -> MATERIALIZE`): 12 `RUN` tasks (`1038.3–1052.6 ms`) followed by `FINALIZE` (`1052.7 ms`).
+  - Concurrent join branches (`1052.7–1244.3 ms`): `Pipeline 3` (`MATERIALIZE -> HASH_JOIN`, `RUN` across `1052.7–1057.2 ms`, `FINALIZE` at `1243.2 ms`) overlaps with `Pipeline 7` (`MATERIALIZE -> HASH_JOIN`, `1053.0–1055.6 ms`) and `Pipeline 6` (`SEQ_SCAN -> HASH_JOIN`, `1055.9–1244.3 ms`).
+  - `Pipeline 2` (`SEQ_SCAN -> HASH_AGGREGATE`): 12 `RUN` tasks (`1245.1–1266.0 ms`), 32 `COMBINE` tasks (`1266.0–1267.7 ms`), and `FINALIZE` (`1267.7 ms`).
+  - `Pipeline 1` (`HASH_AGGREGATE -> TOP_N`, `1267.7–1268.5 ms`) and `Pipeline 0` (`TOP_N -> OUTPUT`, `1268.6 ms`) complete the query.
