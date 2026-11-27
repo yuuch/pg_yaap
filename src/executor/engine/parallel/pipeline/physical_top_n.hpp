@@ -23,7 +23,8 @@ struct TopNSharedPayload
 	dsa_pointer tdc_dp;
 	dsa_pointer sort_indices_dp;
 	bool        finalized;
-	uint8_t     _pad[7];
+	uint8_t     _pad[3];
+	uint32_t    offset_rows;
 };
 
 class TopNGlobalState final : public GlobalSinkState, public GlobalSourceState {
@@ -54,6 +55,7 @@ public:
 class TopNLocalSourceState final : public LocalSourceState {
 public:
 	uint32_t source_cursor = 0;
+	bool     initialized = false;
 };
 
 class PhysicalTopN final : public PhysicalOperator {

@@ -205,7 +205,7 @@ pg_yaap_jit_deform_supported(TupleDesc desc,
 				*failure_reason = "deform targets must be sorted by attribute number";
 			return false;
 		}
-		if (target.att_index >= kMaxDeformTargets || target.dst_col >= kMaxDeformTargets) {
+		if (target.att_index < 0 || target.att_index >= desc->natts || target.dst_col >= kMaxDeformTargets) {
 			if (failure_reason != nullptr)
 				*failure_reason = "deform target exceeds fixed column limit";
 			return false;
@@ -929,6 +929,17 @@ compile_deform_to_datachunk(LLVMJitContext *context,
 			LLVMBuildStore(b, LLVMConstInt(type_i8, 0, false), v_row_null);
 
 			switch (target.decode_kind) {
+				case DeformDecodeKind::kInt16:
+				{
+					LLVMValueRef v_val16 = LLVMBuildLoad2(b, type_i16,
+						LLVMBuildBitCast(b, v_attdatap, l_ptr(type_i16), ""), "val_i16");
+					LLVMValueRef v_val = LLVMBuildSExt(b, v_val16, type_i32, "val_i16_sext");
+					LLVMValueRef v_dest = LLVMBuildGEP2(b, type_i32,
+						LLVMBuildBitCast(b, v_data_array, l_ptr(type_i32), ""),
+						&v_row_idx, 1, "dest_i16");
+					LLVMBuildStore(b, v_val, v_dest);
+					break;
+				}
 				case DeformDecodeKind::kInt32:
 				case DeformDecodeKind::kDate32:
 				{

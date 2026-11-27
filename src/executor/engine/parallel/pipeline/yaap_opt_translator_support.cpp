@@ -146,8 +146,6 @@ AnalyzeFilterNode(const PhysicalFilter &filter, SupportContext &ctx)
 OptimizerPlanSupportStatus
 AnalyzeLimitNode(const PhysicalLimit &limit, SupportContext &ctx)
 {
-	if (limit.limit_offset != nullptr)
-		return MakeSupportError(ctx, "LIMIT with OFFSET is not supported");
 	if (limit.limit_count == nullptr)
 		return MakeSupportError(ctx, "LIMIT count is missing");
 	return AnalyzeChildren(limit, ctx, 1);

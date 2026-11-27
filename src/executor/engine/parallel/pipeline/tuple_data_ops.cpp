@@ -22,7 +22,9 @@
 
 extern "C" {
 #include "postgres.h"
+#include "catalog/pg_collation_d.h"
 #include "utils/elog.h"
+#include "utils/varlena.h"
 }
 
 #include <cstring>
@@ -161,12 +163,71 @@ NeonLaneMaskEqU64(uint64x2_t cmp)
 }
 #endif
 
+static constexpr uint16_t kAggDeltaMaxAggs = 32;
+
 struct AggDelta
 {
 	uint8_t *row_ptr = nullptr;
-	int64_t values[TUPLE_DATA_MAX_COLUMNS];
-	int64_t counts[TUPLE_DATA_MAX_COLUMNS];
+	int64_t values[kAggDeltaMaxAggs];
+	int64_t counts[kAggDeltaMaxAggs];
 };
+
+static inline int
+CompareStringAggBytes(const char *a, uint32_t alen, const char *b, uint32_t blen)
+{
+	const char *sa = a != nullptr ? a : "";
+	const char *sb = b != nullptr ? b : "";
+	return varstr_cmp(const_cast<char *>(sa), static_cast<int>(alen),
+					  const_cast<char *>(sb), static_cast<int>(blen),
+					  DEFAULT_COLLATION_OID);
+}
+
+static inline bool
+IsUninitializedStringAgg(const VecStringRef &ref)
+{
+	return ref.len == 0 && ref.offset == kTdcMinMaxStringEmptyOffset;
+}
+
+static inline void
+UpdateStringMinMaxAgg(TupleDataCollection *tdc,
+                      uint8_t *row_ptr,
+                      uint16_t agg_offset,
+                      const char *cand_ptr,
+                      uint32_t cand_len,
+                      bool is_max)
+{
+	VecStringRef cur{};
+	std::memcpy(&cur, row_ptr + agg_offset, sizeof(cur));
+	bool take = IsUninitializedStringAgg(cur);
+	if (!take)
+	{
+		const char *cur_ptr = VecStringRefDataPtr(
+			cur,
+			tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+		if (cur.len != 0 && cur_ptr == nullptr)
+			elog(ERROR, "pg_yaap: MIN/MAX STRING_REF update missing heap backing");
+		const int cmp = CompareStringAggBytes(cand_ptr, cand_len, cur_ptr, cur.len);
+		take = is_max ? (cmp > 0) : (cmp < 0);
+	}
+	if (!take)
+		return;
+	VecStringRef stored{};
+	if (cand_len == 0)
+	{
+		stored = VecStringRef{0, 0, 0};
+	}
+	else if (cand_len <= 8)
+	{
+		stored = VecStringRef{cand_len, kVecStringInlineOffset, 0};
+		std::memcpy(&stored.prefix, cand_ptr, cand_len);
+	}
+	else
+	{
+		if (tdc == nullptr || !TupleDataCollectionStoreStringBytes(tdc, cand_ptr, cand_len, &stored))
+			elog(ERROR, "pg_yaap: MIN/MAX STRING_REF update ran out of TDC heap (len=%u)", cand_len);
+	}
+	std::memcpy(row_ptr + agg_offset, &stored, sizeof(stored));
+}
 
 static inline void
 InitAggDelta(AggDelta &delta, uint8_t *row_ptr, uint16_t aggregate_count)
@@ -188,12 +249,12 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 		switch (agg.kind)
 		{
 			case TdcAggKind::SUM_INT64:
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				delta.values[a] += chunk.get_int64(agg.src_col_idx, row_idx);
 				break;
 			case TdcAggKind::SUM_NUMERIC:
 			{
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				if (chunk.has_wide128(agg.src_col_idx))
 				{
 					AddWide128At(delta.row_ptr, agg.offset, chunk.get_wide128(agg.src_col_idx, row_idx));
@@ -215,13 +276,13 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 				break;
 			case TdcAggKind::COUNT_NONNULL:
 			case TdcAggKind::COUNT_DISTINCT_NONNULL:
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				if (chunk.nulls[agg.src_col_idx][row_idx] == 0)
 					delta.values[a] += 1;
 				break;
 			case TdcAggKind::AVG_NUMERIC:
 			{
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				if (chunk.has_wide128(agg.src_col_idx))
 				{
 					AddWide128At(delta.row_ptr, agg.offset, chunk.get_wide128(agg.src_col_idx, row_idx));
@@ -243,7 +304,7 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 			case TdcAggKind::MIN_INT64:
 			case TdcAggKind::MIN_NUMERIC:
 			{
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
 				if (delta.counts[a] == 0 || value < delta.values[a])
 					delta.values[a] = value;
@@ -253,13 +314,16 @@ AccumulateAggDelta(const TupleDataLayout *layout,
 			case TdcAggKind::MAX_INT64:
 			case TdcAggKind::MAX_NUMERIC:
 			{
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
 				if (delta.counts[a] == 0 || value > delta.values[a])
 					delta.values[a] = value;
 				delta.counts[a] = 1;
 				break;
 			}
+			case TdcAggKind::MIN_STRING:
+			case TdcAggKind::MAX_STRING:
+				break;
 		}
 	}
 }
@@ -302,6 +366,9 @@ ApplyAggDelta(const TupleDataLayout *layout, const AggDelta &delta)
 					if (current == INT64_MIN || delta.values[a] > current)
 						std::memcpy(delta.row_ptr + agg.offset, &delta.values[a], sizeof(int64_t));
 				}
+				break;
+			case TdcAggKind::MIN_STRING:
+			case TdcAggKind::MAX_STRING:
 				break;
 		}
 	}
@@ -412,7 +479,7 @@ ScatterGroupColumns(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		Assert(col.src_col_idx < 16);
+		Assert(col.src_col_idx < kDataChunkMaxSlots);
 
 			switch (col.kind)
 			{
@@ -498,6 +565,11 @@ ScatterGroupOnly(const TupleDataLayout *layout,
 			const int64_t init_max = INT64_MIN;
 			std::memcpy(row_ptr + agg.offset, &init_max, sizeof(int64_t));
 		}
+		else if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+		{
+			const VecStringRef init_str{0, kTdcMinMaxStringEmptyOffset, 0};
+			std::memcpy(row_ptr + agg.offset, &init_str, sizeof(init_str));
+		}
 	}
 }
 
@@ -529,6 +601,16 @@ Scatter(const TupleDataLayout *layout,
 			const int64_t one = 1;
 			std::memcpy(row_ptr + agg.offset + 16, &one, sizeof(one));
 		}
+		else if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+		{
+			const VecStringRef src = chunk.get_string_ref(agg_chunk_base + a, row_idx);
+			const char *ptr = chunk.get_string_ptr(agg_chunk_base + a, row_idx);
+			VecStringRef dst{};
+			if ((ptr == nullptr && src.len != 0) || tdc == nullptr ||
+				!TupleDataCollectionStoreStringBytes(tdc, ptr, src.len, &dst))
+				elog(ERROR, "pg_yaap: MIN/MAX STRING_REF scatter failed");
+			std::memcpy(row_ptr + agg.offset, &dst, sizeof(dst));
+		}
 		else
 		{
 			int64_t v = chunk.get_int64(agg_chunk_base + a, row_idx);
@@ -545,13 +627,13 @@ Gather(const TupleDataLayout *layout,
        uint16_t row_idx)
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
-	Assert(layout->aggregate_count == 0 || layout->column_count + layout->aggregate_count <= 16);
+	Assert(layout->aggregate_count == 0 || layout->column_count + layout->aggregate_count <= kDataChunkMaxSlots);
 
 	/* Group/payload columns: chunk col i = row col i. */
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		Assert(col.src_col_idx < 16);
+		Assert(col.src_col_idx < kDataChunkMaxSlots);
 
 			switch (col.kind)
 			{
@@ -627,6 +709,26 @@ Gather(const TupleDataLayout *layout,
 				chunk.set_wide128(agg_chunk_base + a, row_idx, WideIntFromInt64(0));
 			continue;
 		}
+		if (agg.kind == TdcAggKind::MIN_STRING || agg.kind == TdcAggKind::MAX_STRING)
+		{
+			VecStringRef ref{};
+			std::memcpy(&ref, row_ptr + agg.offset, sizeof(ref));
+			if (IsUninitializedStringAgg(ref))
+			{
+				chunk.string_columns[agg_chunk_base + a][row_idx] = VecStringRef{0, 0, 0};
+				chunk.nulls[agg_chunk_base + a][row_idx] = 1;
+			}
+			else
+			{
+				const char *ptr = VecStringRefDataPtr(ref,
+					tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(tdc)) : nullptr);
+				if (ptr == nullptr && ref.len != 0)
+					elog(ERROR, "pg_yaap: MIN/MAX STRING_REF gather missing backing storage");
+				chunk.string_columns[agg_chunk_base + a][row_idx] =
+					chunk.store_string_bytes(ptr, ref.len);
+			}
+			continue;
+		}
 
 		int64_t v;
 		std::memcpy(&v, row_ptr + agg.offset, sizeof(v));
@@ -645,7 +747,7 @@ HashGroup(const TupleDataLayout *layout,
 	if (layout->column_count == 1)
 	{
 		const TdcColumnDesc &col = layout->columns[0];
-		Assert(col.src_col_idx < 16);
+		Assert(col.src_col_idx < kDataChunkMaxSlots);
 		switch (col.kind)
 		{
 			case TdcColumnKind::INT32:
@@ -664,7 +766,7 @@ HashGroup(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		Assert(col.src_col_idx < 16);
+		Assert(col.src_col_idx < kDataChunkMaxSlots);
 
 		uint64_t value = 0;
 			switch (col.kind)
@@ -763,7 +865,7 @@ HashGroupRow(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		Assert(i < 16);
+		Assert(i < kDataChunkMaxSlots);
 
 		uint64_t value = 0;
 			switch (col.kind)
@@ -822,7 +924,7 @@ MatchGroup(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		Assert(col.src_col_idx < 16);
+		Assert(col.src_col_idx < kDataChunkMaxSlots);
 
 			switch (col.kind)
 			{
@@ -901,7 +1003,7 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 			(row_col.kind == TdcColumnKind::INT128 || row_col.kind == TdcColumnKind::INT64) &&
 			(chunk_col.kind == TdcColumnKind::INT128 || chunk_col.kind == TdcColumnKind::INT64))
 		{
-			Assert(chunk_col.src_col_idx < 16);
+			Assert(chunk_col.src_col_idx < kDataChunkMaxSlots);
 			const NumericWideInt row_v = row_col.kind == TdcColumnKind::INT128
 				? ReadWide128At(row_ptr, row_col.offset)
 				: WideIntFromInt64(ReadInt64At(row_ptr, row_col.offset));
@@ -910,7 +1012,7 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 		}
 		if (row_col.kind != chunk_col.kind || row_col.width != chunk_col.width)
 			return false;
-		Assert(chunk_col.src_col_idx < 16);
+		Assert(chunk_col.src_col_idx < kDataChunkMaxSlots);
 			switch (row_col.kind)
 			{
 				case TdcColumnKind::INT32:
@@ -968,7 +1070,7 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 			(row_col.kind == TdcColumnKind::INT128 || row_col.kind == TdcColumnKind::INT64) &&
 			(chunk_col.kind == TdcColumnKind::INT128 || chunk_col.kind == TdcColumnKind::INT64))
 		{
-			Assert(chunk_col.src_col_idx < 16);
+			Assert(chunk_col.src_col_idx < kDataChunkMaxSlots);
 			const NumericWideInt row_v = row_col.kind == TdcColumnKind::INT128
 				? ReadWide128At(row_ptr, row_col.offset)
 				: WideIntFromInt64(ReadInt64At(row_ptr, row_col.offset));
@@ -978,7 +1080,7 @@ MatchGroupLayouts(const TupleDataLayout *row_layout,
 		}
 		if (row_col.kind != chunk_col.kind || row_col.width != chunk_col.width)
 			return false;
-		Assert(chunk_col.src_col_idx < 16);
+		Assert(chunk_col.src_col_idx < kDataChunkMaxSlots);
 
 		switch (row_col.kind)
 		{
@@ -1174,7 +1276,7 @@ MatchGroupRow(const TupleDataLayout *layout,
 	for (uint16_t i = 0; i < layout->column_count; ++i)
 	{
 		const TdcColumnDesc &col = layout->columns[i];
-		Assert(i < 16);
+		Assert(i < kDataChunkMaxSlots);
 
 		switch (col.kind)
 		{
@@ -1211,7 +1313,8 @@ void
 UpdateAggregates(const TupleDataLayout *layout,
                  uint8_t *row_ptr,
                  const PipelineChunk &chunk,
-                 uint16_t row_idx)
+                 uint16_t row_idx,
+                 TupleDataCollection *tdc)
 {
 	Assert(layout != nullptr && row_ptr != nullptr);
 	Assert(row_idx < chunk.count);
@@ -1223,13 +1326,13 @@ UpdateAggregates(const TupleDataLayout *layout,
 		switch (agg.kind)
 		{
 		case TdcAggKind::SUM_INT64:
-			Assert(agg.src_col_idx < 16);
+			Assert(agg.src_col_idx < kDataChunkMaxSlots);
 			AddInt64At(row_ptr,
 			           agg.offset,
 			           chunk.get_int64(agg.src_col_idx, row_idx));
 			break;
 		case TdcAggKind::SUM_NUMERIC:
-			Assert(agg.src_col_idx < 16);
+			Assert(agg.src_col_idx < kDataChunkMaxSlots);
 			AddWide128At(row_ptr,
 			             agg.offset,
 			             chunk.get_wide128(agg.src_col_idx, row_idx));
@@ -1239,12 +1342,12 @@ UpdateAggregates(const TupleDataLayout *layout,
 				break;
 			case TdcAggKind::COUNT_NONNULL:
 			case TdcAggKind::COUNT_DISTINCT_NONNULL:
-				Assert(agg.src_col_idx < 16);
+				Assert(agg.src_col_idx < kDataChunkMaxSlots);
 				if (chunk.nulls[agg.src_col_idx][row_idx] == 0)
 					AddInt64At(row_ptr, agg.offset, 1);
 				break;
 		case TdcAggKind::AVG_NUMERIC:
-			Assert(agg.src_col_idx < 16);
+			Assert(agg.src_col_idx < kDataChunkMaxSlots);
 			AddWide128At(row_ptr,
 			             agg.offset,
 			             chunk.get_wide128(agg.src_col_idx, row_idx));
@@ -1253,7 +1356,7 @@ UpdateAggregates(const TupleDataLayout *layout,
 		case TdcAggKind::MIN_INT64:
 		case TdcAggKind::MIN_NUMERIC:
 		{
-			Assert(agg.src_col_idx < 16);
+			Assert(agg.src_col_idx < kDataChunkMaxSlots);
 			const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
 			const int64_t current = ReadInt64At(row_ptr, agg.offset);
 			if (current == INT64_MAX || value < current)
@@ -1263,11 +1366,23 @@ UpdateAggregates(const TupleDataLayout *layout,
 		case TdcAggKind::MAX_INT64:
 		case TdcAggKind::MAX_NUMERIC:
 		{
-			Assert(agg.src_col_idx < 16);
+			Assert(agg.src_col_idx < kDataChunkMaxSlots);
 			const int64_t value = chunk.get_int64(agg.src_col_idx, row_idx);
 			const int64_t current = ReadInt64At(row_ptr, agg.offset);
 			if (current == INT64_MIN || value > current)
 				std::memcpy(row_ptr + agg.offset, &value, sizeof(int64_t));
+			break;
+		}
+		case TdcAggKind::MIN_STRING:
+		case TdcAggKind::MAX_STRING:
+		{
+			Assert(agg.src_col_idx < kDataChunkMaxSlots);
+			if (chunk.nulls[agg.src_col_idx][row_idx] != 0)
+				break;
+			const VecStringRef cand_ref = chunk.get_string_ref(agg.src_col_idx, row_idx);
+			const char *cand_ptr = chunk.get_string_ptr(agg.src_col_idx, row_idx);
+			UpdateStringMinMaxAgg(tdc, row_ptr, agg.offset, cand_ptr, cand_ref.len,
+				agg.kind == TdcAggKind::MAX_STRING);
 			break;
 		}
 	}
@@ -1279,12 +1394,19 @@ UpdateAggregatesBatch(const TupleDataLayout *layout,
                       uint8_t **row_ptrs,
                       const PipelineChunk &chunk,
                       const uint16_t *row_indices,
-                      uint16_t count)
+                      uint16_t count,
+                      TupleDataCollection *tdc)
 {
 	Assert(layout != nullptr && row_ptrs != nullptr);
 	Assert(row_indices != nullptr);
 	Assert(count <= chunk.count);
 
+	if (TdcLayoutHasStringAgg(layout) || layout->aggregate_count > kAggDeltaMaxAggs)
+	{
+		for (uint16_t i = 0; i < count; ++i)
+			UpdateAggregates(layout, row_ptrs[i], chunk, row_indices[i], tdc);
+		return;
+	}
 	UpdateAggregatesBatchGroupedGeneric(layout, row_ptrs, chunk, row_indices, count);
 }
 
@@ -1295,7 +1417,8 @@ UpdateAggregatesGather(const TupleDataLayout *layout,
                        const uint32_t *canonical_row_indices,
                        const PipelineChunk &chunk,
                        const uint16_t *row_indices,
-                       uint16_t count)
+                       uint16_t count,
+                       TupleDataCollection *tdc)
 {
 	Assert(layout != nullptr && tdc_base != nullptr);
 	Assert(canonical_row_indices != nullptr && row_indices != nullptr);
@@ -1303,6 +1426,17 @@ UpdateAggregatesGather(const TupleDataLayout *layout,
 	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
 	if (count == 0 || layout->aggregate_count == 0)
 		return;
+
+	if (TdcLayoutHasStringAgg(layout) || layout->aggregate_count > kAggDeltaMaxAggs)
+	{
+		for (uint16_t i = 0; i < count; ++i)
+			UpdateAggregates(layout,
+			                 tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+			                 chunk,
+			                 row_indices[i],
+			                 tdc);
+		return;
+	}
 
 	/* Partitioned HashAggregate calls UpdateAggregatesGather once per partition
 	 * per chunk (typically 32-64 rows). Avoid zeroing the 8 KB delta hash table
@@ -1393,13 +1527,25 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
                                  const PipelineChunk &chunk,
                                  const uint16_t *row_indices,
                                  uint16_t count,
-                                 uint32_t distinct_count)
+                                 uint32_t distinct_count,
+                                 TupleDataCollection *tdc)
 {
 	Assert(layout != nullptr && tdc_base != nullptr && canonical_row_indices != nullptr);
 	Assert(row_width == layout->row_width);
 	Assert(count <= PIPELINE_DEFAULT_CHUNK_SIZE);
 	if (count == 0 || layout->aggregate_count == 0)
 		return;
+	if (TdcLayoutHasStringAgg(layout) || layout->aggregate_count > kAggDeltaMaxAggs)
+	{
+		for (uint16_t i = 0; i < count; ++i)
+		{
+			const uint16_t r = row_indices != nullptr ? row_indices[i] : i;
+			UpdateAggregates(layout,
+			                 tdc_base + static_cast<size_t>(canonical_row_indices[i]) * row_width,
+			                 chunk, r, tdc);
+		}
+		return;
+	}
 	if (distinct_count == 0 || distinct_count > 64 || chunk.has_any_dictionary())
 	{
 		if (row_indices != nullptr)
@@ -1626,6 +1772,9 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
 					std::memcpy(tdc_base + static_cast<size_t>(g) * row_width + agg_off, &cur[g], sizeof(int64_t));
 				break;
 			}
+			case TdcAggKind::MIN_STRING:
+			case TdcAggKind::MAX_STRING:
+				break;
 		}
 	}
 }
@@ -1633,7 +1782,9 @@ UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
 void
 CombineAggregates(const TupleDataLayout *layout,
                   uint8_t *dst_row,
-                  const uint8_t *src_row)
+                  const uint8_t *src_row,
+                  TupleDataCollection *dst_tdc,
+                  const TupleDataCollection *src_tdc)
 {
 	Assert(layout != nullptr && dst_row != nullptr && src_row != nullptr);
 
@@ -1671,6 +1822,22 @@ CombineAggregates(const TupleDataLayout *layout,
 				const int64_t dst = ReadInt64At(dst_row, agg.offset);
 				if (dst == INT64_MIN || src > dst)
 					std::memcpy(dst_row + agg.offset, &src, sizeof(int64_t));
+				break;
+			}
+			case TdcAggKind::MIN_STRING:
+			case TdcAggKind::MAX_STRING:
+			{
+				VecStringRef src_ref{};
+				std::memcpy(&src_ref, src_row + agg.offset, sizeof(src_ref));
+				if (IsUninitializedStringAgg(src_ref))
+					break;
+				const char *src_ptr = VecStringRefDataPtr(
+					src_ref,
+					src_tdc != nullptr ? reinterpret_cast<const char *>(TupleDataCollectionHeapConst(src_tdc)) : nullptr);
+				if (src_ref.len != 0 && src_ptr == nullptr)
+					elog(ERROR, "pg_yaap: MIN/MAX STRING_REF combine missing source heap backing");
+				UpdateStringMinMaxAgg(dst_tdc, dst_row, agg.offset, src_ptr, src_ref.len,
+					agg.kind == TdcAggKind::MAX_STRING);
 				break;
 			}
 		}

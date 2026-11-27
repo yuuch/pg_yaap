@@ -183,8 +183,12 @@ struct AggBuildState {
 std::vector<AggFuncDesc> agg_funcs;
 std::vector<TdcAggKind> agg_kinds;
 std::vector<int16_t> agg_numeric_scales;
+std::vector<Oid> agg_out_type_oids;
+std::vector<uint8_t> agg_input_is_string;
+std::vector<ColumnSchema> group_schemas;
 std::vector<ProjectStep> project_steps;
 std::vector<ProjectExprDesc> project_exprs;
+std::vector<char> project_string_consts;
 std::vector<MaterializedOptExpr> materialized_exprs;
 TupleDataLayout hash_layout{};
 uint32_t perfect_hash_capacity = 0;
@@ -197,6 +201,7 @@ std::vector<ColumnSchema> schema;
 std::vector<yaap::PhysicalOperator::OutputColumn> outputs;
 std::vector<SortKeyDesc> final_sort_keys;
 uint64_t limit_count = 0;
+uint64_t limit_offset = 0;
 uint32_t estimated_groups = 0;
 };
 
@@ -707,6 +712,16 @@ LowerProjectionStringPrefixSlice(const BoundFunctionExpression *func,
 								 uint8_t &out_slot);
 
 bool
+LowerProjectionStringExpr(const Expression *expr,
+						  std::vector<ProjectStep> &steps,
+						  std::vector<char> &string_consts,
+						  uint8_t &next_int64_slot,
+						  uint8_t &next_string_slot,
+						  const std::vector<ColumnRef> &cols,
+						  const std::vector<ColumnSchema> &schema,
+						  uint8_t &out_slot);
+
+bool
 LowerOptimizerBoolExpr(const Expression *expr,
 					   std::vector<ProjectStep> &steps,
 					   uint8_t &next_int64_slot,
@@ -779,7 +794,9 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 						   uint8_t &next_int64_slot,
 						   AggFuncDesc &out_desc,
 						   TdcAggKind &out_kind,
-						   int16_t &out_numeric_scale);
+						   int16_t &out_numeric_scale,
+						   Oid &out_type_oid,
+						   bool &out_input_is_string);
 
 bool
 BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,

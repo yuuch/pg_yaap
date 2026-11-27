@@ -197,13 +197,15 @@ bool MatchGroupRow(const TupleDataLayout *layout,
 void UpdateAggregates(const TupleDataLayout *layout,
                       uint8_t *row_ptr,
                       const PipelineChunk &chunk,
-                      uint16_t row_idx);
+                      uint16_t row_idx,
+                      TupleDataCollection *tdc = nullptr);
 
 void UpdateAggregatesBatch(const TupleDataLayout *layout,
                            uint8_t **row_ptrs,
                            const PipelineChunk &chunk,
                            const uint16_t *row_indices,
-                           uint16_t count);
+                           uint16_t count,
+                           TupleDataCollection *tdc = nullptr);
 
 void UpdateAggregatesGather(const TupleDataLayout *layout,
                             uint8_t *tdc_base,
@@ -211,7 +213,8 @@ void UpdateAggregatesGather(const TupleDataLayout *layout,
                             const uint32_t *canonical_row_indices,
                             const PipelineChunk &chunk,
                             const uint16_t *row_indices,
-                            uint16_t count);
+                            uint16_t count,
+                            TupleDataCollection *tdc = nullptr);
 
 /**
  * Column-major small-group fast path when all canonical row indices lie in
@@ -225,7 +228,8 @@ void UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
                                       const PipelineChunk &chunk,
                                       const uint16_t *row_indices,
                                       uint16_t count,
-                                      uint32_t distinct_count);
+                                      uint32_t distinct_count,
+                                      TupleDataCollection *tdc = nullptr);
 
 /*
  * CombineAggregates:
@@ -244,7 +248,9 @@ void UpdateAggregatesGatherDenseSmall(const TupleDataLayout *layout,
  */
 void CombineAggregates(const TupleDataLayout *layout,
                        uint8_t *dst_row,
-                       const uint8_t *src_row);
+                       const uint8_t *src_row,
+                       TupleDataCollection *dst_tdc = nullptr,
+                       const TupleDataCollection *src_tdc = nullptr);
 
 }  /* namespace pipeline */
 }  /* namespace pg_yaap */

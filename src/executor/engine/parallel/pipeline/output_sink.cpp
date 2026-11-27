@@ -10,6 +10,7 @@ extern "C" {
 #include "executor/tuptable.h"
 #include "port/atomics.h"
 #include "utils/date.h"
+#include "utils/timestamp.h"
 #include "utils/dsa.h"
 #include "utils/elog.h"
 #include "utils/numeric.h"
@@ -154,6 +155,8 @@ EncodeColumnFromRow(const ColumnSchema &col,
 				return CharGetDatum(static_cast<char>(value));
 			if (col.decode_kind == ColumnDecodeKind::INT32_DATE)
 				return DateADTGetDatum(static_cast<DateADT>(value));
+			if (col.type_oid == INT2OID)
+				return Int16GetDatum(static_cast<int16_t>(value));
 			return Int32GetDatum(value);
 		}
 		case ColumnDecodeKind::INT64_INT8:
@@ -165,8 +168,14 @@ EncodeColumnFromRow(const ColumnSchema &col,
                 return NumericGetDatum(int64_div_fast_to_numeric(value, 0));
 			if (col.type_oid == BOOLOID)
 				return BoolGetDatum(value != 0);
+			if (col.type_oid == INT2OID)
+				return Int16GetDatum(static_cast<int16_t>(value));
 			if (col.type_oid == INT4OID)
 				return Int32GetDatum(static_cast<int32_t>(value));
+			if (col.type_oid == DATEOID)
+				return DateADTGetDatum(static_cast<DateADT>(value));
+			if (col.type_oid == TIMESTAMPOID)
+				return TimestampGetDatum(static_cast<Timestamp>(value));
 			return Int64GetDatum(value);
 		}
 		case ColumnDecodeKind::DOUBLE_FLOAT8:
@@ -1025,12 +1034,15 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 	dest_->rStartup(dest_, operation_, tupdesc_);
 	if (shared_payload->segment_backed)
 	{
+        uint64 seen = 0;
         uint64 emitted = 0;
         bool receiver_done = false;
         MemoryContext row_context = AllocSetContextCreate(ctx.mcxt,
             "YAAP output row", ALLOCSET_SMALL_SIZES);
 		auto emit_row = [&](const TupleDataCollection *store, const uint8_t *row) {
             if (receiver_done || (max_emit_rows_ > 0 && emitted >= max_emit_rows_)) return;
+            if (seen < skip_emit_rows_) { ++seen; return; }
+            ++seen;
             MemoryContext old = MemoryContextSwitchTo(row_context);
             ExecClearTuple(slot);
             for (uint16_t c = 0; c < natts; ++c) {
@@ -1085,16 +1097,19 @@ OutputSink::EmitGlobalTdcToDest(ExecCtx &ctx)
 		: nullptr;
 	if (order != nullptr && order->count != row_count)
 		elog(ERROR, "pg_yaap: output sort index does not match row count");
+	const uint32_t start_idx =
+		(skip_emit_rows_ < row_count) ? static_cast<uint32_t>(skip_emit_rows_) : row_count;
+	const uint32_t remaining_rows = row_count - start_idx;
 	const uint32_t emit_count =
-		(max_emit_rows_ > 0 && max_emit_rows_ < row_count)
+		(max_emit_rows_ > 0 && max_emit_rows_ < remaining_rows)
 			? static_cast<uint32_t>(max_emit_rows_)
-			: row_count;
+			: remaining_rows;
 	MemoryContext row_context = AllocSetContextCreate(ctx.mcxt,
 		"YAAP flat output row", ALLOCSET_SMALL_SIZES);
 	for (uint32_t i = 0; i < emit_count; ++i)
 	{
 		CHECK_FOR_INTERRUPTS();
-		const uint32_t row_idx = order != nullptr ? order->indices[i] : i;
+		const uint32_t row_idx = order != nullptr ? order->indices[start_idx + i] : (start_idx + i);
 		const uint8_t *row_ptr = TupleDataCollectionGetRowConst(tdc, row_idx);
 
 		MemoryContext old = MemoryContextSwitchTo(row_context);

@@ -47,7 +47,7 @@ AppendScaleProjectStep(uint8_t input_slot,
 	}
 	int64_t factor = 0;
 	const int delta = static_cast<int>(target_scale) - static_cast<int>(input_scale);
-	if (!Pow10Int64(std::abs(delta), factor) || next_int64_slot >= 16)
+	if (!Pow10Int64(std::abs(delta), factor) || next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	out_slot = next_int64_slot++;
 	steps.push_back(ProjectStep{
@@ -67,7 +67,7 @@ LowerProjectionNumericCompare(const BoundFunctionExpression *func,
 							  const std::vector<ColumnSchema> &schema,
 							  uint8_t &out_slot)
 {
-	if (func == nullptr || func->children.size() != 2 || next_int64_slot >= 16)
+	if (func == nullptr || func->children.size() != 2 || next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	ProjectOp op = ProjectOp::COPY_VAR;
 	if (func->function_name == "<") op = ProjectOp::INT64_LT_VAR_CONST;
@@ -116,7 +116,7 @@ LowerProjectionNumericCompare(const BoundFunctionExpression *func,
 	uint8_t input_slot = col->chunk_slot;
 	if (col->decode_kind == ColumnDecodeKind::INT32_INT4)
 	{
-		if (next_int64_slot >= 16)
+		if (next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		input_slot = next_int64_slot++;
 		steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, col->chunk_slot, 0, input_slot, 0});
@@ -159,7 +159,7 @@ LowerProjectionConstant(const BoundConstantExpression *constant,
 						int8_t &out_scale,
 						uint8_t &out_slot)
 {
-	if (constant == nullptr || constant->is_null || next_int64_slot >= 16)
+	if (constant == nullptr || constant->is_null || next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	int64_t value = 0;
 	int8_t scale = 0;
@@ -212,7 +212,7 @@ LowerProjectionStringCompare(const BoundFunctionExpression *func,
 		return false;
 	uint8_t const_len = 0;
 	int64_t const_value = 0;
-	if (!TryExtractShortStringConst(rhs, const_len, const_value) || next_int64_slot >= 16)
+	if (!TryExtractShortStringConst(rhs, const_len, const_value) || next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	uint8_t encoded_len = const_len;
 	if (col->type_oid == BPCHAROID)
@@ -247,7 +247,7 @@ LowerProjectionStringLike(const BoundFunctionExpression *func,
 		return false;
 	bool prefix = false;
 	std::string match;
-	if (!TryExtractLikePattern(rhs, prefix, match) || !prefix || match.size() > 8 || next_int64_slot >= 16)
+	if (!TryExtractLikePattern(rhs, prefix, match) || !prefix || match.size() > 8 || next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	int64_t packed = 0;
 	if (!match.empty())
@@ -270,7 +270,7 @@ LowerProjectionStringPrefixSlice(const BoundFunctionExpression *func,
 								 const std::vector<ColumnSchema> &schema,
 								 uint8_t &out_slot)
 {
-	if (func == nullptr || func->function_name != "prefix_slice" || func->children.size() != 2 || next_string_slot >= 16)
+	if (func == nullptr || func->function_name != "prefix_slice" || func->children.size() != 2 || next_string_slot >= kDataChunkMaxSlots)
 		return false;
 	const auto *lhs = UnwrapPrefixBaseColumn(func->children[0].get());
 	const auto *len = dynamic_cast<const BoundConstantExpression *>(func->children[1].get());
@@ -348,7 +348,7 @@ LowerOptimizerBoolExpr(const Expression *expr,
 		return false;
 	if (conj->bool_expr_type == NOT_EXPR)
 	{
-		if (conj->children.size() != 1 || next_int64_slot >= 16)
+		if (conj->children.size() != 1 || next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		uint8_t child_slot = 0;
 		if (!LowerOptimizerBoolExpr(conj->children[0].get(), steps, next_int64_slot, cols, schema, child_slot))
@@ -362,7 +362,7 @@ LowerOptimizerBoolExpr(const Expression *expr,
 		return false;
 	for (size_t i = 1; i < conj->children.size(); ++i)
 	{
-		if (next_int64_slot >= 16)
+		if (next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		uint8_t right_slot = 0;
 		if (!LowerOptimizerBoolExpr(conj->children[i].get(), steps, next_int64_slot, cols, schema, right_slot))
@@ -381,6 +381,144 @@ LowerOptimizerBoolExpr(const Expression *expr,
 }
 
 bool
+LowerProjectionStringExpr(const Expression *expr,
+						  std::vector<ProjectStep> &steps,
+						  std::vector<char> &string_consts,
+						  uint8_t &next_int64_slot,
+						  uint8_t &next_string_slot,
+						  const std::vector<ColumnRef> &cols,
+						  const std::vector<ColumnSchema> &schema,
+						  uint8_t &out_slot)
+{
+	if (expr == nullptr)
+		return false;
+	const Expression *unwrapped = UnwrapTransparentCastExpr(expr);
+	if (unwrapped == nullptr || unwrapped->type != ExpressionType::BOUND_FUNCTION)
+		return false;
+	const auto *func = static_cast<const BoundFunctionExpression *>(unwrapped);
+	if (func->function_name == "prefix_slice")
+		return LowerProjectionStringPrefixSlice(func, steps, next_string_slot, cols, schema, out_slot);
+
+	if (pg_strcasecmp(func->function_name.c_str(), "regexp_replace") == 0)
+	{
+		if (func->children.size() != 3 || next_string_slot >= kDataChunkMaxSlots)
+			return false;
+		const auto *src_col_expr = UnwrapTransparentCastColumn(func->children[0].get());
+		const auto *pat_const = dynamic_cast<const BoundConstantExpression *>(UnwrapTransparentCastExpr(func->children[1].get()));
+		const auto *repl_const = dynamic_cast<const BoundConstantExpression *>(UnwrapTransparentCastExpr(func->children[2].get()));
+		if (src_col_expr == nullptr || pat_const == nullptr || repl_const == nullptr ||
+			pat_const->is_null || repl_const->is_null)
+			return false;
+		ColumnRef ref{};
+		const ColumnSchema *src_col = nullptr;
+		if (!LookupBindingColumn(src_col_expr->binding, cols, schema, ref, src_col) ||
+			src_col == nullptr || src_col->decode_kind != ColumnDecodeKind::STRING_REF)
+			return false;
+		const size_t pat_off = string_consts.size();
+		const size_t pat_len = pat_const->value.size();
+		string_consts.insert(string_consts.end(), pat_const->value.begin(), pat_const->value.end());
+		const size_t repl_off = string_consts.size();
+		const size_t repl_len = repl_const->value.size();
+		string_consts.insert(string_consts.end(), repl_const->value.begin(), repl_const->value.end());
+		if (pat_off > 0xFFFFu || pat_len > 0xFFFFu || repl_off > 0xFFFFu || repl_len > 0xFFFFu)
+			return false;
+		const uint64_t packed =
+			(static_cast<uint64_t>(pat_off) & 0xFFFFu) |
+			((static_cast<uint64_t>(pat_len) & 0xFFFFu) << 16) |
+			((static_cast<uint64_t>(repl_off) & 0xFFFFu) << 32) |
+			((static_cast<uint64_t>(repl_len) & 0xFFFFu) << 48);
+		out_slot = next_string_slot++;
+		steps.push_back(ProjectStep{
+			ProjectOp::STRING_REGEXP_REPLACE,
+			src_col->chunk_slot,
+			0,
+			out_slot,
+			static_cast<int64_t>(packed)});
+		return true;
+	}
+
+	if (func->function_name == "case" && func->children.size() == 2)
+	{
+		const auto *when_func = dynamic_cast<const BoundFunctionExpression *>(func->children[0].get());
+		if (when_func == nullptr || when_func->function_name != "when" || when_func->children.size() != 2)
+			return false;
+		uint8_t then_slot = 0;
+		bool then_is_str = false;
+		const Expression *then_expr = UnwrapTransparentCastExpr(when_func->children[1].get());
+		if (const auto *then_col_expr = dynamic_cast<const BoundColumnRefExpression *>(then_expr))
+		{
+			ColumnRef ref{};
+			const ColumnSchema *col = nullptr;
+			if (LookupBindingColumn(then_col_expr->binding, cols, schema, ref, col) &&
+				col != nullptr && col->decode_kind == ColumnDecodeKind::STRING_REF)
+			{
+				then_slot = col->chunk_slot;
+				then_is_str = true;
+			}
+		}
+		else if (LowerProjectionStringExpr(then_expr, steps, string_consts, next_int64_slot, next_string_slot, cols, schema, then_slot))
+		{
+			then_is_str = true;
+		}
+		if (!then_is_str || next_string_slot >= kDataChunkMaxSlots)
+			return false;
+
+		uint8_t cond_slot = 0;
+		if (!LowerOptimizerBoolExpr(when_func->children[0].get(), steps, next_int64_slot, cols, schema, cond_slot))
+			return false;
+
+		const Expression *else_expr = UnwrapTransparentCastExpr(func->children[1].get());
+		if (const auto *else_const = dynamic_cast<const BoundConstantExpression *>(else_expr))
+		{
+			if (else_const->is_null)
+				return false;
+			const uint32_t else_off = static_cast<uint32_t>(string_consts.size());
+			const uint32_t else_len = static_cast<uint32_t>(else_const->value.size());
+			if (else_len > 0)
+				string_consts.insert(string_consts.end(), else_const->value.begin(), else_const->value.end());
+			const uint64_t packed = static_cast<uint64_t>(else_off) | (static_cast<uint64_t>(else_len) << 32);
+			out_slot = next_string_slot++;
+			steps.push_back(ProjectStep{
+				ProjectOp::STRING_CASE_VAR_CONST,
+				cond_slot,
+				then_slot,
+				out_slot,
+				static_cast<int64_t>(packed)});
+			return true;
+		}
+		uint8_t else_slot = 0;
+		bool else_is_str = false;
+		if (const auto *else_col_expr = dynamic_cast<const BoundColumnRefExpression *>(else_expr))
+		{
+			ColumnRef ref{};
+			const ColumnSchema *col = nullptr;
+			if (LookupBindingColumn(else_col_expr->binding, cols, schema, ref, col) &&
+				col != nullptr && col->decode_kind == ColumnDecodeKind::STRING_REF)
+			{
+				else_slot = col->chunk_slot;
+				else_is_str = true;
+			}
+		}
+		else if (LowerProjectionStringExpr(else_expr, steps, string_consts, next_int64_slot, next_string_slot, cols, schema, else_slot))
+		{
+			else_is_str = true;
+		}
+		if (!else_is_str || next_string_slot >= kDataChunkMaxSlots)
+			return false;
+		out_slot = next_string_slot++;
+		steps.push_back(ProjectStep{
+			ProjectOp::STRING_CASE_ELSE_VAR,
+			cond_slot,
+			then_slot,
+			out_slot,
+			static_cast<int64_t>(else_slot)});
+		return true;
+	}
+
+	return false;
+}
+
+bool
 LowerExtractYearExpr(const BoundFunctionExpression *func,
 					 std::vector<ProjectStep> &steps,
 					 uint8_t &next_int64_slot,
@@ -389,20 +527,78 @@ LowerExtractYearExpr(const BoundFunctionExpression *func,
 					 int8_t &out_scale,
 					 uint8_t &out_slot)
 {
-	if (func == nullptr || func->children.size() != 2 ||
-		(func->function_name != "extract" && func->function_name != "date_part"))
+	if (func == nullptr || func->children.size() != 2 || next_int64_slot >= kDataChunkMaxSlots)
 		return false;
-	const auto *field = dynamic_cast<const BoundConstantExpression *>(func->children[0].get());
-	const auto *value = dynamic_cast<const BoundColumnRefExpression *>(func->children[1].get());
-	if (field == nullptr || value == nullptr || pg_strcasecmp(field->value.c_str(), "year") != 0 || next_int64_slot >= 16)
+	if (pg_strcasecmp(func->function_name.c_str(), "date_trunc") == 0)
+	{
+		const auto *field = dynamic_cast<const BoundConstantExpression *>(UnwrapTransparentCastExpr(func->children[0].get()));
+		const auto *value = UnwrapTransparentCastColumn(func->children[1].get());
+		if (field == nullptr || value == nullptr || pg_strcasecmp(field->value.c_str(), "minute") != 0)
+			return false;
+		ColumnRef ref{};
+		const ColumnSchema *col = nullptr;
+		if (!LookupBindingColumn(value->binding, cols, schema, ref, col) ||
+			col == nullptr || col->type_oid != TIMESTAMPOID || col->decode_kind != ColumnDecodeKind::INT64_INT8)
+			return false;
+		out_slot = next_int64_slot++;
+		out_scale = 0;
+		steps.push_back(ProjectStep{ProjectOp::DATE_TRUNC_MINUTE_TIMESTAMP, col->chunk_slot, 0, out_slot, 0});
+		return true;
+	}
+	if (func->function_name != "extract" && func->function_name != "date_part")
+		return false;
+	const auto *field = dynamic_cast<const BoundConstantExpression *>(UnwrapTransparentCastExpr(func->children[0].get()));
+	const auto *value = UnwrapTransparentCastColumn(func->children[1].get());
+	if (field == nullptr || value == nullptr)
 		return false;
 	ColumnRef ref{};
 	const ColumnSchema *col = nullptr;
-	if (!LookupBindingColumn(value->binding, cols, schema, ref, col) || col == nullptr || col->decode_kind != ColumnDecodeKind::INT32_DATE)
+	if (!LookupBindingColumn(value->binding, cols, schema, ref, col) || col == nullptr)
+		return false;
+	if (pg_strcasecmp(field->value.c_str(), "year") == 0 && col->decode_kind == ColumnDecodeKind::INT32_DATE)
+	{
+		out_slot = next_int64_slot++;
+		out_scale = 0;
+		steps.push_back(ProjectStep{ProjectOp::EXTRACT_YEAR_FROM_DATE, col->chunk_slot, 0, out_slot, 0});
+		return true;
+	}
+	if (pg_strcasecmp(field->value.c_str(), "minute") == 0 &&
+		col->type_oid == TIMESTAMPOID && col->decode_kind == ColumnDecodeKind::INT64_INT8)
+	{
+		out_slot = next_int64_slot++;
+		out_scale = 0;
+		steps.push_back(ProjectStep{ProjectOp::EXTRACT_MINUTE_FROM_TIMESTAMP, col->chunk_slot, 0, out_slot, 0});
+		return true;
+	}
+	return false;
+}
+
+static bool
+LowerStringLengthExpr(const BoundFunctionExpression *func,
+					  std::vector<ProjectStep> &steps,
+					  uint8_t &next_int64_slot,
+					  const std::vector<ColumnRef> &cols,
+					  const std::vector<ColumnSchema> &schema,
+					  int8_t &out_scale,
+					  uint8_t &out_slot)
+{
+	if (func == nullptr || func->children.size() != 1 || next_int64_slot >= kDataChunkMaxSlots)
+		return false;
+	if (pg_strcasecmp(func->function_name.c_str(), "length") != 0 &&
+		pg_strcasecmp(func->function_name.c_str(), "char_length") != 0 &&
+		pg_strcasecmp(func->function_name.c_str(), "character_length") != 0)
+		return false;
+	const auto *arg = UnwrapTransparentCastColumn(func->children[0].get());
+	if (arg == nullptr)
+		return false;
+	ColumnRef ref{};
+	const ColumnSchema *col = nullptr;
+	if (!LookupBindingColumn(arg->binding, cols, schema, ref, col) ||
+		col == nullptr || col->decode_kind != ColumnDecodeKind::STRING_REF)
 		return false;
 	out_slot = next_int64_slot++;
 	out_scale = 0;
-	steps.push_back(ProjectStep{ProjectOp::EXTRACT_YEAR_FROM_DATE, col->chunk_slot, 0, out_slot, 0});
+	steps.push_back(ProjectStep{ProjectOp::STRING_LENGTH, col->chunk_slot, 0, out_slot, 0});
 	return true;
 }
 
@@ -432,7 +628,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 
 	if (is_div)
 	{
-		if (next_int64_slot >= 16)
+		if (next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		int8_t lhs_scale = 0;
 		int8_t rhs_scale = 0;
@@ -466,7 +662,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 				return false;
 			int8_t const_scale = 0;
 			int64_t const_value = 0;
-			if (!ScaleNumericConstantToInt64(const_expr, const_scale, const_value) || next_int64_slot >= 16)
+			if (!ScaleNumericConstantToInt64(const_expr, const_scale, const_value) || next_int64_slot >= kDataChunkMaxSlots)
 				return false;
 			out_slot = next_int64_slot++;
 			out_scale = static_cast<int8_t>(var_scale + const_scale);
@@ -479,7 +675,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 		uint8_t rhs_slot = 0;
 		if (!LowerOptimizerExpr(lhs, steps, next_int64_slot, cols, schema, cache, lhs_scale, lhs_slot, true) ||
 			!LowerOptimizerExpr(rhs, steps, next_int64_slot, cols, schema, cache, rhs_scale, rhs_slot, true) ||
-			next_int64_slot >= 16)
+			next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		out_slot = next_int64_slot++;
 		out_scale = static_cast<int8_t>(lhs_scale + rhs_scale);
@@ -500,7 +696,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 		if (!ScaleNumericConstantToInt64(lhs_const, lhs_scale, lhs_value))
 			return false;
 		out_scale = static_cast<int8_t>(Max(lhs_scale, rhs_scale));
-		if (!RescaleInt64Constant(lhs_value, lhs_scale, out_scale, lhs_value) || next_int64_slot >= 16)
+		if (!RescaleInt64Constant(lhs_value, lhs_scale, out_scale, lhs_value) || next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		out_slot = next_int64_slot++;
 		steps.push_back(ProjectStep{
@@ -525,7 +721,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 		uint8_t lhs_aligned = lhs_slot;
 		if (!AppendScaleProjectStep(lhs_slot, lhs_scale, out_scale, steps, next_int64_slot, lhs_aligned) ||
 			!RescaleInt64Constant(rhs_value, rhs_scale, out_scale, rhs_value) ||
-			next_int64_slot >= 16)
+			next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		out_slot = next_int64_slot++;
 		steps.push_back(ProjectStep{
@@ -548,7 +744,7 @@ LowerNumericBinaryExpr(const BoundFunctionExpression *func,
 	uint8_t rhs_aligned = rhs_slot;
 	if (!AppendScaleProjectStep(lhs_slot, lhs_scale, out_scale, steps, next_int64_slot, lhs_aligned) ||
 		!AppendScaleProjectStep(rhs_slot, rhs_scale, out_scale, steps, next_int64_slot, rhs_aligned) ||
-		next_int64_slot >= 16)
+		next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	out_slot = next_int64_slot++;
 	steps.push_back(ProjectStep{
@@ -587,7 +783,7 @@ LowerCaseExpr(const BoundFunctionExpression *func,
 	if (else_const != nullptr)
 	{
 		int64_t else_value = 0;
-		if (!ScaleConstantToTargetScale(else_const, then_scale, else_value) || next_int64_slot >= 16)
+		if (!ScaleConstantToTargetScale(else_const, then_scale, else_value) || next_int64_slot >= kDataChunkMaxSlots)
 			return false;
 		out_slot = next_int64_slot++;
 		out_scale = then_scale;
@@ -608,7 +804,7 @@ LowerCaseExpr(const BoundFunctionExpression *func,
 	uint8_t aligned_else = else_slot;
 	if (!AppendScaleProjectStep(then_slot, then_scale, out_scale, steps, next_int64_slot, aligned_then) ||
 		!AppendScaleProjectStep(else_slot, else_scale, out_scale, steps, next_int64_slot, aligned_else) ||
-		next_int64_slot >= 16)
+		next_int64_slot >= kDataChunkMaxSlots)
 		return false;
 	out_slot = next_int64_slot++;
 	steps.push_back(ProjectStep{
@@ -646,7 +842,15 @@ LowerOptimizerExpr(const Expression *expr,
 			return false;
 		if (require_int64_slot && col->decode_kind == ColumnDecodeKind::INT32_INT4)
 		{
-			if (next_int64_slot >= 16)
+			for (const ProjectStep &existing : steps)
+			{
+				if (existing.op == ProjectOp::INT32_TO_INT64_VAR && existing.in_a_chunk_slot == col->chunk_slot)
+				{
+					out_slot = existing.out_chunk_slot;
+					return true;
+				}
+			}
+			if (next_int64_slot >= kDataChunkMaxSlots)
 				return false;
 			out_slot = next_int64_slot++;
 			steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, col->chunk_slot, 0, out_slot, 0});
@@ -665,6 +869,7 @@ LowerOptimizerExpr(const Expression *expr,
 		return LowerOptimizerExpr(func->children[0].get(), steps, next_int64_slot, cols, schema, cache, out_scale, out_slot, cast_to_int64);
 	}
 	if (LowerExtractYearExpr(func, steps, next_int64_slot, cols, schema, out_scale, out_slot) ||
+		LowerStringLengthExpr(func, steps, next_int64_slot, cols, schema, out_scale, out_slot) ||
 		LowerCaseExpr(func, steps, next_int64_slot, cols, schema, cache, out_scale, out_slot) ||
 		LowerNumericBinaryExpr(func, steps, next_int64_slot, cols, schema, cache, out_scale, out_slot))
 		return true;
@@ -701,14 +906,39 @@ InferProjectionExprSchema(const Expression *expr,
 			out_scale = 0;
 			return true;
 		}
-		if (constant->value.find('.') != std::string::npos)
+		if (constant->value.empty())
 		{
-			out_type_oid = NUMERICOID;
+			out_type_oid = TEXTOID;
 			out_typmod = -1;
-			out_scale = static_cast<int8_t>(constant->value.size() - constant->value.find('.') - 1);
+			out_scale = 0;
 			return true;
 		}
-		out_type_oid = INT8OID;
+		{
+			const char *p = constant->value.c_str();
+			char *end = nullptr;
+			errno = 0;
+			(void) std::strtoll(p, &end, 10);
+			if (errno == 0 && end != p && *end == '\0')
+			{
+				out_type_oid = INT8OID;
+				out_typmod = -1;
+				out_scale = 0;
+				return true;
+			}
+		}
+		if (constant->value.find('.') != std::string::npos)
+		{
+			int8_t num_scale = 0;
+			int64_t num_val = 0;
+			if (ScaleNumericConstantToInt64(constant, num_scale, num_val))
+			{
+				out_type_oid = NUMERICOID;
+				out_typmod = -1;
+				out_scale = num_scale;
+				return true;
+			}
+		}
+		out_type_oid = TEXTOID;
 		out_typmod = -1;
 		out_scale = 0;
 		return true;
@@ -742,8 +972,17 @@ InferProjectionExprSchema(const Expression *expr,
 			!InferProjectionExprSchema(func->children.back().get(), cols, schema,
 									   else_type, else_typmod, else_scale))
 			return false;
-		const bool then_integral = then_type == BOOLOID || then_type == INT4OID || then_type == INT8OID;
-		const bool else_integral = else_type == BOOLOID || else_type == INT4OID || else_type == INT8OID;
+		const bool then_str = then_type == TEXTOID || then_type == VARCHAROID || then_type == BPCHAROID;
+		const bool else_str = else_type == TEXTOID || else_type == VARCHAROID || else_type == BPCHAROID;
+		if (then_str && (else_str || func->children.back()->type == ExpressionType::BOUND_CONSTANT))
+		{
+			out_type_oid = TEXTOID;
+			out_typmod = -1;
+			out_scale = 0;
+			return true;
+		}
+		const bool then_integral = then_type == BOOLOID || then_type == INT2OID || then_type == INT4OID || then_type == INT8OID;
+		const bool else_integral = else_type == BOOLOID || else_type == INT2OID || else_type == INT4OID || else_type == INT8OID;
 		if (then_integral && else_integral)
 		{
 			out_type_oid = INT8OID;
@@ -774,6 +1013,29 @@ InferProjectionExprSchema(const Expression *expr,
 		out_scale = 0;
 		return true;
 	}
+	if (pg_strcasecmp(func->function_name.c_str(), "date_trunc") == 0)
+	{
+		out_type_oid = TIMESTAMPOID;
+		out_typmod = -1;
+		out_scale = 0;
+		return true;
+	}
+	if (pg_strcasecmp(func->function_name.c_str(), "length") == 0 ||
+		pg_strcasecmp(func->function_name.c_str(), "char_length") == 0 ||
+		pg_strcasecmp(func->function_name.c_str(), "character_length") == 0)
+	{
+		out_type_oid = INT4OID;
+		out_typmod = -1;
+		out_scale = 0;
+		return true;
+	}
+	if (pg_strcasecmp(func->function_name.c_str(), "regexp_replace") == 0)
+	{
+		out_type_oid = TEXTOID;
+		out_typmod = -1;
+		out_scale = 0;
+		return true;
+	}
 	if (func->function_name == "+" || func->function_name == "-" ||
 		func->function_name == "*" || func->function_name == "/")
 	{
@@ -789,7 +1051,7 @@ InferProjectionExprSchema(const Expression *expr,
 			!InferProjectionExprSchema(func->children[1].get(), cols, schema, rhs_type, rhs_typmod, rhs_scale))
 			return false;
 		const Oid op_rettype = OidIsValid(func->op_oid) ? get_op_rettype(func->op_oid) : InvalidOid;
-		if (op_rettype == INT4OID || op_rettype == INT8OID)
+		if (op_rettype == INT2OID || op_rettype == INT4OID || op_rettype == INT8OID)
 		{
 			out_type_oid = op_rettype;
 			out_typmod = -1;
@@ -866,12 +1128,16 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 						   uint8_t &next_int64_slot,
 						   AggFuncDesc &out_desc,
 						   TdcAggKind &out_kind,
-						   int16_t &out_numeric_scale)
+						   int16_t &out_numeric_scale,
+						   Oid &out_type_oid,
+						   bool &out_input_is_string)
 {
 	if (agg == nullptr)
 		return false;
 	out_desc = AggFuncDesc{static_cast<Oid>(agg->agg_oid), InvalidOid, InvalidOid, 0, 0};
 	out_numeric_scale = 0;
+	out_type_oid = InvalidOid;
+	out_input_is_string = false;
 
 	if (agg->children.empty())
 	{
@@ -951,7 +1217,7 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 		}
 		if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
 		{
-			if (next_int64_slot >= 16)
+			if (next_int64_slot >= kDataChunkMaxSlots)
 				return false;
 			const uint16_t first = static_cast<uint16_t>(project_steps.size());
 			const uint8_t cast_slot = next_int64_slot++;
@@ -964,6 +1230,11 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 				 bare_col->decode_kind == ColumnDecodeKind::INT64_NUMERIC_SCALED)
 		{
 			out_desc.input_col_idx = bare_col->chunk_slot;
+		}
+		else if (bare_col->decode_kind == ColumnDecodeKind::STRING_REF)
+		{
+			out_desc.input_col_idx = bare_col->chunk_slot;
+			out_input_is_string = true;
 		}
 		else
 		{
@@ -991,13 +1262,13 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 		const bool intlike_expr =
 			InferProjectionExprSchema(arg, cols, schema, arg_type_oid, arg_typmod, arg_scale) &&
 			arg_scale == 0 &&
-			(arg_type_oid == BOOLOID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
+			(arg_type_oid == BOOLOID || arg_type_oid == INT2OID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
 		if (is_bare_ref && bare_col != nullptr &&
 			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
 		{
 			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
 			{
-				if (next_int64_slot >= 16)
+				if (next_int64_slot >= kDataChunkMaxSlots)
 					return false;
 				const uint16_t first = static_cast<uint16_t>(project_steps.size());
 				const uint8_t cast_slot = next_int64_slot++;
@@ -1021,7 +1292,22 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 		out_kind = intlike_expr ? TdcAggKind::SUM_INT64 : TdcAggKind::SUM_NUMERIC;
 	}
 	else if (pg_strcasecmp(agg->function_name.c_str(), "avg") == 0)
+	{
 		out_kind = TdcAggKind::AVG_NUMERIC;
+		if (is_bare_ref && bare_col != nullptr && bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
+		{
+			if (next_int64_slot >= kDataChunkMaxSlots)
+				return false;
+			const uint16_t first = static_cast<uint16_t>(project_steps.size());
+			const uint8_t cast_slot = next_int64_slot++;
+			project_steps.push_back(ProjectStep{ProjectOp::INT32_TO_INT64_VAR, bare_col->chunk_slot, 0, cast_slot, 0});
+			project_exprs.push_back(ProjectExprDesc{first, 1, cast_slot, 0, 0});
+			materialized_exprs.push_back(MaterializedOptExpr{arg, 0, cast_slot});
+			out_desc.input_col_idx = cast_slot;
+			out_numeric_scale = static_cast<int16_t>(kAvgNumericExtraScale);
+			return true;
+		}
+	}
 	else if (pg_strcasecmp(agg->function_name.c_str(), "min") == 0)
 	{
 		Oid arg_type_oid = InvalidOid;
@@ -1030,13 +1316,17 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 		const bool intlike_expr =
 			InferProjectionExprSchema(arg, cols, schema, arg_type_oid, arg_typmod, arg_scale) &&
 			arg_scale == 0 &&
-			(arg_type_oid == BOOLOID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
+			(arg_type_oid == BOOLOID || arg_type_oid == INT2OID || arg_type_oid == INT4OID ||
+			 arg_type_oid == INT8OID || arg_type_oid == DATEOID || arg_type_oid == TIMESTAMPOID);
 		if (is_bare_ref && bare_col != nullptr &&
-			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
+			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+			 bare_col->decode_kind == ColumnDecodeKind::INT32_DATE ||
+			 bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
 		{
-			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
+			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+				bare_col->decode_kind == ColumnDecodeKind::INT32_DATE)
 			{
-				if (next_int64_slot >= 16)
+				if (next_int64_slot >= kDataChunkMaxSlots)
 					return false;
 				const uint16_t first = static_cast<uint16_t>(project_steps.size());
 				const uint8_t cast_slot = next_int64_slot++;
@@ -1048,9 +1338,20 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 			else
 				out_desc.input_col_idx = bare_col->chunk_slot;
 			out_kind = TdcAggKind::MIN_INT64;
+			out_type_oid = bare_col->type_oid;
+			return true;
+		}
+		if (is_bare_ref && bare_col != nullptr && bare_col->decode_kind == ColumnDecodeKind::STRING_REF)
+		{
+			out_desc.input_col_idx = bare_col->chunk_slot;
+			out_kind = TdcAggKind::MIN_STRING;
+			out_type_oid = bare_col->type_oid;
+			out_input_is_string = true;
 			return true;
 		}
 		out_kind = intlike_expr ? TdcAggKind::MIN_INT64 : TdcAggKind::MIN_NUMERIC;
+		if (intlike_expr)
+			out_type_oid = arg_type_oid;
 	}
 	else if (pg_strcasecmp(agg->function_name.c_str(), "max") == 0)
 	{
@@ -1060,13 +1361,17 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 		const bool intlike_expr =
 			InferProjectionExprSchema(arg, cols, schema, arg_type_oid, arg_typmod, arg_scale) &&
 			arg_scale == 0 &&
-			(arg_type_oid == BOOLOID || arg_type_oid == INT4OID || arg_type_oid == INT8OID);
+			(arg_type_oid == BOOLOID || arg_type_oid == INT2OID || arg_type_oid == INT4OID ||
+			 arg_type_oid == INT8OID || arg_type_oid == DATEOID || arg_type_oid == TIMESTAMPOID);
 		if (is_bare_ref && bare_col != nullptr &&
-			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 || bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
+			(bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+			 bare_col->decode_kind == ColumnDecodeKind::INT32_DATE ||
+			 bare_col->decode_kind == ColumnDecodeKind::INT64_INT8))
 		{
-			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4)
+			if (bare_col->decode_kind == ColumnDecodeKind::INT32_INT4 ||
+				bare_col->decode_kind == ColumnDecodeKind::INT32_DATE)
 			{
-				if (next_int64_slot >= 16)
+				if (next_int64_slot >= kDataChunkMaxSlots)
 					return false;
 				const uint16_t first = static_cast<uint16_t>(project_steps.size());
 				const uint8_t cast_slot = next_int64_slot++;
@@ -1078,9 +1383,20 @@ ClassifyOptimizerAggregate(const BoundAggregateExpression *agg,
 			else
 				out_desc.input_col_idx = bare_col->chunk_slot;
 			out_kind = TdcAggKind::MAX_INT64;
+			out_type_oid = bare_col->type_oid;
+			return true;
+		}
+		if (is_bare_ref && bare_col != nullptr && bare_col->decode_kind == ColumnDecodeKind::STRING_REF)
+		{
+			out_desc.input_col_idx = bare_col->chunk_slot;
+			out_kind = TdcAggKind::MAX_STRING;
+			out_type_oid = bare_col->type_oid;
+			out_input_is_string = true;
 			return true;
 		}
 		out_kind = intlike_expr ? TdcAggKind::MAX_INT64 : TdcAggKind::MAX_NUMERIC;
+		if (intlike_expr)
+			out_type_oid = arg_type_oid;
 	}
 	else
 		return false;
@@ -1148,22 +1464,30 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 {
 	out_cols.clear();
 	out_schema.clear();
-	if (agg.groups.size() + agg.expressions.size() > 16)
+	if (agg.groups.size() + agg.expressions.size() > kDataChunkMaxSlots)
 		return false;
 
 	for (size_t i = 0; i < agg.groups.size(); ++i)
 	{
-		const auto *col_expr = dynamic_cast<const BoundColumnRefExpression *>(agg.groups[i]);
-		if (col_expr == nullptr)
-			return false;
-		ColumnRef ref{};
-		const ColumnSchema *src = nullptr;
-		if ((!LookupNamedExprInputColumn(col_expr, input_outputs, input_cols, input_schema, ref, src) ||
-			 src == nullptr) &&
-			(!LookupBindingColumn(col_expr->binding, input_cols, input_schema, ref, src) ||
-			 src == nullptr))
-			return false;
-		ColumnSchema cs = *src;
+		ColumnSchema cs{};
+		if (i < agg_state.group_schemas.size())
+		{
+			cs = agg_state.group_schemas[i];
+		}
+		else
+		{
+			const auto *col_expr = dynamic_cast<const BoundColumnRefExpression *>(agg.groups[i]);
+			if (col_expr == nullptr)
+				return false;
+			ColumnRef ref{};
+			const ColumnSchema *src = nullptr;
+			if ((!LookupNamedExprInputColumn(col_expr, input_outputs, input_cols, input_schema, ref, src) ||
+				 src == nullptr) &&
+				(!LookupBindingColumn(col_expr->binding, input_cols, input_schema, ref, src) ||
+				 src == nullptr))
+				return false;
+			cs = *src;
+		}
 		cs.chunk_slot = static_cast<uint8_t>(i);
 		cs.src_attno = 0;
 		out_schema.push_back(cs);
@@ -1184,22 +1508,32 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 			case TdcAggKind::COUNT_NONNULL:
 			case TdcAggKind::COUNT_DISTINCT_NONNULL:
 			case TdcAggKind::SUM_INT64:
-			case TdcAggKind::MIN_INT64:
-			case TdcAggKind::MAX_INT64:
 				cs.type_oid = INT8OID;
 				cs.typmod = -1;
 				cs.typlen = 8;
 				cs.typbyval = true;
 				cs.decode_kind = ColumnDecodeKind::INT64_INT8;
 				break;
+			case TdcAggKind::MIN_INT64:
+			case TdcAggKind::MAX_INT64:
+			{
+				const Oid oid = (i < agg_state.agg_out_type_oids.size() && OidIsValid(agg_state.agg_out_type_oids[i]))
+					? agg_state.agg_out_type_oids[i] : INT8OID;
+				cs.type_oid = oid;
+				cs.typmod = -1;
+				cs.typlen = (oid == INT2OID) ? 2 : ((oid == INT4OID || oid == DATEOID) ? 4 : 8);
+				cs.typbyval = true;
+				cs.decode_kind = ColumnDecodeKind::INT64_INT8;
+				break;
+			}
 			case TdcAggKind::SUM_NUMERIC:
+			case TdcAggKind::AVG_NUMERIC:
 				cs.type_oid = NUMERICOID;
 				cs.typmod = MakeNumericTypmod(38, agg_state.agg_numeric_scales[i]);
 				cs.typlen = -1;
 				cs.typbyval = false;
 				cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
 				break;
-			case TdcAggKind::AVG_NUMERIC:
 			case TdcAggKind::MIN_NUMERIC:
 			case TdcAggKind::MAX_NUMERIC:
 				cs.type_oid = NUMERICOID;
@@ -1208,6 +1542,18 @@ BuildOptimizerAggOutput(const PhysicalHashAggregate &agg,
 				cs.typbyval = false;
 				cs.decode_kind = ColumnDecodeKind::INT64_NUMERIC_SCALED;
 				break;
+			case TdcAggKind::MIN_STRING:
+			case TdcAggKind::MAX_STRING:
+			{
+				const Oid oid = (i < agg_state.agg_out_type_oids.size() && OidIsValid(agg_state.agg_out_type_oids[i]))
+					? agg_state.agg_out_type_oids[i] : TEXTOID;
+				cs.type_oid = oid;
+				cs.typmod = -1;
+				cs.typlen = -1;
+				cs.typbyval = false;
+				cs.decode_kind = ColumnDecodeKind::STRING_REF;
+				break;
+			}
 			default:
 				return false;
 		}
@@ -1422,6 +1768,7 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 		row_capacity,
 		node.limit_count,
 		nullptr);
+	output_op->SetSkipEmitRows(node.limit_offset);
 	output_op->AddChild(std::move(node.op));
 	return output_op;
 }

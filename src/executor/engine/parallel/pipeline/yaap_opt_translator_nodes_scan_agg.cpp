@@ -114,6 +114,7 @@ TryBuildPureProjection(const PhysicalProjection &projection,
 			 child.outputs.size());
 	out.final_sort_keys = child.final_sort_keys;
 	out.limit_count = child.limit_count;
+	out.limit_offset = child.limit_offset;
 	out.estimated_groups = child.estimated_groups;
 	return true;
 }
@@ -254,6 +255,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 
 	std::vector<ProjectStep> steps;
 	std::vector<ProjectExprDesc> expr_descs;
+	std::vector<char> string_consts;
 	std::vector<ColumnSchema> out_schema;
 	uint8_t next_int64_slot = NextFreeInt64Slot(child.schema);
 	uint8_t next_string_slot = NextFreeStringSlot(child.schema);
@@ -298,9 +300,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		}
 		if (expr->type == ExpressionType::BOUND_FUNCTION)
 		{
-			const auto *func = static_cast<const BoundFunctionExpression *>(expr);
-			if (func->function_name == "prefix_slice")
-				lowered = LowerProjectionStringPrefixSlice(func, steps, next_string_slot, child.cols, child.schema, result_slot);
+			lowered = LowerProjectionStringExpr(expr, steps, string_consts, next_int64_slot, next_string_slot, child.cols, child.schema, result_slot);
 		}
 		if (!lowered)
 			lowered = LowerOptimizerExpr(expr, steps, next_int64_slot, child.cols, child.schema, nullptr, result_scale, result_slot);
@@ -408,6 +408,10 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	expr_descs_vec.assign(expr_descs.begin(), expr_descs.end());
 	PgVector<ProjectStep> steps_vec;
 	steps_vec.assign(steps.begin(), steps.end());
+	PgVector<char> string_consts_vec;
+	string_consts_vec.assign(string_consts.begin(), string_consts.end());
+	dsa_pointer string_consts_dp = string_consts.empty() ? InvalidDsaPointer
+		: BuildFilterArray(state->runtime_dsa, string_consts.data(), sizeof(char), string_consts.size());
 
 	auto project_op = std::make_unique<PipelineProjection>(
 		input_schema_dp,
@@ -416,7 +420,9 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 		std::move(steps_vec),
 		expr_descs_dp,
 		steps_dp,
-		nullptr);
+		nullptr,
+		std::move(string_consts_vec),
+		string_consts_dp);
 	project_op->AddChild(std::move(child.op));
 
 	out.op = std::move(project_op);
@@ -473,6 +479,7 @@ TranslateProjectionNode(const PhysicalProjection &projection,
 	}
 	out.final_sort_keys = std::move(child.final_sort_keys);
 	out.limit_count = child.limit_count;
+	out.limit_offset = child.limit_offset;
 	out.estimated_groups = child.estimated_groups;
 	return true;
 }
@@ -671,6 +678,8 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 		AggFuncDesc desc{};
 		TdcAggKind kind{};
 		int16_t numeric_scale = 0;
+		Oid agg_out_type_oid = InvalidOid;
+		bool agg_input_is_string = false;
 		if (!ClassifyOptimizerAggregate(bound_agg,
 										&child.outputs,
 										child.cols,
@@ -681,7 +690,9 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 										next_int64_slot,
 										desc,
 										kind,
-										numeric_scale))
+										numeric_scale,
+										agg_out_type_oid,
+										agg_input_is_string))
 		{
 			if (pg_yaap_trace_hooks)
 				elog(LOG, "pg_yaap: optimizer agg rejected: aggregate classify failed fn=%s",
@@ -691,63 +702,140 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 		agg_state.agg_funcs.push_back(desc);
 		agg_state.agg_kinds.push_back(kind);
 		agg_state.agg_numeric_scales.push_back(numeric_scale);
+		agg_state.agg_out_type_oids.push_back(agg_out_type_oid);
+		agg_state.agg_input_is_string.push_back(agg_input_is_string ? 1 : 0);
 	}
+	size_t distinct_agg_count = 0;
 	for (TdcAggKind kind : agg_state.agg_kinds)
 	{
-		if (kind == TdcAggKind::COUNT_DISTINCT_NONNULL && agg_state.agg_kinds.size() != 1)
-		{
-			if (pg_yaap_trace_hooks)
-				elog(LOG, "pg_yaap: optimizer agg rejected: mixed distinct aggregates not yet supported");
-			return false;
-		}
+		if (kind == TdcAggKind::COUNT_DISTINCT_NONNULL)
+			++distinct_agg_count;
 	}
+	if (distinct_agg_count > 1)
+	{
+		if (pg_yaap_trace_hooks)
+			elog(LOG, "pg_yaap: optimizer agg rejected: multiple COUNT(DISTINCT) aggregates not yet supported");
+		return false;
+	}
+
+	std::vector<ColumnRef> effective_cols = child.cols;
+	std::vector<ColumnSchema> effective_schema = child.schema;
+	uint8_t next_string_slot = NextFreeStringSlot(child.schema);
 
 	std::vector<ColumnRef> group_cols;
 	group_cols.reserve(agg.groups.size());
-	for (Expression *group_expr : agg.groups)
+	agg_state.group_schemas.reserve(agg.groups.size());
+	for (size_t group_idx = 0; group_idx < agg.groups.size(); ++group_idx)
 	{
+		Expression *group_expr = agg.groups[group_idx];
 		const auto *group_col = dynamic_cast<const BoundColumnRefExpression *>(group_expr);
-		if (group_col == nullptr)
+		if (group_col != nullptr)
+		{
+			ColumnRef input_ref{};
+			const ColumnSchema *input_col = nullptr;
+			if ((!LookupNamedExprInputColumn(group_col,
+											 &child.outputs,
+											 child.cols,
+											 child.schema,
+											 input_ref,
+											 input_col) ||
+				 input_col == nullptr) &&
+				(!LookupBindingColumn(group_col->binding,
+									  child.cols,
+									  child.schema,
+									  input_ref,
+									  input_col) ||
+				 input_col == nullptr))
+			{
+				input_col = nullptr;
+			}
+			if (input_col == nullptr)
+			{
+				if (pg_yaap_trace_hooks)
+					elog(LOG,
+						 "pg_yaap: optimizer agg rejected: missing translated group column binding=(%zu,%zu) child_cols=%zu child_outputs=%zu",
+						 group_col->binding.table_index.index,
+						 group_col->binding.column_index.index,
+						 child.cols.size(),
+						 child.outputs.size());
+				return false;
+			}
+			group_cols.push_back(input_ref);
+			agg_state.group_schemas.push_back(*input_col);
+			continue;
+		}
+
+		Oid type_oid = InvalidOid;
+		int32 typmod = -1;
+		int8_t result_scale = 0;
+		if (!InferProjectionExprSchema(group_expr, child.cols, child.schema, type_oid, typmod, result_scale))
 		{
 			if (pg_yaap_trace_hooks)
-				elog(LOG, "pg_yaap: optimizer agg rejected: non-column group expr");
+				elog(LOG, "pg_yaap: optimizer agg rejected: non-column group expr schema infer failed type=%d",
+					 group_expr != nullptr ? static_cast<int>(group_expr->type) : -1);
 			return false;
 		}
-		ColumnRef input_ref{};
-		const ColumnSchema *input_col = nullptr;
-		if ((!LookupNamedExprInputColumn(group_col,
-										 &child.outputs,
-										 child.cols,
-										 child.schema,
-										 input_ref,
-										 input_col) ||
-			 input_col == nullptr) &&
-			(!LookupBindingColumn(group_col->binding,
-								  child.cols,
-								  child.schema,
-								  input_ref,
-								  input_col) ||
-			 input_col == nullptr))
+		const uint16_t first_step_idx = static_cast<uint16_t>(agg_state.project_steps.size());
+		uint8_t result_slot = 0;
+		bool lowered = false;
+		if (group_expr != nullptr && group_expr->type == ExpressionType::BOUND_FUNCTION)
 		{
-			input_col = nullptr;
+			lowered = LowerProjectionStringExpr(
+				group_expr,
+				agg_state.project_steps,
+				agg_state.project_string_consts,
+				next_int64_slot,
+				next_string_slot,
+				child.cols,
+				child.schema,
+				result_slot);
 		}
-		if (input_col == nullptr)
+		if (!lowered)
+		{
+			lowered = LowerOptimizerExpr(
+				group_expr,
+				agg_state.project_steps,
+				next_int64_slot,
+				child.cols,
+				child.schema,
+				&agg_state.materialized_exprs,
+				result_scale,
+				result_slot,
+				true);
+		}
+		if (!lowered)
 		{
 			if (pg_yaap_trace_hooks)
-				elog(LOG,
-					 "pg_yaap: optimizer agg rejected: missing translated group column binding=(%zu,%zu) child_cols=%zu child_outputs=%zu",
-					 group_col->binding.table_index.index,
-					 group_col->binding.column_index.index,
-					 child.cols.size(),
-					 child.outputs.size());
+				elog(LOG, "pg_yaap: optimizer agg rejected: non-column group expr lowering failed type=%d",
+					 group_expr != nullptr ? static_cast<int>(group_expr->type) : -1);
 			return false;
 		}
-		group_cols.push_back(input_ref);
+		if (agg_state.project_steps.size() > first_step_idx)
+		{
+			agg_state.project_exprs.push_back(ProjectExprDesc{
+				first_step_idx,
+				static_cast<uint16_t>(agg_state.project_steps.size() - first_step_idx),
+				result_slot,
+				result_scale,
+				0});
+		}
+		ColumnSchema mapped{};
+		if (!MapProjectedExprSchema(type_oid, typmod, result_scale, result_slot, mapped))
+		{
+			if (pg_yaap_trace_hooks)
+				elog(LOG, "pg_yaap: optimizer agg rejected: non-column group expr schema map failed oid=%u", type_oid);
+			return false;
+		}
+		const ColumnRef synth_ref{UINT32_MAX - 1u, static_cast<AttrNumber>(group_idx + 1)};
+		effective_cols.push_back(synth_ref);
+		effective_schema.push_back(mapped);
+		group_cols.push_back(synth_ref);
+		agg_state.group_schemas.push_back(mapped);
 	}
 
 	if (!BuildHashGroupLayout(group_cols,
-							  child.cols,
-							  child.schema,
+							  effective_cols,
+							  effective_schema,
 							  agg_state.agg_funcs,
 							  agg_state.agg_kinds,
 							  agg_state.agg_numeric_scales,
@@ -758,7 +846,9 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 				 group_cols.size(), agg_state.agg_funcs.size());
 		return false;
 	}
-	(void) pg_yaap::pipeline::translator_detail::TryBuildPerfectHashSpec(group_cols, child.cols, child.schema, agg_state.perfect_hash_capacity);
+	for (size_t i = 0; i < agg_state.agg_input_is_string.size() && i < agg_state.hash_layout.aggregate_count; ++i)
+		agg_state.hash_layout.aggregates[i].input_is_string = agg_state.agg_input_is_string[i];
+	(void) pg_yaap::pipeline::translator_detail::TryBuildPerfectHashSpec(group_cols, effective_cols, effective_schema, agg_state.perfect_hash_capacity);
 
 	std::unique_ptr<PipelineOperator> agg_child = std::move(child.op);
 	if (!agg_state.project_exprs.empty())
@@ -767,12 +857,21 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 		expr_descs_vec.assign(agg_state.project_exprs.begin(), agg_state.project_exprs.end());
 		PgVector<ProjectStep> steps_vec;
 		steps_vec.assign(agg_state.project_steps.begin(), agg_state.project_steps.end());
+		PgVector<char> string_consts_vec;
+		string_consts_vec.assign(agg_state.project_string_consts.begin(), agg_state.project_string_consts.end());
 		dsa_pointer input_schema_dp = BuildSchemaDescriptorFromColumns(child.schema, state->runtime_dsa);
+		dsa_pointer string_consts_dp = agg_state.project_string_consts.empty() ? InvalidDsaPointer
+			: BuildFilterArray(state->runtime_dsa, agg_state.project_string_consts.data(), sizeof(char), agg_state.project_string_consts.size());
 		auto project_op = std::make_unique<PipelineProjection>(
 			input_schema_dp,
 			InvalidDsaPointer,
 			std::move(expr_descs_vec),
-			std::move(steps_vec));
+			std::move(steps_vec),
+			InvalidDsaPointer,
+			InvalidDsaPointer,
+			nullptr,
+			std::move(string_consts_vec),
+			string_consts_dp);
 		project_op->AddChild(std::move(agg_child));
 		agg_child = std::move(project_op);
 	}
@@ -788,7 +887,7 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 	for (const ColumnRef &ref : group_cols)
 	{
 		const ColumnSchema *col = nullptr;
-		if (!LookupRawColumn(ref, child.cols, child.schema, col) || col == nullptr)
+		if (!LookupRawColumn(ref, effective_cols, effective_schema, col) || col == nullptr)
 		{
 			if (pg_yaap_trace_hooks)
 				elog(LOG, "pg_yaap: optimizer agg rejected: missing group key column");
@@ -824,6 +923,7 @@ TranslateHashAggregateNode(const PhysicalHashAggregate &agg,
 	out.op = std::move(hash_op);
 	out.final_sort_keys = std::move(child.final_sort_keys);
 	out.limit_count = child.limit_count;
+	out.limit_offset = child.limit_offset;
 	out.estimated_groups = static_cast<uint32_t>(std::max<size_t>(1, agg.estimated_cardinality));
 	if (!BuildOptimizerAggOutput(agg, &child.outputs, child.cols, child.schema, agg_state, out.cols, out.schema))
 		return false;

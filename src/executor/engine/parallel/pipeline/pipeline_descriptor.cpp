@@ -333,7 +333,8 @@ EmitProjection(const PhysicalProjection &op, OpDescriptor &out, dsa_area *dsa)
 		&out.body.project.expr_descs, &out.body.project.n_exprs);
 	SerializeProjectStepVector(op.steps(), dsa,
 		&out.body.project.steps, &out.body.project.n_steps_total);
-	out.body.project._pad0 = 0;
+	SerializeCharVector(op.string_consts(), dsa,
+		&out.body.project.string_consts, &out.body.project.string_const_bytes);
 }
 
 static void
@@ -559,6 +560,13 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				steps.assign(step_ptr, step_ptr + op.body.project.n_steps_total);
 			}
 
+			PgVector<char> string_consts;
+			if (op.body.project.string_const_bytes > 0 && DsaPointerIsValid(op.body.project.string_consts))
+			{
+				auto *str_ptr = static_cast<char *>(dsa_get_address(ctx.dsa, op.body.project.string_consts));
+				string_consts.assign(str_ptr, str_ptr + op.body.project.string_const_bytes);
+			}
+
 			return std::make_unique<PhysicalProjection>(
 				op.body.project.input_schema,
 				op.body.project.output_schema,
@@ -566,7 +574,9 @@ ReconstructOp(const OpDescriptor &op, ExecCtx &ctx)
 				std::move(steps),
 				op.body.project.expr_descs,
 				op.body.project.steps,
-				const_cast<OpDescriptor *>(&op));
+				const_cast<OpDescriptor *>(&op),
+				std::move(string_consts),
+				op.body.project.string_consts);
 		}
 
 		case OpKind::HASH_JOIN:

@@ -44,6 +44,125 @@ struct VecOutputColMeta {
 	int scale = 0;
 };
 
+static constexpr uint16_t kDataChunkInlineSlots = 16;
+static constexpr uint16_t kDataChunkMaxSlots = 192;
+
+template <typename T, uint16_t Capacity>
+struct alignas(16) DataChunkColumnBank {
+	alignas(16) T inline_storage[kDataChunkInlineSlots][Capacity];
+	T *ptrs[kDataChunkMaxSlots];
+	uint16_t max_slot_count;
+	MemoryContext owner_mcxt;
+
+	DataChunkColumnBank()
+		: max_slot_count(kDataChunkInlineSlots),
+		  owner_mcxt(CurrentMemoryContext)
+	{
+		for (uint16_t i = 0; i < kDataChunkInlineSlots; ++i)
+			ptrs[i] = inline_storage[i];
+		for (uint16_t i = kDataChunkInlineSlots; i < kDataChunkMaxSlots; ++i)
+			ptrs[i] = nullptr;
+	}
+
+	~DataChunkColumnBank()
+	{
+		for (uint16_t i = kDataChunkInlineSlots; i < max_slot_count; ++i)
+		{
+			if (ptrs[i] != nullptr)
+			{
+				pfree(ptrs[i]);
+				ptrs[i] = nullptr;
+			}
+		}
+	}
+
+	DataChunkColumnBank(const DataChunkColumnBank &other)
+		: max_slot_count(kDataChunkInlineSlots),
+		  owner_mcxt(CurrentMemoryContext)
+	{
+		memcpy(inline_storage, other.inline_storage, sizeof(inline_storage));
+		for (uint16_t i = 0; i < kDataChunkInlineSlots; ++i)
+			ptrs[i] = inline_storage[i];
+		for (uint16_t i = kDataChunkInlineSlots; i < kDataChunkMaxSlots; ++i)
+			ptrs[i] = nullptr;
+		for (uint16_t i = kDataChunkInlineSlots; i < other.max_slot_count; ++i)
+		{
+			if (other.ptrs[i] != nullptr)
+			{
+				T *dst = allocate_slot(i);
+				memcpy(dst, other.ptrs[i], sizeof(T) * Capacity);
+			}
+		}
+	}
+
+	DataChunkColumnBank &operator=(const DataChunkColumnBank &other)
+	{
+		if (this == &other)
+			return *this;
+		memcpy(inline_storage, other.inline_storage, sizeof(inline_storage));
+		const uint16_t limit = other.max_slot_count > max_slot_count ? other.max_slot_count : max_slot_count;
+		for (uint16_t i = kDataChunkInlineSlots; i < limit; ++i)
+		{
+			if (i < other.max_slot_count && other.ptrs[i] != nullptr)
+			{
+				T *dst = (ptrs[i] != nullptr) ? ptrs[i] : allocate_slot(i);
+				memcpy(dst, other.ptrs[i], sizeof(T) * Capacity);
+			}
+			else if (ptrs[i] != nullptr)
+			{
+				memset(ptrs[i], 0, sizeof(T) * Capacity);
+			}
+		}
+		return *this;
+	}
+
+	T *allocate_slot(uint16_t slot)
+	{
+		Assert(slot < kDataChunkMaxSlots);
+		if (ptrs[slot] == nullptr)
+		{
+			MemoryContext mcxt = (owner_mcxt != nullptr) ? owner_mcxt : CurrentMemoryContext;
+			ptrs[slot] = static_cast<T *>(MemoryContextAllocZero(mcxt, sizeof(T) * Capacity));
+			if (slot + 1 > max_slot_count)
+				max_slot_count = static_cast<uint16_t>(slot + 1);
+		}
+		return ptrs[slot];
+	}
+
+	inline T *operator[](size_t slot)
+	{
+		Assert(slot < kDataChunkMaxSlots);
+		T *p = ptrs[slot];
+		if (unlikely(p == nullptr))
+			return allocate_slot(static_cast<uint16_t>(slot));
+		return p;
+	}
+
+	inline const T *operator[](size_t slot) const
+	{
+		Assert(slot < kDataChunkMaxSlots);
+		const T *p = ptrs[slot];
+		if (unlikely(p == nullptr))
+			return const_cast<DataChunkColumnBank *>(this)->allocate_slot(static_cast<uint16_t>(slot));
+		return p;
+	}
+
+	inline bool has_slot(uint16_t slot) const
+	{
+		return slot < kDataChunkMaxSlots && ptrs[slot] != nullptr;
+	}
+
+	void zero_all()
+	{
+		memset(inline_storage, 0, sizeof(inline_storage));
+		for (uint16_t i = kDataChunkInlineSlots; i < max_slot_count; ++i)
+		{
+			if (ptrs[i] != nullptr)
+				memset(ptrs[i], 0, sizeof(T) * Capacity);
+		}
+	}
+};
+
 template <uint16_t Capacity>
 struct alignas(16) DataChunk {
 	static void *operator new(std::size_t size)
@@ -64,56 +183,78 @@ struct alignas(16) DataChunk {
 	}
 
 	uint16_t count;
-	alignas(16) double double_columns[16][Capacity];
-	alignas(16) int64_t int64_columns[16][Capacity];
-	alignas(16) int32_t int32_columns[16][Capacity];
-	alignas(16) VecStringRef string_columns[16][Capacity];
-	alignas(16) uint8_t nulls[16][Capacity]; /* Use uint8_t for reliability */
-	alignas(16) uint16_t double_dict_indices[16][Capacity];
-	alignas(16) uint16_t int64_dict_indices[16][Capacity];
-	alignas(16) uint16_t int32_dict_indices[16][Capacity];
-	alignas(16) uint16_t string_dict_indices[16][Capacity];
-	VecDictionaryDesc double_dict[16];
-	VecDictionaryDesc int64_dict[16];
-	VecDictionaryDesc int32_dict[16];
-	VecDictionaryDesc string_dict[16];
+	DataChunkColumnBank<double, Capacity> double_columns;
+	DataChunkColumnBank<int64_t, Capacity> int64_columns;
+	DataChunkColumnBank<int32_t, Capacity> int32_columns;
+	DataChunkColumnBank<VecStringRef, Capacity> string_columns;
+	DataChunkColumnBank<uint8_t, Capacity> nulls;
+	alignas(16) uint16_t double_dict_indices[kDataChunkInlineSlots][Capacity];
+	alignas(16) uint16_t int64_dict_indices[kDataChunkInlineSlots][Capacity];
+	alignas(16) uint16_t int32_dict_indices[kDataChunkInlineSlots][Capacity];
+	alignas(16) uint16_t string_dict_indices[kDataChunkInlineSlots][Capacity];
+	VecDictionaryDesc double_dict[kDataChunkMaxSlots];
+	VecDictionaryDesc int64_dict[kDataChunkMaxSlots];
+	VecDictionaryDesc int32_dict[kDataChunkMaxSlots];
+	VecDictionaryDesc string_dict[kDataChunkMaxSlots];
 	SelectionVector sel;
 	bool has_selection;
-	uint16_t wide128_slot_mask;
-	uint8_t wide128_slot_index[16];
+	bool any_dict_active;
+	uint64_t wide128_slot_mask[3];
+	uint8_t wide128_slot_index[kDataChunkMaxSlots];
 	VolVecVector<char> string_arena;
 	VolVecVector<NumericWideInt> wide128_arena;
 
 	DataChunk()
 		: count(0),
 		  has_selection(false),
-		  wide128_slot_mask(0),
+		  any_dict_active(false),
+		  wide128_slot_mask{0, 0, 0},
 		  string_arena(PgMemoryContextAllocator<char>(CurrentMemoryContext)),
 		  wide128_arena(PgMemoryContextAllocator<NumericWideInt>(CurrentMemoryContext))
 	{
-		memset(nulls, 0, sizeof(nulls));
+		nulls.zero_all();
 		memset(wide128_slot_index, 0xFF, sizeof(wide128_slot_index));
-		clear_dictionaries();
+		memset(double_dict, 0, sizeof(double_dict));
+		memset(int64_dict, 0, sizeof(int64_dict));
+		memset(int32_dict, 0, sizeof(int32_dict));
+		memset(string_dict, 0, sizeof(string_dict));
 	}
 
 	void clear_dictionaries()
 	{
-		for (uint8_t slot = 0; slot < 16; ++slot)
-		{
-			double_dict[slot] = VecDictionaryDesc{false, 0, 0};
-			int64_dict[slot] = VecDictionaryDesc{false, 0, 0};
-			int32_dict[slot] = VecDictionaryDesc{false, 0, 0};
-			string_dict[slot] = VecDictionaryDesc{false, 0, 0};
-		}
+		if (!any_dict_active)
+			return;
+		memset(double_dict, 0, sizeof(double_dict));
+		memset(int64_dict, 0, sizeof(int64_dict));
+		memset(int32_dict, 0, sizeof(int32_dict));
+		memset(string_dict, 0, sizeof(string_dict));
+		any_dict_active = false;
+	}
+
+	inline bool has_wide128_bit(uint8_t slot) const
+	{
+		return (wide128_slot_mask[slot >> 6] & (uint64_t{1} << (slot & 63u))) != 0;
+	}
+
+	inline void set_wide128_bit(uint8_t slot)
+	{
+		wide128_slot_mask[slot >> 6] |= (uint64_t{1} << (slot & 63u));
+	}
+
+	inline void clear_wide128_bit(uint8_t slot)
+	{
+		wide128_slot_mask[slot >> 6] &= ~(uint64_t{1} << (slot & 63u));
 	}
 
 	void reset_lightweight() {
 		count = 0;
 		sel.clear();
 		has_selection = false;
-		if (wide128_slot_mask != 0)
+		if ((wide128_slot_mask[0] | wide128_slot_mask[1] | wide128_slot_mask[2]) != 0)
 		{
-			wide128_slot_mask = 0;
+			wide128_slot_mask[0] = 0;
+			wide128_slot_mask[1] = 0;
+			wide128_slot_mask[2] = 0;
 			memset(wide128_slot_index, 0xFF, sizeof(wide128_slot_index));
 			wide128_arena.clear();
 		}
@@ -123,18 +264,12 @@ struct alignas(16) DataChunk {
 
 	void reset() {
 		reset_lightweight();
-		memset(nulls, 0, sizeof(nulls));
+		nulls.zero_all();
 	}
 
 	bool has_any_dictionary() const
 	{
-		for (int i = 0; i < 16; ++i)
-		{
-			if (double_dict[i].active || int64_dict[i].active ||
-				int32_dict[i].active || string_dict[i].active)
-				return true;
-		}
-		return false;
+		return any_dict_active;
 	}
 
 	bool has_int32_dictionary(uint8_t slot) const { return int32_dict[slot].active; }
@@ -149,22 +284,30 @@ struct alignas(16) DataChunk {
 
 	void set_int32_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
 	{
+		Assert(slot < kDataChunkInlineSlots);
 		int32_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		any_dict_active = true;
 		memcpy(int32_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
 	}
 	void set_int64_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
 	{
+		Assert(slot < kDataChunkInlineSlots);
 		int64_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		any_dict_active = true;
 		memcpy(int64_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
 	}
 	void set_double_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
 	{
+		Assert(slot < kDataChunkInlineSlots);
 		double_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		any_dict_active = true;
 		memcpy(double_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
 	}
 	void set_string_dictionary(uint8_t slot, uint8_t source_slot, const uint16_t *indices, uint16_t logical_count)
 	{
+		Assert(slot < kDataChunkInlineSlots);
 		string_dict[slot] = VecDictionaryDesc{true, source_slot, 0};
+		any_dict_active = true;
 		memcpy(string_dict_indices[slot], indices, logical_count * sizeof(uint16_t));
 	}
 
@@ -190,31 +333,31 @@ struct alignas(16) DataChunk {
 	bool has_wide128(uint8_t slot) const
 	{
 		const uint8_t eff_slot = int64_dict[slot].active ? int64_dict[slot].source_slot : slot;
-		return (wide128_slot_mask & static_cast<uint16_t>(1u << eff_slot)) != 0;
+		return has_wide128_bit(eff_slot);
 	}
 
 	void clear_wide128(uint8_t slot)
 	{
-		wide128_slot_mask &= static_cast<uint16_t>(~(1u << slot));
+		clear_wide128_bit(slot);
 	}
 
 	NumericWideInt *wide128_slot_data(uint8_t slot)
 	{
-		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) == 0)
+		if (!has_wide128_bit(slot))
 			return nullptr;
 		return wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
 	}
 
 	const NumericWideInt *wide128_slot_data(uint8_t slot) const
 	{
-		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) == 0)
+		if (!has_wide128_bit(slot))
 			return nullptr;
 		return wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
 	}
 
 	NumericWideInt *ensure_wide128_slot(uint8_t slot, uint16_t backfill_rows)
 	{
-		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) != 0)
+		if (has_wide128_bit(slot))
 			return wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
 		if (wide128_slot_index[slot] == UINT8_MAX)
 		{
@@ -225,13 +368,13 @@ struct alignas(16) DataChunk {
 		NumericWideInt *slab = wide128_arena.data() + static_cast<size_t>(wide128_slot_index[slot]) * Capacity;
 		for (uint16_t r = 0; r < backfill_rows; ++r)
 			slab[r] = WideIntFromInt64(int64_columns[slot][r]);
-		wide128_slot_mask |= static_cast<uint16_t>(1u << slot);
+		set_wide128_bit(slot);
 		return slab;
 	}
 
 	void set_wide128(uint8_t slot, uint16_t row_idx, NumericWideInt value)
 	{
-		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) == 0 && WideIntFitsInt64(value))
+		if (!has_wide128_bit(slot) && WideIntFitsInt64(value))
 		{
 			int64_columns[slot][row_idx] = static_cast<int64_t>(WideIntLow64(value));
 			return;
@@ -247,11 +390,11 @@ struct alignas(16) DataChunk {
 		{
 			const uint8_t src = int64_dict[slot].source_slot;
 			const uint16_t idx = int64_dict_indices[slot][row_idx];
-			if ((wide128_slot_mask & static_cast<uint16_t>(1u << src)) != 0)
+			if (has_wide128_bit(src))
 				return wide128_arena[static_cast<size_t>(wide128_slot_index[src]) * Capacity + idx];
 			return WideIntFromInt64(int64_columns[src][idx]);
 		}
-		if ((wide128_slot_mask & static_cast<uint16_t>(1u << slot)) != 0)
+		if (has_wide128_bit(slot))
 			return wide128_arena[static_cast<size_t>(wide128_slot_index[slot]) * Capacity + row_idx];
 		return WideIntFromInt64(int64_columns[slot][row_idx]);
 	}
@@ -282,26 +425,28 @@ struct alignas(16) DataChunk {
 
 	void flatten()
 	{
-		for (uint8_t slot = 0; slot < 16; ++slot)
+		if (!any_dict_active)
+			return;
+		for (uint16_t slot = 0; slot < kDataChunkInlineSlots; ++slot)
 		{
 			if (int32_dict[slot].active)
 			{
 				int32_t tmp[Capacity];
 				for (uint16_t row = 0; row < count; ++row)
-					tmp[row] = get_int32(slot, row);
+					tmp[row] = get_int32(static_cast<uint8_t>(slot), row);
 				memcpy(int32_columns[slot], tmp, count * sizeof(int32_t));
-				clear_int32_dictionary(slot);
+				clear_int32_dictionary(static_cast<uint8_t>(slot));
 			}
 			if (int64_dict[slot].active)
 			{
-				const bool wide = has_wide128(slot);
+				const bool wide = has_wide128(static_cast<uint8_t>(slot));
 				if (wide)
 				{
 					NumericWideInt wtmp[Capacity];
 					for (uint16_t row = 0; row < count; ++row)
-						wtmp[row] = get_wide128(slot, row);
-					clear_int64_dictionary(slot);
-					NumericWideInt *slab = ensure_wide128_slot(slot, 0);
+						wtmp[row] = get_wide128(static_cast<uint8_t>(slot), row);
+					clear_int64_dictionary(static_cast<uint8_t>(slot));
+					NumericWideInt *slab = ensure_wide128_slot(static_cast<uint8_t>(slot), 0);
 					for (uint16_t row = 0; row < count; ++row)
 					{
 						slab[row] = wtmp[row];
@@ -312,28 +457,29 @@ struct alignas(16) DataChunk {
 				{
 					int64_t tmp[Capacity];
 					for (uint16_t row = 0; row < count; ++row)
-						tmp[row] = get_int64(slot, row);
+						tmp[row] = get_int64(static_cast<uint8_t>(slot), row);
 					memcpy(int64_columns[slot], tmp, count * sizeof(int64_t));
-					clear_int64_dictionary(slot);
+					clear_int64_dictionary(static_cast<uint8_t>(slot));
 				}
 			}
 			if (double_dict[slot].active)
 			{
 				double tmp[Capacity];
 				for (uint16_t row = 0; row < count; ++row)
-					tmp[row] = get_double(slot, row);
+					tmp[row] = get_double(static_cast<uint8_t>(slot), row);
 				memcpy(double_columns[slot], tmp, count * sizeof(double));
-				clear_double_dictionary(slot);
+				clear_double_dictionary(static_cast<uint8_t>(slot));
 			}
 			if (string_dict[slot].active)
 			{
 				VecStringRef tmp[Capacity];
 				for (uint16_t row = 0; row < count; ++row)
-					tmp[row] = get_string_ref(slot, row);
+					tmp[row] = get_string_ref(static_cast<uint8_t>(slot), row);
 				memcpy(string_columns[slot], tmp, count * sizeof(VecStringRef));
-				clear_string_dictionary(slot);
+				clear_string_dictionary(static_cast<uint8_t>(slot));
 			}
 		}
+		any_dict_active = false;
 	}
 
 	VecStringRef store_string_bytes(const char *data, uint32_t len)
@@ -358,14 +504,14 @@ struct alignas(16) DataChunk {
 	{
 		return VecStringRefDataPtr(ref, string_arena.data());
 	}
-	void get_double_ptrs(double** out) { for(int i=0; i<16; i++) out[i] = double_columns[i]; }
-	void get_int64_ptrs(int64_t** out) { for(int i=0; i<16; i++) out[i] = int64_columns[i]; }
-	void get_int32_ptrs(int32_t** out) { for(int i=0; i<16; i++) out[i] = int32_columns[i]; }
-	void get_string_ptrs(VecStringRef** out) { for(int i=0; i<16; i++) out[i] = string_columns[i]; }
-	void get_null_ptrs(uint8_t** out) { for(int i=0; i<16; i++) out[i] = nulls[i]; }
+	void get_double_ptrs(double** out) { for(int i=0; i<kDataChunkInlineSlots; i++) out[i] = double_columns[i]; }
+	void get_int64_ptrs(int64_t** out) { for(int i=0; i<kDataChunkInlineSlots; i++) out[i] = int64_columns[i]; }
+	void get_int32_ptrs(int32_t** out) { for(int i=0; i<kDataChunkInlineSlots; i++) out[i] = int32_columns[i]; }
+	void get_string_ptrs(VecStringRef** out) { for(int i=0; i<kDataChunkInlineSlots; i++) out[i] = string_columns[i]; }
+	void get_null_ptrs(uint8_t** out) { for(int i=0; i<kDataChunkInlineSlots; i++) out[i] = nulls[i]; }
 };
 
-static constexpr int kMaxDeformTargets = 16;
+static constexpr int kMaxDeformTargets = kDataChunkMaxSlots;
 /*
  * kBpchar1 — BPCHAR(1) varlena payload decoded as a single int32 character
  * value. Required because Q1's `l_returnflag`/`l_linestatus` (BPCHAR(1)) are
@@ -373,7 +519,7 @@ static constexpr int kMaxDeformTargets = 16;
  * 4-byte load past the varlena header reads garbage. Decoded into the int32
  * column slot, identical destination layout to kInt32.
  */
-enum class DeformDecodeKind : uint8_t { kInt32, kInt64, kDate32, kFloat8, kNumeric, kStringRef, kBpchar1 };
+enum class DeformDecodeKind : uint8_t { kInt16, kInt32, kInt64, kDate32, kFloat8, kNumeric, kStringRef, kBpchar1 };
 struct DeformTarget { int att_index; uint16_t dst_col; DeformDecodeKind decode_kind; };
 struct DeformProgram {
 	int ntargets; int last_att_index; DeformTarget targets[kMaxDeformTargets];

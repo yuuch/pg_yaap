@@ -1,4 +1,5 @@
 #include "parallel/pipeline/translator_internal.hpp"
+#include "core/data_chunk.hpp"
 
 #include <limits>
 
@@ -179,6 +180,7 @@ MapProjectedExprSchema(Oid type_oid,
 			cs.decode_kind = ColumnDecodeKind::INT64_INT8;
 			break;
 		case INT8OID:
+		case TIMESTAMPOID:
 			cs.typmod = -1;
 			cs.typlen = 8;
 			cs.typbyval = true;
@@ -195,6 +197,12 @@ MapProjectedExprSchema(Oid type_oid,
 			cs.typlen = 4;
 			cs.typbyval = true;
 			cs.decode_kind = ColumnDecodeKind::INT32_DATE;
+			break;
+		case INT2OID:
+			cs.typmod = -1;
+			cs.typlen = 2;
+			cs.typbyval = true;
+			cs.decode_kind = ColumnDecodeKind::INT64_INT8;
 			break;
 		case INT4OID:
 			cs.typmod = -1;
@@ -400,7 +408,7 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 			mark_col.chunk_slot = unique_output_slots ? next_output_slot++ : next_int32_slot++;
 			mark_col.src_attno = 0;
 			mark_col.decode_kind = ColumnDecodeKind::INT32_INT4;
-			if (mark_col.chunk_slot >= 16)
+			if (mark_col.chunk_slot >= kDataChunkMaxSlots)
 				return false;
 			out_schema.push_back(mark_col);
 			out_mappings.push_back(HashJoinOutputColumnDesc{
@@ -452,7 +460,7 @@ BuildHashJoinOutputMappings(const std::vector<ColumnRef> &output_cols,
 						 ref.attno);
 				return false;
 		}
-		if (out_col.chunk_slot >= 16)
+		if (out_col.chunk_slot >= kDataChunkMaxSlots)
 		{
 			if (pg_yaap_trace_hooks)
 				elog(LOG,
@@ -594,6 +602,7 @@ BuildSeqScanColumns(Oid relid,
 	uint8_t i32 = 0;
 	uint8_t i64 = 0;
 	uint8_t dbl = 0;
+	uint8_t str = 0;
 	out.clear();
 	out.reserve(cols.size());
 	for (const ColumnRef &ref : cols)
@@ -618,7 +627,7 @@ BuildSeqScanColumns(Oid relid,
 				cs.decode_kind = UseInt32CharDecodeForColumn(attr->atttypid, attr->atttypmod) ?
 					ColumnDecodeKind::INT32_CHAR :
 					ColumnDecodeKind::STRING_REF;
-				cs.chunk_slot = (cs.decode_kind == ColumnDecodeKind::INT32_CHAR) ? i32++ : i32++;
+				cs.chunk_slot = (cs.decode_kind == ColumnDecodeKind::INT32_CHAR) ? i32++ : str++;
 				break;
 			case CHAROID:
 				cs.decode_kind = ColumnDecodeKind::INT32_CHAR;
@@ -628,11 +637,13 @@ BuildSeqScanColumns(Oid relid,
 				cs.decode_kind = ColumnDecodeKind::INT32_DATE;
 				cs.chunk_slot = i32++;
 				break;
+			case INT2OID:
 			case INT4OID:
 				cs.decode_kind = ColumnDecodeKind::INT32_INT4;
 				cs.chunk_slot = i32++;
 				break;
 			case INT8OID:
+			case TIMESTAMPOID:
 				cs.decode_kind = ColumnDecodeKind::INT64_INT8;
 				cs.chunk_slot = i64++;
 				break;
@@ -647,13 +658,13 @@ BuildSeqScanColumns(Oid relid,
 			case TEXTOID:
 			case VARCHAROID:
 				cs.decode_kind = ColumnDecodeKind::STRING_REF;
-				cs.chunk_slot = i32++;
+				cs.chunk_slot = str++;
 				break;
 			default:
 				relation_close(rel, AccessShareLock);
 				return false;
 		}
-		if (cs.chunk_slot >= 16)
+		if (cs.chunk_slot >= kDataChunkMaxSlots)
 		{
 			relation_close(rel, AccessShareLock);
 			return false;
@@ -677,7 +688,7 @@ BuildAggOutputSchemaDescriptor(const std::vector<ColumnRef> &group_cols,
 	const uint16_t n_groups = static_cast<uint16_t>(group_cols.size());
 	const uint16_t n_aggs = static_cast<uint16_t>(agg_kinds.size());
 	const uint16_t n_cols = n_groups + n_aggs;
-	if (n_cols == 0 || n_cols > 16)
+	if (n_cols == 0 || n_cols > kDataChunkMaxSlots)
 		return InvalidDsaPointer;
 	const Size sz = offsetof(SchemaDescriptor, columns) + static_cast<Size>(n_cols) * sizeof(ColumnSchema);
 	dsa_pointer dp = dsa_allocate0(dsa, sz);

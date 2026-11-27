@@ -96,6 +96,11 @@ DataChunkDeformer::deform_tuple_header(HeapTupleHeader tuphdr,
 
 			switch (t.decode_kind)
 			{
+				case DeformDecodeKind::kInt16:
+					((int32_t *) bindings.columns_data[t.dst_col])[row_idx] =
+						static_cast<int32_t>(*reinterpret_cast<const int16_t *>(attptr));
+					break;
+
 				case DeformDecodeKind::kInt32:
 				case DeformDecodeKind::kDate32:
 					((int32_t *) bindings.columns_data[t.dst_col])[row_idx] =
