@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="260" viewBox="0 0 760 260" role="img" aria-label="pg_yaap TPC-H SF10 and SF100 Benchmark Snapshot">
+  <rect x="0.5" y="0.5" width="759" height="259" rx="12" fill="#0D1117" stroke="#30363D"/>
+
+  <text x="24" y="34" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.4" fill="#E6EDF3">BENCHMARK SNAPSHOT</text>
+  <text x="736" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8B949E">Apple M4 Pro · 24 GB RAM · 12 Workers</text>
+  <line x1="24" y1="48" x2="736" y2="48" stroke="#30363D" stroke-width="1"/>
+
+  <rect x="24" y="64" width="346" height="146" rx="8" fill="#161B22" stroke="#30363D"/>
+  <text x="42" y="90" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8B949E">TPC-H SF10 (~10 GB)</text>
+  <rect x="274" y="74" width="80" height="22" rx="11" fill="#0D1117" stroke="#30363D"/>
+  <text x="314" y="89" text-anchor="middle" font-family="'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="600" fill="#E6EDF3">22/22 OK</text>
+  <text x="42" y="142" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="40" font-weight="700" fill="#FF6B6B">20.8s</text>
+  <text x="164" y="142" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#8B949E">SQL total (21.3s wall)</text>
+  <line x1="42" y1="162" x2="352" y2="162" stroke="#30363D" stroke-width="1"/>
+  <text x="42" y="182" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#E6EDF3">pg_duckdb v1.2.2: 63.3s · PG: 146.0s+ (3 TO)</text>
+  <text x="42" y="199" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8B949E">Native PG Heap · 30s timeout · 22/22 exact match</text>
+
+  <rect x="390" y="64" width="346" height="146" rx="8" fill="#161B22" stroke="#30363D"/>
+  <text x="408" y="90" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8B949E">TPC-H SF100 (~125 GB)</text>
+  <rect x="640" y="74" width="80" height="22" rx="11" fill="#0D1117" stroke="#30363D"/>
+  <text x="680" y="89" text-anchor="middle" font-family="'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="11" font-weight="600" fill="#E6EDF3">22/22 OK</text>
+  <text x="408" y="142" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="40" font-weight="700" fill="#FF6B6B">432.6s</text>
+  <text x="546" y="142" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#8B949E">SQL total (1.64× vs DuckDB)</text>
+  <line x1="408" y1="162" x2="718" y2="162" stroke="#30363D" stroke-width="1"/>
+  <text x="408" y="182" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#E6EDF3">pg_duckdb v1.2.2: 710.2s · PG: 1,101.4s+ (6 TO)</text>
+  <text x="408" y="199" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8B949E">Larger-than-memory Heap · 100s timeout · 22/22 match</text>
+
+  <text x="24" y="236" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8B949E">Identical PG 18.3 server (UTF8 Heap, 4GB shared_buffers, 12 workers). All 22/22 queries match pg_duckdb at SF10 &amp; SF100.</text>
+</svg>

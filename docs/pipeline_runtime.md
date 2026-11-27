@@ -1,5 +1,7 @@
 # Pipeline runtime and process communication
 
+![Internal pipeline runtime architecture](../imgs/pipeline_runtime.svg)
+
 This document describes the current runtime under
 `src/executor/engine/parallel/pipeline/`. The supported input is the optimizer-owned
 YAAP physical plan lowered by `yaap_pipeline_init` / `yaap_opt_translator*`.
@@ -220,3 +222,13 @@ workers for shutdown before the leader drains output.
 - `tests/pipeline_stage3_4.py`: concurrent TopN/CrossProduct LWLock safety,
   low-budget Materialize spill/reload/retirement, hybrid partial startup (`ready=1`),
   PG `EXPLAIN`/cursor lifecycle boundaries, and client-disconnect leak checks.
+
+## Optimizer, vectorized execution, and operator implementation notes
+
+- **Optimizer pipeline (`src/optimizer/`)**: `LogicalPlanner` normalizes correlated subqueries via `LogicalDependentJoin` rewriting (`LogicalDelimJoin`, mark joins, single joins). `LogicalOptimizer` runs `JoinPredicateExtraction`, `FilterPushdown`, `PredicatePropagation`, `ScanFilterFolding`, `RemoveUnusedColumns`, `CardinalityEstimator`, DP `JoinOrderOptimizer`, and `CommonSubplanElimination` (`PhysicalMaterializedCTE` / `PhysicalCTEScan`).
+- **Vectorized batch and expression model**: Pipelines process `DataChunk<2048>` batches with null bitmaps, selection/dictionary vectors, scale-2 `int64_t` numerics (`Wide128` fallback for wider precisions), per-chunk string arenas, `VecExprProgram` bytecode evaluation, and zero-copy in-place `PhysicalFilter` / `PhysicalProjection` execution.
+- **Analytical operators & JIT**:
+  - `PhysicalHashJoin`: Supports `INNER`, `LEFT`, `RIGHT`, `SEMI`, `ANTI`, `MARK`, and `SINGLE` joins with radix-partitioned Hybrid Hash Join probing, build-to-scan runtime Bloom + Min/Max filter pushdown, and recursive radix repartitioning (up to depth 4) on oversized build partitions.
+  - `PhysicalHashAggregate` / `PhysicalPerfectHashAggregate`: Partitioned parallel hash aggregation plus direct-mapped perfect hashing (up to `65536` slots for bounded integer / 1-byte `bpchar` keys).
+  - `PhysicalTopN`: Task-local candidate tracking merged via `LWLock`.
+  - `PhysicalSeqScan`: PostgreSQL `ReadStream` scans paired with optional LLVM JIT `HeapTupleHeader` deformation (`pg_yaap.jit_deform`).
