@@ -661,6 +661,7 @@ struct OutputSharedPayload {
 	bool segment_backed;
 	bool finalized;
 	uint8_t _pad[2];
+	uint64_t skip_emit_rows;
 };
 
 /*

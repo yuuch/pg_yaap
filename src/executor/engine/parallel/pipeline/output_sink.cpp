@@ -695,6 +695,8 @@ OutputSink::GetGlobalSinkState(ExecCtx &ctx)
 	state->global_tdc = ResolveTdc(ctx.dsa, state->shared_payload->tdc_dp);
 	state->max_emit_rows = max_emit_rows_ > 0 ? max_emit_rows_ :
 		(desc_ ? desc_->body.output.max_emit_rows : 0);
+	state->skip_emit_rows = state->shared_payload->skip_emit_rows > 0
+		? state->shared_payload->skip_emit_rows : skip_emit_rows_;
 
 	if (state->global_tdc == nullptr)
 		elog(ERROR, "pg_yaap: output sink global TDC resolve failed");
@@ -759,15 +761,26 @@ OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 
 	if (global.global_tdc == nullptr || global.layout == nullptr)
 		elog(ERROR, "pg_yaap: output sink not initialized");
+	const uint64 row_cap_limit = (global.max_emit_rows > 0 && global.n_sort_keys == 0)
+		? (global.skip_emit_rows <= UINT64_MAX - global.max_emit_rows
+			? global.skip_emit_rows + global.max_emit_rows
+			: UINT64_MAX)
+		: 0;
 	if (global.shared_payload != nullptr && global.shared_payload->segment_backed)
 	{
 		if (!global.segmented_writer_initialized)
 			elog(ERROR, "pg_yaap: output segmented writer not initialized");
 		auto *buffer_state = ResolveBufferState(ctx);
+		bool hit_limit = false;
 		for (uint16_t row = 0; row < in.count; ++row)
 		{
 			if (PipelineCancelRequestedEvery(ctx, row))
 				return SinkResultType::FINISHED;
+			if (row_cap_limit > 0 && global.shared_payload->segment_row_count >= row_cap_limit)
+			{
+				hit_limit = true;
+				break;
+			}
             if (!TupleDataCollectionHasSpaceForAppend(global.global_tdc,
                 TupleDataCollectionRequiredHeapBytesForChunkRow(global.layout, in, row))) {
                 buffer::YaapSegmentedTdcSealPublish(ctx.dsa, &global.segmented_writer);
@@ -796,11 +809,16 @@ OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 		global.shared_payload->segment_generation = tail->generation;
 		global.shared_payload->tdc_dp = tail->payload_dp;
 		global.global_tdc = ResolveTdc(ctx.dsa, tail->payload_dp);
-		return SinkResultType::NEED_MORE_INPUT;
+		return (hit_limit || (row_cap_limit > 0 && global.shared_payload->segment_row_count >= row_cap_limit))
+			? SinkResultType::FINISHED
+			: SinkResultType::NEED_MORE_INPUT;
 	}
 
 	for (uint16_t row = 0; row < in.count; ++row)
 	{
+		if (row_cap_limit > 0 &&
+			pg_atomic_read_u32(&global.global_tdc->row_count) >= row_cap_limit)
+			return SinkResultType::FINISHED;
 		if (global.max_emit_rows > 0 && global.n_sort_keys > 0)
 		{
 			const uint32_t row_count = pg_atomic_read_u32(&global.global_tdc->row_count);
@@ -836,6 +854,9 @@ OutputSink::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 		 * the column-decode metadata in the parallel SchemaDescriptor. */
 		AppendChunkRowToTdc(global, global.global_tdc, row_ptr, in, row);
 		++local.emitted_rows;
+		if (row_cap_limit > 0 &&
+			pg_atomic_read_u32(&global.global_tdc->row_count) >= row_cap_limit)
+			return SinkResultType::FINISHED;
 	}
 
 	return SinkResultType::NEED_MORE_INPUT;

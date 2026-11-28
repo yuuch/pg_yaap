@@ -69,6 +69,8 @@ public:
 	uint32_t             perfect_capacity = 0;
 	PgVector<uint32_t>   perfect_row_indices;
 	bool                 has_distinct_count = false;
+	bool                 saw_distinct_input = false;
+	bool                 seen_empty_distinct_str = false;
 	uint16_t             distinct_agg_idx = UINT16_MAX;
 	dsa_pointer          distinct_layout_dp = InvalidDsaPointer;
 	const TupleDataLayout *distinct_layout = nullptr;

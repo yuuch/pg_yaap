@@ -273,9 +273,10 @@ YaapSegmentedTdcAppendWithHeap(dsa_area *dsa, YaapBufferSharedState *state,
 		if (seg_cap > fixed_hdr + tdc->row_width && store->heap_capacity > 0)
 		{
 			const uint32_t usable = seg_cap - fixed_hdr;
-			if (rows_used >= store->row_capacity && heap_used < store->heap_capacity / 2u)
+			if (rows_used >= store->row_capacity &&
+				heap_used < (store->heap_capacity * 3u) / 4u)
 			{
-				uint32_t new_heap = std::max(heap_used * 2u, usable / 4u);
+				uint32_t new_heap = std::max(heap_used + heap_used / 2u + 1024u, usable / 8u);
 				new_heap = std::max(new_heap, required_heap_bytes * 2u);
 				new_heap = std::min(new_heap, store->heap_capacity);
 				if (usable > new_heap + tdc->row_width)
@@ -289,9 +290,12 @@ YaapSegmentedTdcAppendWithHeap(dsa_area *dsa, YaapBufferSharedState *state,
 			}
 			else if (rows_used < store->row_capacity / 2u && store->row_capacity > 64u)
 			{
-				uint32_t new_rows = std::max<uint32_t>(rows_used * 2u, 64u);
+				/* Keep at least 1/4 of segment usable bytes for row slots so one
+				 * string-heavy burst does not starve subsequent sparse segments. */
+				const uint32_t floor_rows = std::max<uint32_t>(64u, (usable / 4u) / tdc->row_width);
+				uint32_t new_rows = std::max(rows_used * 2u, floor_rows);
 				new_rows = std::min(new_rows, store->row_capacity);
-				if (usable > new_rows * tdc->row_width)
+				if (usable > new_rows * tdc->row_width + required_heap_bytes)
 				{
 					tdc->row_capacity = new_rows;
 					tdc->heap_capacity = usable - new_rows * tdc->row_width;

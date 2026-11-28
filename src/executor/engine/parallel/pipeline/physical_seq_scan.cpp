@@ -1095,7 +1095,7 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	 */
 	if (!local.deform_programs_built)
 	{
-		if (BuildProjDeformProgramFromSchema(out_schema, local.proj_deform_program))
+		if (out_schema->n_columns > 0 && BuildProjDeformProgramFromSchema(out_schema, local.proj_deform_program))
 		{
 			local.proj_deformer = std::make_unique<DataChunkDeformer>(local.scan_tupdesc,
 			                                                           &local.proj_deform_program);
@@ -1207,136 +1207,166 @@ PhysicalSeqScan::GetData(ExecCtx &ctx, PipelineChunk &out, OperatorSourceInput &
 	const bool use_simple_filter = has_filter && simple_filter_step != nullptr;
 
 	uint32_t tuple_checks = 0;
-	while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
+	const bool zero_col_output = (out_schema->n_columns == 0 || local.proj_deformer == nullptr);
+	if (zero_col_output && !has_filter && local.n_active_runtime_filters == 0)
 	{
-		if (PipelineCancelRequestedEvery(ctx, tuple_checks++, 1023u))
+		while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
 		{
-			ReleaseSeqScanPage(local);
-			break;
-		}
-		if (!EnsureSeqScanPageLoaded(local, ctx))
-		{
-			local.exhausted = true;
-			break;
-		}
-
-		OffsetNumber offnum = local.scan_desc->rs_vistuples[local.page_visible_index++];
-		Page page = BufferGetPage(local.scan_desc->rs_cbuf);
-		ItemId lpp = PageGetItemId(page, offnum);
-		HeapTupleData tuple;
-		tuple.t_data = (HeapTupleHeader) PageGetItem(page, lpp);
-		tuple.t_len = ItemIdGetLength(lpp);
-		tuple.t_tableOid = RelationGetRelid(local.scan_desc->rs_base.rs_rd);
-		ItemPointerSet(&(tuple.t_self), local.scan_desc->rs_cblock, offnum);
-
-		if (tuple.t_data == nullptr)
-			continue;
-
-		/* Runtime HashJoin Bloom + Min/Max filter pushdown: reject non-matching
-		 * probe keys using a single fixed-offset tuple read before running
-		 * filter_deformer, proj_deformer, or downstream hash-join probes. */
-		if (local.n_active_runtime_filters > 0)
-		{
-			const bool has_nulls = (tuple.t_data->t_infomask & HEAP_HASNULL) != 0;
-			const uint32_t tup_natts = HeapTupleHeaderGetNatts(tuple.t_data);
-			const char *tup_base = reinterpret_cast<const char *>(tuple.t_data) + tuple.t_data->t_hoff;
-			bool rf_pass = true;
-			for (uint8_t rfi = 0; rfi < local.n_active_runtime_filters; ++rfi)
+			if (PipelineCancelRequestedEvery(ctx, tuple_checks++, 63u))
 			{
-				const auto &af = local.active_runtime_filters[rfi];
-				int64_t key_val = 0;
-				if (likely(!has_nulls && af.attcacheoff >= 0 && af.attno <= tup_natts))
+				ReleaseSeqScanPage(local);
+				break;
+			}
+			if (!EnsureSeqScanPageLoaded(local, ctx))
+			{
+				local.exhausted = true;
+				break;
+			}
+			const uint32_t avail = static_cast<uint32_t>(
+				local.scan_desc->rs_ntuples - local.page_visible_index);
+			const uint32_t room = static_cast<uint32_t>(
+				PIPELINE_DEFAULT_CHUNK_SIZE - out.count);
+			const uint32_t take = std::min(avail, room);
+			local.page_visible_index += static_cast<int>(take);
+			out.count = static_cast<uint16_t>(out.count + take);
+		}
+	}
+	else
+	{
+		while (out.count < PIPELINE_DEFAULT_CHUNK_SIZE)
+		{
+			if (PipelineCancelRequestedEvery(ctx, tuple_checks++, 1023u))
+			{
+				ReleaseSeqScanPage(local);
+				break;
+			}
+			if (!EnsureSeqScanPageLoaded(local, ctx))
+			{
+				local.exhausted = true;
+				break;
+			}
+
+			OffsetNumber offnum = local.scan_desc->rs_vistuples[local.page_visible_index++];
+			Page page = BufferGetPage(local.scan_desc->rs_cbuf);
+			ItemId lpp = PageGetItemId(page, offnum);
+			HeapTupleData tuple;
+			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lpp);
+			tuple.t_len = ItemIdGetLength(lpp);
+			tuple.t_tableOid = RelationGetRelid(local.scan_desc->rs_base.rs_rd);
+			ItemPointerSet(&(tuple.t_self), local.scan_desc->rs_cblock, offnum);
+
+			if (tuple.t_data == nullptr)
+				continue;
+
+			/* Runtime HashJoin Bloom + Min/Max filter pushdown: reject non-matching
+			 * probe keys using a single fixed-offset tuple read before running
+			 * filter_deformer, proj_deformer, or downstream hash-join probes. */
+			if (local.n_active_runtime_filters > 0)
+			{
+				const bool has_nulls = (tuple.t_data->t_infomask & HEAP_HASNULL) != 0;
+				const uint32_t tup_natts = HeapTupleHeaderGetNatts(tuple.t_data);
+				const char *tup_base = reinterpret_cast<const char *>(tuple.t_data) + tuple.t_data->t_hoff;
+				bool rf_pass = true;
+				for (uint8_t rfi = 0; rfi < local.n_active_runtime_filters; ++rfi)
 				{
-					if (af.is_int64)
+					const auto &af = local.active_runtime_filters[rfi];
+					int64_t key_val = 0;
+					if (likely(!has_nulls && af.attcacheoff >= 0 && af.attno <= tup_natts))
 					{
-						std::memcpy(&key_val, tup_base + af.attcacheoff, sizeof(int64_t));
+						if (af.is_int64)
+						{
+							std::memcpy(&key_val, tup_base + af.attcacheoff, sizeof(int64_t));
+						}
+						else
+						{
+							int32_t v32;
+							std::memcpy(&v32, tup_base + af.attcacheoff, sizeof(int32_t));
+							key_val = static_cast<int64_t>(v32);
+						}
 					}
 					else
 					{
-						int32_t v32;
-						std::memcpy(&v32, tup_base + af.attcacheoff, sizeof(int32_t));
-						key_val = static_cast<int64_t>(v32);
+						bool isnull = false;
+						Datum d = heap_getattr(&tuple, af.attno, local.scan_tupdesc, &isnull);
+						if (isnull)
+						{
+							rf_pass = false;
+							break;
+						}
+						key_val = af.is_int64 ? DatumGetInt64(d) : static_cast<int64_t>(DatumGetInt32(d));
 					}
+					if (af.has_minmax && (key_val < af.min_val || key_val > af.max_val))
+					{
+						rf_pass = false;
+						break;
+					}
+					if (af.bloom_usable)
+					{
+						const uint64_t h = RuntimeFilterHashKey(key_val);
+						const uint32_t idx = static_cast<uint32_t>(h >> 32) & af.word_mask;
+						const uint64_t mask = RuntimeFilterWordMask(h);
+						const uint64_t word = *reinterpret_cast<const uint64_t *>(&af.words[idx]);
+						if ((word & mask) != mask)
+						{
+							rf_pass = false;
+							break;
+						}
+					}
+				}
+				if (!rf_pass)
+					continue;
+			}
+
+			/* B.1 Option C: deform filter cols first (1-row scratch at row 0),
+			 * evaluate predicate inline; only on survival do we deform the
+			 * full projection at out.count and increment. Q1 rejects ~96.6%
+			 * of rows so the projection deform is short-circuited for the
+			 * vast majority of tuples. */
+			if (has_filter)
+			{
+				if (local.filter_uses_string_arena)
+					local.filter_chunk->string_arena.clear();
+				local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
+
+				bool pass;
+				if (use_simple_filter)
+				{
+					pass = EvalSimpleFilterStep(*simple_filter_step,
+						*local.filter_chunk,
+						filter_string_consts);
 				}
 				else
 				{
-					bool isnull = false;
-					Datum d = heap_getattr(&tuple, af.attno, local.scan_tupdesc, &isnull);
-					if (isnull)
+					pass = true;
+					if (required_bool_regs > 0)
+						std::memset(local.filter_bool_values, 0, required_bool_regs * sizeof(local.filter_bool_values[0]));
+					for (uint16_t expr_idx = 0; expr_idx < n_filter_exprs_; ++expr_idx)
 					{
-						rf_pass = false;
-						break;
-					}
-					key_val = af.is_int64 ? DatumGetInt64(d) : static_cast<int64_t>(DatumGetInt32(d));
-				}
-				if (af.has_minmax && (key_val < af.min_val || key_val > af.max_val))
-				{
-					rf_pass = false;
-					break;
-				}
-				if (af.bloom_usable)
-				{
-					const uint64_t h = RuntimeFilterHashKey(key_val);
-					const uint32_t idx = static_cast<uint32_t>(h >> 32) & af.word_mask;
-					const uint64_t mask = RuntimeFilterWordMask(h);
-					const uint64_t word = *reinterpret_cast<const uint64_t *>(&af.words[idx]);
-					if ((word & mask) != mask)
-					{
-						rf_pass = false;
-						break;
+						const FilterExprDesc &expr = filter_exprs[expr_idx];
+						const uint16_t expr_end = expr.first_step_idx + expr.n_steps;
+						if (expr_end > n_filter_steps_)
+							elog(ERROR, "pg_yaap: filter expression step range overflow");
+						for (uint16_t step_idx = expr.first_step_idx; step_idx < expr_end; ++step_idx)
+							EvalFilterStep(filter_steps[step_idx],
+								*local.filter_chunk,
+								filter_string_consts,
+								local.filter_bool_values);
+						if (expr.output_bool_reg >= filter_bool_regs_ ||
+						    !local.filter_bool_values[expr.output_bool_reg])
+						{
+							pass = false;
+							break;
+						}
 					}
 				}
+				if (!pass)
+					continue;
 			}
-			if (!rf_pass)
-				continue;
-		}
-
-		/* B.1 Option C: deform filter cols first (1-row scratch at row 0),
-		 * evaluate predicate inline; only on survival do we deform the
-		 * full projection at out.count and increment. Q1 rejects ~96.6%
-		 * of rows so the projection deform is short-circuited for the
-		 * vast majority of tuples. */
-		if (has_filter)
-		{
-			if (local.filter_uses_string_arena)
-				local.filter_chunk->string_arena.clear();
-			local.filter_deformer->deform_tuple_header(tuple.t_data, 0, filter_bindings);
-
-			bool pass;
-			if (use_simple_filter)
-			{
-				pass = EvalSimpleFilterStep(*simple_filter_step,
-					*local.filter_chunk,
-					filter_string_consts);
-			}
+			if (zero_col_output)
+				out.count++;
 			else
-			{
-				pass = true;
-				if (required_bool_regs > 0)
-					std::memset(local.filter_bool_values, 0, required_bool_regs * sizeof(local.filter_bool_values[0]));
-				for (uint16_t expr_idx = 0; expr_idx < n_filter_exprs_; ++expr_idx)
-				{
-					const FilterExprDesc &expr = filter_exprs[expr_idx];
-					const uint16_t expr_end = expr.first_step_idx + expr.n_steps;
-					if (expr_end > n_filter_steps_)
-						elog(ERROR, "pg_yaap: filter expression step range overflow");
-					for (uint16_t step_idx = expr.first_step_idx; step_idx < expr_end; ++step_idx)
-						EvalFilterStep(filter_steps[step_idx],
-							*local.filter_chunk,
-							filter_string_consts,
-							local.filter_bool_values);
-					if (expr.output_bool_reg >= filter_bool_regs_ ||
-					    !local.filter_bool_values[expr.output_bool_reg])
-					{
-						pass = false;
-						break;
-					}
-				}
-			}
-			if (!pass)
-				continue;
+				AppendProjectedTupleViaDeformer(out, &tuple, proj_bindings, local);
 		}
-		AppendProjectedTupleViaDeformer(out, &tuple, proj_bindings, local);
 	}
 
 	if (out.count >= PIPELINE_DEFAULT_CHUNK_SIZE)

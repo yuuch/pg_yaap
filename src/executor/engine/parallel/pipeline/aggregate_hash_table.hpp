@@ -118,6 +118,7 @@ struct HashAggSharedPayload
 	dsa_pointer local_partitions_registry_dp; /* dsa_pointer[local_state_slot_count] */
 	dsa_pointer publication_dp; /* YaapSegmentPublicationDirectory, optional */
 	pg_atomic_uint32 combine_partitions_done;
+	pg_atomic_uint32 distinct_saw_input;
 };
 
 struct PerfectHashAggSharedPayload
@@ -155,6 +156,18 @@ struct AggregateHashTableBatchProbeResult
  * Allocation size. Use with dsa_allocate0; then call AggregateHashTableInit
  * to overwrite the zero-init row_index fields with AHT_INVALID_ROW_INDEX.
  */
+inline uint16_t
+AggregateHashTableSalt(uint64_t hash)
+{
+	return static_cast<uint16_t>(hash >> 48);
+}
+
+inline uint32_t
+AggregateHashTableProbeStep(uint64_t hash)
+{
+	return static_cast<uint32_t>((hash >> 59) | UINT64CONST(1));
+}
+
 inline size_t
 AggregateHashTableAllocSize(uint32_t capacity)
 {
@@ -324,7 +337,8 @@ void AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
 										   const TupleDataCollection *src_tdc,
 										   uint32_t start_row,
 										   uint32_t count,
-										   const uint64_t *hashes);
+										   const uint64_t *hashes,
+										   uint8_t *inserted_out = nullptr);
 
 void AggregateHashTableCombineRowBatchSegmented(AggregateHashTable *aht,
 												dsa_area *dsa,

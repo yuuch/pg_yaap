@@ -1718,9 +1718,19 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 	const bool topn_output =
 		!node.final_sort_keys.empty() &&
 		node.limit_count > 0;
+	const bool unsorted_limit_output =
+		node.final_sort_keys.empty() &&
+		node.limit_count > 0;
+	const uint64_t keep_rows_u64 = (node.limit_count > 0)
+		? (node.limit_offset <= UINT64_MAX - node.limit_count
+			? node.limit_offset + node.limit_count
+			: UINT64_MAX)
+		: 0;
 	uint32_t row_capacity = EstimateInitialResultRows(queryDesc, node.estimated_groups);
 	if (topn_output)
 		row_capacity = static_cast<uint32_t>(std::max<uint64_t>(1, std::min<uint64_t>(row_capacity, node.limit_count)));
+	else if (unsorted_limit_output && keep_rows_u64 <= 4096)
+		row_capacity = static_cast<uint32_t>(std::max<uint64_t>(1, keep_rows_u64));
 	dsa_pointer segment_arena_dp = InvalidDsaPointer;
 	dsa_pointer buffer_state_dp = InvalidDsaPointer;
 	if (state->runtime_dsm != nullptr)
@@ -1738,9 +1748,11 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 			}
 		}
 	}
-	/* Small Top-N retains a bounded replacement table; larger ordered output
-	 * streams segments into PostgreSQL external sort on the leader. */
-	if (topn_output && node.limit_count <= 4096)
+	/* Small Top-N retains a bounded replacement table; unsorted small LIMIT
+	 * stops accepting rows after offset + limit; larger ordered output streams
+	 * segments into PostgreSQL external sort on the leader. */
+	if ((topn_output && node.limit_count <= 4096) ||
+		(unsorted_limit_output && keep_rows_u64 <= 4096))
 	{
 		segment_arena_dp = InvalidDsaPointer;
 		buffer_state_dp = InvalidDsaPointer;
@@ -1749,6 +1761,9 @@ BuildOutputContract(OptimizerNodeTranslation &node,
 		output_layout_dp, output_layout, row_capacity, segment_arena_dp, buffer_state_dp);
 	if (!DsaPointerIsValid(output_payload_dp))
 		return nullptr;
+	if (auto *output_payload = static_cast<pipeline::OutputSharedPayload *>(
+			dsa_get_address(state->runtime_dsa, output_payload_dp)))
+		output_payload->skip_emit_rows = node.limit_offset;
 	const dsa_pointer final_sort_keys_dp = BuildFilterArray(state->runtime_dsa,
 		node.final_sort_keys.data(),
 		sizeof(SortKeyDesc),

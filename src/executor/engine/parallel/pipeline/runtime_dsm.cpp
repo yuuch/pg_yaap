@@ -189,7 +189,12 @@ DestroyRuntimeDsm(PgYaapQueryState *state)
 					dsa_get_address(state->runtime_dsa, control->buffer_state_root))
 				: nullptr;
 			if (buffer_state != nullptr && pg_yaap_trace_execution_path)
-				ereport(LOG, (errmsg("pg_yaap memory resident=%llu peak=%llu committed=%llu spill=%llu allocations=%llu pressure_epoch=%llu dsa_total=%zu payload_limit=%llu dsa_limit=%llu",
+			{
+				auto *small_arena = buffer::YaapSharedSegmentArenaResolve(
+					state->runtime_dsa, control->shared_segment_arena_root);
+				auto *large_arena = buffer::YaapSharedSegmentArenaResolve(
+					state->runtime_dsa, control->large_shared_segment_arena_root);
+				ereport(LOG, (errmsg("pg_yaap memory resident=%llu peak=%llu committed=%llu spill=%llu allocations=%llu pressure_epoch=%llu dsa_total=%zu payload_limit=%llu dsa_limit=%llu seg256k=(cnt=%u next=%u free=%u) seg1m=(cnt=%u next=%u free=%u)",
 					(unsigned long long) buffer::YaapBufferResidentBytes(buffer_state),
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->peak_resident_bytes),
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->committed_bytes),
@@ -198,7 +203,14 @@ DestroyRuntimeDsm(PgYaapQueryState *state)
 					(unsigned long long) pg_atomic_read_u64(&buffer_state->pressure_epoch),
 					dsa_get_total_size(state->runtime_dsa),
 					(unsigned long long) buffer_state->hard_limit,
-					(unsigned long long) control->dsa_limit_bytes)));
+					(unsigned long long) control->dsa_limit_bytes,
+					small_arena ? small_arena->segment_count : 0u,
+					small_arena ? small_arena->next_segment_id : 0u,
+					small_arena ? small_arena->free_segment_count : 0u,
+					large_arena ? large_arena->segment_count : 0u,
+					large_arena ? large_arena->next_segment_id : 0u,
+					large_arena ? large_arena->free_segment_count : 0u)));
+			}
 			if (buffer_state != nullptr)
 			{
 				if (DsaPointerIsValid(control->shared_segment_arena_root))

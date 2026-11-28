@@ -47,6 +47,7 @@ static constexpr uint32_t kInitialGlobalPartitionRows = 16384;
 static constexpr uint32_t kMinLocalSegmentBackedRows = 32768;
 
 static uint32_t PartitionRowCapacity(uint32_t max_groups, uint32_t partition_count);
+static uint32_t EffectiveWorkerCount(const ExecCtx &ctx);
 static uint32_t InitialPartitionRows(const ExecCtx &ctx, const TupleDataLayout *layout,
 	uint32_t estimated_groups, uint32_t partition_count, uint32_t workers);
 static void AllocAhtForTdc(ExecCtx &ctx, dsa_pointer tdc_dp, uint32_t row_capacity,
@@ -132,8 +133,14 @@ InitDistinctGlobalPartitions(ExecCtx &ctx, HashAggSharedPayload *payload,
 		payload->distinct_partitions_dp));
 	const uint32_t per_partition_groups = PartitionRowCapacity(payload->max_groups,
 		payload->partition_count);
-	const uint32_t initial_rows = std::max<uint32_t>(1,
-		std::min(per_partition_groups, kInitialGlobalPartitionRows));
+	const uint32_t workers = EffectiveWorkerCount(ctx);
+	const uint32_t target_groups = (layout->column_count == 0)
+		? std::max<uint32_t>(payload->max_groups, 1u << 20)
+		: std::max<uint32_t>(per_partition_groups, 256u) * payload->partition_count;
+	const uint32_t initial_rows = (layout->column_count == 0)
+		? InitialPartitionRows(ctx, distinct_layout, target_groups,
+			payload->partition_count, workers)
+		: std::max<uint32_t>(1u, std::min(per_partition_groups, kInitialGlobalPartitionRows));
 	for (uint32_t part_idx = 0; part_idx < payload->partition_count; ++part_idx)
 	{
 		HashAggPartition &part = parts[part_idx];
@@ -151,11 +158,11 @@ InitDistinctGlobalPartitions(ExecCtx &ctx, HashAggSharedPayload *payload,
 }
 
 static void
-CopyTdcRow(const TupleDataLayout *layout,
-	       const TupleDataCollection *src_tdc,
-	       const uint8_t *src_row,
-	       TupleDataCollection *dst_tdc,
-	       uint8_t *dst_row)
+CopyTdcGroupColumns(const TupleDataLayout *layout,
+                    const TupleDataCollection *src_tdc,
+                    const uint8_t *src_row,
+                    TupleDataCollection *dst_tdc,
+                    uint8_t *dst_row)
 {
 	for (uint16_t col_idx = 0; col_idx < layout->column_count; ++col_idx)
 	{
@@ -175,6 +182,16 @@ CopyTdcRow(const TupleDataLayout *layout,
 			elog(ERROR, "pg_yaap: hash aggregate TDC copy ran out of heap");
 		std::memcpy(dst_row + col.offset, &dst_ref, sizeof(dst_ref));
 	}
+}
+
+static void
+CopyTdcRow(const TupleDataLayout *layout,
+	       const TupleDataCollection *src_tdc,
+	       const uint8_t *src_row,
+	       TupleDataCollection *dst_tdc,
+	       uint8_t *dst_row)
+{
+	CopyTdcGroupColumns(layout, src_tdc, src_row, dst_tdc, dst_row);
 
 	for (uint16_t agg_idx = 0; agg_idx < layout->aggregate_count; ++agg_idx)
 	{
@@ -349,7 +366,8 @@ static bool
 TryInitSegmentBackedTdc(ExecCtx &ctx, HashAggPartition &part,
 						 dsa_pointer layout_dp, const TupleDataLayout *layout,
 							 uint32_t partition_count, uint32_t row_capacity,
-							 bool allow_wide_worker_strings = false)
+							 bool allow_wide_worker_strings = false,
+							 bool prefer_large_arena = false)
 {
 	if (!CanUseSegmentBackedLocalTdc(layout, partition_count) ||
 		ctx.control == nullptr ||
@@ -371,14 +389,18 @@ TryInitSegmentBackedTdc(ExecCtx &ctx, HashAggPartition &part,
 	uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(layout, row_capacity);
 	const uint64_t required_bytes = offsetof(TupleDataCollection, rows) +
 		static_cast<uint64_t>(row_capacity) * layout->row_width + heap_capacity;
-	if (required_bytes > arena->segment_size)
+	if (required_bytes > arena->segment_size ||
+		(prefer_large_arena && DsaPointerIsValid(ctx.control->large_shared_segment_arena_root)))
 	{
 		dsa_pointer large_dp = ctx.control->large_shared_segment_arena_root;
 		auto *large_arena = buffer::YaapSharedSegmentArenaResolve(ctx.dsa, large_dp);
-		if (large_arena == nullptr || required_bytes > large_arena->segment_size)
+		if (large_arena != nullptr && required_bytes <= large_arena->segment_size)
+		{
+			arena_dp = large_dp;
+			arena = large_arena;
+		}
+		else if (required_bytes > arena->segment_size)
 			return false;
-		arena_dp = large_dp;
-		arena = large_arena;
 	}
 	/* Fill the chosen segment's full capacity proportionally so high-cardinality
 	 * string aggregations don't waste the majority of each fixed segment. */
@@ -809,7 +831,8 @@ ReleaseLocalPartitionArrays(ExecCtx &ctx, HashAggSharedPayload *payload)
 }
 
 static void GrowLocalTdc(ExecCtx &ctx,
-                         HashAggLocalSinkState &local,
+                         const TupleDataLayout *layout,
+                         dsa_pointer layout_dp,
 	                         HashAggPartition &part,
 	                         uint32_t required_heap_bytes,
 	                         uint32_t incoming_rows = 1u);
@@ -903,7 +926,7 @@ SinkChunkPerfectHash(ExecCtx &ctx,
 		{
 			while (pg_atomic_read_u32(&tdc->row_count) >= tdc->row_capacity)
 			{
-				GrowLocalTdc(ctx, local, part, 0);
+				GrowLocalTdc(ctx, local.layout, local.layout_dp, part, 0);
 				tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 				if (tdc == nullptr)
 					elog(ERROR, "pg_yaap: perfect hash aggregate TDC missing after grow");
@@ -985,7 +1008,7 @@ SinkChunkSingleState(ExecCtx &ctx,
 			row_indices.data(), in.count);
 		while (!TupleDataCollectionHasSpaceForAppend(tdc, req_heap))
 		{
-			GrowLocalTdc(ctx, local, part, req_heap);
+			GrowLocalTdc(ctx, local.layout, local.layout_dp, part, req_heap);
 			tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 			if (tdc == nullptr)
 				elog(ERROR, "pg_yaap: single-state hash aggregate TDC missing after grow");
@@ -1237,7 +1260,8 @@ ProjectedLocalGrowBytes(const TupleDataLayout *layout,
 
 static void
 GrowLocalTdc(ExecCtx &ctx,
-             HashAggLocalSinkState &local,
+             const TupleDataLayout *layout,
+             dsa_pointer layout_dp,
 	             HashAggPartition &part,
 	             uint32_t required_heap_bytes,
 	             uint32_t incoming_rows)
@@ -1253,22 +1277,22 @@ GrowLocalTdc(ExecCtx &ctx,
 		elog(ERROR, "pg_yaap: local hash aggregate partition TDC missing");
 	const uint32_t old_count = pg_atomic_read_u32(&old_tdc->row_count);
 	const uint32_t new_capacity = NextTdcRowCapacity(old_tdc,
-		local.layout->row_width,
+		layout->row_width,
 		required_heap_bytes,
 		incoming_rows);
-	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(local.layout,
+	const uint32_t heap_capacity = TupleDataCollectionGrowHeapCapacity(layout,
 		old_tdc,
 		new_capacity,
 		required_heap_bytes);
 	dsa_pointer new_tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
 		new_capacity,
-		local.layout->row_width,
+		layout->row_width,
 		heap_capacity);
 	auto *new_tdc = ResolveTdc(ctx.dsa, new_tdc_dp);
 	TupleDataCollectionInit(new_tdc,
 		new_capacity,
-		local.layout->row_width,
-		local.layout_dp,
+		layout->row_width,
+		layout_dp,
 		heap_capacity);
 
 	for (uint32_t row_idx = 0; row_idx < old_count; ++row_idx)
@@ -1278,14 +1302,14 @@ GrowLocalTdc(ExecCtx &ctx,
 		if (copied_idx == TDC_INVALID_ROW_INDEX)
 			elog(ERROR, "pg_yaap: local hash aggregate TDC grow copy overflow");
 		const uint8_t *src = TupleDataCollectionGetRowConst(old_tdc, row_idx);
-		CopyTdcRow(local.layout, old_tdc, src, new_tdc, dst);
+		CopyTdcRow(layout, old_tdc, src, new_tdc, dst);
 	}
 
 	const uint32_t capacity = AggregateHashTableChooseCapacity(new_capacity);
 	dsa_pointer new_aht_dp = YaapDsaAllocateZero(ctx.dsa, AggregateHashTableAllocSize(capacity));
 	AggregateHashTable *new_aht = static_cast<AggregateHashTable *>(dsa_get_address(ctx.dsa, new_aht_dp));
 	AggregateHashTableInit(new_aht, capacity, new_tdc_dp);
-	AggregateHashTableRehash(new_aht, new_tdc, local.layout);
+	AggregateHashTableRehash(new_aht, new_tdc, layout);
 	part.tdc_dp = new_tdc_dp;
 	part.aht_dp = new_aht_dp;
 	DestroyAht(ctx, old_aht_dp);
@@ -1786,13 +1810,13 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 		const uint32_t workers = EffectiveWorkerCount(ctx);
 		if (use_single_state)
 			state->max_groups = 1;
-		const uint32_t max_parts = state->max_groups >= 200000u ? 64u : 32u;
+		const bool has_distinct_count = GetSingleDistinctCountAgg(state->layout);
+		const uint32_t max_parts = (state->max_groups >= 200000u || has_distinct_count) ? 64u : 32u;
 		state->partition_count = (use_perfect_hash || use_single_state) ? 1u :
 			std::min(max_parts, HashAggChoosePartitionCount(workers, state->layout->row_width));
 		const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 		const uint32_t initial_global_partition_rows = InitialPartitionRows(ctx, state->layout,
 			state->max_groups, state->partition_count, workers);
-		const bool has_distinct_count = GetSingleDistinctCountAgg(state->layout);
 
 		if (!DsaPointerIsValid(state->shared_payload_dp))
 			state->shared_payload_dp = dsa_allocate0(ctx.dsa, sizeof(HashAggSharedPayload));
@@ -1810,20 +1834,39 @@ PhysicalHashAggregate::GetGlobalSinkState(ExecCtx &ctx)
 			static_cast<size_t>(state->payload->local_state_slot_count) * sizeof(dsa_pointer));
 		state->payload->publication_dp = InvalidDsaPointer;
 		pg_atomic_init_u32(&state->payload->combine_partitions_done, 0);
+		pg_atomic_init_u32(&state->payload->distinct_saw_input, 0);
 		state->partitions = ResolvePartitions(ctx.dsa, state->payload);
 		auto *registry = ResolveLocalRegistry(ctx.dsa, state->payload);
 		for (uint32_t slot = 0; slot < state->payload->local_state_slot_count; ++slot)
 			registry[slot] = InvalidDsaPointer;
+
+		uint32_t global_aht_init_rows = initial_global_partition_rows;
+		if (auto *budget = ResolveBufferState(ctx);
+			budget != nullptr && budget->hard_limit > 0 && state->partition_count > 0)
+		{
+			const uint64_t aht_budget_divisor = state->max_groups >= 10000000u ? 8u : 32u;
+			const uint32_t aht_cap_rows = state->max_groups >= 10000000u ? 524288u : 131072u;
+			const uint64_t per_part_aht_budget =
+				std::max<uint64_t>(AggregateHashTableAllocSize(32u),
+					(budget->hard_limit / aht_budget_divisor) / state->partition_count);
+			uint32_t capped = std::min<uint32_t>(per_partition_groups, aht_cap_rows);
+			while (capped > initial_global_partition_rows &&
+				   AggregateHashTableAllocSize(AggregateHashTableChooseCapacity(capped)) > per_part_aht_budget)
+				capped >>= 1;
+			if (capped > global_aht_init_rows)
+				global_aht_init_rows = capped;
+		}
+		const bool prefer_large_arena = state->max_groups >= 200000u;
 
 		for (uint32_t part_idx = 0; part_idx < state->partition_count; ++part_idx)
 		{
 			HashAggPartition &part = state->partitions[part_idx];
 			LWLockInitialize(&part.mutex, LWTRANCHE_PARALLEL_QUERY_DSA);
 			if (!has_distinct_count && TryInitSegmentBackedTdc(ctx, part, state->layout_dp, state->layout,
-								state->partition_count, initial_global_partition_rows, true))
+								state->partition_count, initial_global_partition_rows, true, prefer_large_arena))
 			{
 				AggregateHashTable *aht = nullptr;
-				AllocAhtForTdc(ctx, part.tdc_dp, initial_global_partition_rows,
+				AllocAhtForTdc(ctx, part.tdc_dp, global_aht_init_rows,
 						   &part.aht_dp, &aht);
 				AggregateHashTableEnableSegmentRefs(ctx.dsa, aht, initial_global_partition_rows);
 				continue;
@@ -1890,7 +1933,9 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 	state->perfect_capacity = global.payload->perfect_hash_capacity;
 	state->use_perfect_hash = state->perfect_capacity > 0;
 	state->has_distinct_count = GetSingleDistinctCountAgg(state->layout, &state->distinct_agg_idx);
-	if (state->has_distinct_count)
+	const bool local_distinct_mode = state->has_distinct_count &&
+		state->layout->aggregate_count == 1;
+	if (state->has_distinct_count && !local_distinct_mode)
 	{
 		state->use_perfect_hash = false;
 		state->perfect_capacity = 0;
@@ -1899,10 +1944,16 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		state->partition_shift = HashAggPartitionShift(state->partition_mask);
 		state->distinct_layout = global.distinct_layout;
 		state->distinct_layout_dp = global.distinct_layout_dp;
-		/* COUNT(DISTINCT) updates shared, partition-locked sets directly.  It
-		 * has no worker-local state to combine, so avoid allocating duplicate
-		 * local AHTs proportional to worker count. */
+		/* Multi-aggregate COUNT(DISTINCT) shares group state directly on
+		 * global partitions; skip duplicate local AHT allocations here. */
 		return state;
+	}
+	if (local_distinct_mode)
+	{
+		state->use_perfect_hash = false;
+		state->perfect_capacity = 0;
+		state->distinct_layout = global.distinct_layout;
+		state->distinct_layout_dp = global.distinct_layout_dp;
 	}
 	if (state->use_perfect_hash)
 	{
@@ -1911,14 +1962,18 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 		state->partition_shift = 0;
 		state->perfect_row_indices.assign(state->perfect_capacity, TDC_INVALID_ROW_INDEX);
 	}
+	const TupleDataLayout *local_layout = local_distinct_mode ? state->distinct_layout : state->layout;
+	const dsa_pointer local_layout_dp = local_distinct_mode ? state->distinct_layout_dp : global.layout_dp;
 	const uint32_t per_partition_groups = PartitionRowCapacity(state->max_groups, state->partition_count);
 	/* Cardinality estimates are global upper bounds.  Reserving that capacity
 	 * in every worker/partition multiplies a sparse aggregation (Q1 has four
 	 * groups) by workers × partitions.  Start bounded and grow on demand. */
 	const uint32_t workers = EffectiveWorkerCount(ctx);
-	const uint32_t local_groups = static_cast<uint32_t>(
+	uint32_t local_groups = static_cast<uint32_t>(
 		(static_cast<uint64_t>(state->max_groups) + workers - 1u) / workers);
-	const uint32_t initial_local_partition_rows = InitialPartitionRows(ctx, state->layout,
+	if (local_distinct_mode && state->layout->column_count == 0)
+		local_groups = std::max<uint32_t>(local_groups, 524288u);
+	const uint32_t initial_local_partition_rows = InitialPartitionRows(ctx, local_layout,
 		local_groups, state->partition_count, workers);
 	state->initial_partition_rows = initial_local_partition_rows;
 
@@ -1958,17 +2013,17 @@ PhysicalHashAggregate::GetLocalSinkState(ExecCtx &ctx, GlobalSinkState &gstate)
 			state->segmented_writers[part_idx].segment_count = 1;
 			continue;
 		}
-		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(state->layout,
+		const uint32_t heap_capacity = TupleDataCollectionDefaultHeapCapacity(local_layout,
 			initial_local_partition_rows);
 		part.tdc_dp = TupleDataCollectionAllocate(ctx.dsa,
 			initial_local_partition_rows,
-			state->layout->row_width,
+			local_layout->row_width,
 			heap_capacity);
 		auto *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
 		TupleDataCollectionInit(tdc,
 			initial_local_partition_rows,
-			state->layout->row_width,
-			global.layout_dp,
+			local_layout->row_width,
+			local_layout_dp,
 			heap_capacity);
 		AggregateHashTable *aht = nullptr;
 		AllocAhtForTdc(ctx, part.tdc_dp, initial_local_partition_rows, &part.aht_dp, &aht);
@@ -1990,14 +2045,244 @@ FlushLocalPartitionToGlobal(ExecCtx &ctx,
                             uint32_t part_idx,
                             uint64_t budget_bytes);
 
+static void
+InsertNullDistinctGroupRows(ExecCtx &ctx,
+                            HashAggGlobalSinkState &global,
+                            HashAggLocalSinkState &local,
+                            PipelineChunk &in,
+                            const uint16_t *null_rows,
+                            uint16_t null_count)
+{
+	if (null_count == 0 || local.layout->column_count == 0)
+		return;
+	std::array<uint64_t, PIPELINE_DEFAULT_CHUNK_SIZE> hashes;
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> partitions;
+	std::array<AggregateHashTableBatchProbeInput, PIPELINE_DEFAULT_CHUNK_SIZE> inputs;
+	std::array<AggregateHashTableBatchProbeResult, PIPELINE_DEFAULT_CHUNK_SIZE> results;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> part_rows;
+	for (uint16_t i = 0; i < null_count; ++i)
+	{
+		const uint16_t row_idx = null_rows[i];
+		hashes[row_idx] = HashGroup(local.layout, in, row_idx);
+		partitions[row_idx] = static_cast<uint32_t>(hashes[row_idx] >> local.partition_shift) &
+			local.partition_mask;
+	}
+	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
+	{
+		uint16_t cnt = 0;
+		for (uint16_t i = 0; i < null_count; ++i)
+		{
+			const uint16_t row_idx = null_rows[i];
+			if (partitions[row_idx] == part_idx)
+				part_rows[cnt++] = row_idx;
+		}
+		if (cnt == 0)
+			continue;
+		HashAggPartition &group_part = global.partitions[part_idx];
+		LWLockAcquire(&group_part.mutex, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			TupleDataCollection *group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
+			while (PartitionNeedsGrowForChunkBatch(local.layout, group_tdc,
+				in, part_rows.data(), cnt))
+			{
+				GrowTdcForPartition(ctx, global.layout_dp, local.layout, group_part,
+					RequiredHeapBytesForChunkRows(local.layout, in, part_rows.data(), cnt),
+					cnt);
+				group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
+			}
+			for (uint16_t i = 0; i < cnt; ++i)
+			{
+				inputs[i].row_idx = part_rows[i];
+				inputs[i].hash = hashes[part_rows[i]];
+			}
+			AggregateHashTableFindOrInsertBatch(ResolveAht(ctx.dsa, group_part.aht_dp),
+				group_tdc, local.layout, in, inputs.data(), cnt, results.data());
+			if (AggregateHashTableShouldResize(ResolveAht(ctx.dsa, group_part.aht_dp), group_tdc))
+				ResizeAhtForTdc(ctx, group_part.tdc_dp, group_tdc, local.layout, &group_part.aht_dp);
+		}
+		PG_CATCH();
+		{
+			LWLockRelease(&group_part.mutex);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		LWLockRelease(&group_part.mutex);
+	}
+}
+
+static SinkResultType
+SinkChunkDistinctLocal(ExecCtx &ctx, HashAggLocalSinkState &local,
+                       HashAggGlobalSinkState &global, PipelineChunk &in)
+{
+	if (in.count == 0)
+		return SinkResultType::NEED_MORE_INPUT;
+	if (!local.saw_distinct_input && global.payload != nullptr)
+	{
+		pg_atomic_write_u32(&global.payload->distinct_saw_input, 1);
+		local.saw_distinct_input = true;
+	}
+	const TdcAggregateDesc &distinct_agg = local.layout->aggregates[local.distinct_agg_idx];
+	const uint8_t *const distinct_nulls = in.nulls[distinct_agg.src_col_idx];
+	const bool unkeyed = (local.layout->column_count == 0);
+	const bool dedup_unkeyed_empty_str = unkeyed && distinct_agg.input_is_string != 0;
+	const VecStringRef *const distinct_strs = dedup_unkeyed_empty_str
+		? in.string_columns[distinct_agg.src_col_idx] : nullptr;
+
+	std::array<uint64_t, PIPELINE_DEFAULT_CHUNK_SIZE> distinct_hashes;
+	std::array<uint32_t, PIPELINE_DEFAULT_CHUNK_SIZE> partitions;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> probe_rows;
+	std::array<uint16_t, PIPELINE_DEFAULT_CHUNK_SIZE> null_rows;
+	std::array<AggregateHashTableBatchProbeInput, PIPELINE_DEFAULT_CHUNK_SIZE> probe_inputs;
+	std::array<AggregateHashTableBatchProbeResult, PIPELINE_DEFAULT_CHUNK_SIZE> probe_results;
+
+	constexpr uint32_t kInlinePartitionCap = 64;
+	std::array<uint16_t, kInlinePartitionCap> part_counts{};
+	std::array<uint16_t, kInlinePartitionCap> part_offsets{};
+	std::array<uint16_t, kInlinePartitionCap> part_write{};
+	const bool use_radix_scatter = local.partition_count <= kInlinePartitionCap;
+	uint16_t null_count = 0;
+
+	for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+	{
+		if (PipelineCancelRequestedEvery(ctx, row_idx))
+			return SinkResultType::FINISHED;
+		if (distinct_nulls[row_idx] != 0)
+		{
+			if (!unkeyed)
+				null_rows[null_count++] = row_idx;
+			partitions[row_idx] = UINT32_MAX;
+			continue;
+		}
+		if (dedup_unkeyed_empty_str && distinct_strs[row_idx].len == 0)
+		{
+			if (local.seen_empty_distinct_str)
+			{
+				partitions[row_idx] = UINT32_MAX;
+				continue;
+			}
+			local.seen_empty_distinct_str = true;
+		}
+		const uint64_t dh = HashGroup(local.distinct_layout, in, row_idx);
+		distinct_hashes[row_idx] = dh;
+		const uint64_t ph = unkeyed ? dh : HashGroup(local.layout, in, row_idx);
+		const uint32_t p = static_cast<uint32_t>(ph >> local.partition_shift) &
+			local.partition_mask;
+		partitions[row_idx] = p;
+		if (use_radix_scatter)
+			++part_counts[p];
+	}
+
+	if (null_count > 0)
+		InsertNullDistinctGroupRows(ctx, global, local, in, null_rows.data(), null_count);
+
+	if (use_radix_scatter)
+	{
+		uint16_t offset = 0;
+		for (uint32_t p = 0; p < local.partition_count; ++p)
+		{
+			part_offsets[p] = offset;
+			part_write[p] = offset;
+			offset += part_counts[p];
+		}
+		for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+		{
+			const uint32_t p = partitions[row_idx];
+			if (p != UINT32_MAX)
+				probe_rows[part_write[p]++] = row_idx;
+		}
+	}
+
+	const uint64_t local_flush_budget = LocalPartitionFlushBudgetBytes(ctx, local.partition_count);
+	for (uint32_t part_idx = 0; part_idx < local.partition_count; ++part_idx)
+	{
+		if (PipelineCancelRequestedEvery(ctx, part_idx))
+			return SinkResultType::FINISHED;
+		uint16_t probe_count = 0;
+		uint16_t *part_rows = probe_rows.data();
+		if (use_radix_scatter)
+		{
+			probe_count = part_counts[part_idx];
+			part_rows = probe_rows.data() + part_offsets[part_idx];
+		}
+		else
+		{
+			for (uint16_t row_idx = 0; row_idx < in.count; ++row_idx)
+			{
+				if (partitions[row_idx] == part_idx)
+					probe_rows[probe_count++] = row_idx;
+			}
+		}
+		if (probe_count == 0)
+			continue;
+
+		HashAggPartition &part = local.local_partitions[part_idx];
+		TupleDataCollection *tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+		if (tdc == nullptr)
+			elog(ERROR, "pg_yaap: local distinct hash aggregate TDC missing");
+		if (PartitionNeedsGrowForChunkBatch(local.distinct_layout, tdc, in, part_rows, probe_count))
+		{
+			const uint32_t req_heap = RequiredHeapBytesForChunkRows(local.distinct_layout,
+				in, part_rows, probe_count);
+			if (pg_atomic_read_u32(&tdc->row_count) > 0 &&
+				ProjectedLocalGrowBytes(local.distinct_layout, tdc, req_heap, probe_count) > local_flush_budget)
+			{
+				FlushLocalPartitionToGlobal(ctx, global, local, part_idx, local_flush_budget);
+				tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+				if (tdc == nullptr)
+					elog(ERROR, "pg_yaap: local distinct hash aggregate TDC missing after flush");
+			}
+		}
+		while (PartitionNeedsGrowForChunkBatch(local.distinct_layout, tdc, in, part_rows, probe_count))
+		{
+			GrowLocalTdc(ctx,
+				local.distinct_layout,
+				local.distinct_layout_dp,
+				part,
+				RequiredHeapBytesForChunkRows(local.distinct_layout, in, part_rows, probe_count),
+				probe_count);
+			tdc = ResolveTdc(ctx.dsa, part.tdc_dp);
+			if (tdc == nullptr)
+				elog(ERROR, "pg_yaap: local distinct hash aggregate TDC missing after grow");
+		}
+		AggregateHashTable *aht = ResolveAht(ctx.dsa, part.aht_dp);
+		for (uint16_t i = 0; i < probe_count; ++i)
+		{
+			const uint16_t row_idx = part_rows[i];
+			probe_inputs[i].row_idx = row_idx;
+			probe_inputs[i].hash = distinct_hashes[row_idx];
+		}
+		AggregateHashTableFindOrInsertBatch(aht,
+			tdc,
+			local.distinct_layout,
+			in,
+			probe_inputs.data(),
+			probe_count,
+			probe_results.data());
+		if (AggregateHashTableShouldResize(aht, tdc))
+		{
+			ResizeAhtForTdc(ctx,
+				part.tdc_dp,
+				tdc,
+				local.distinct_layout,
+				&part.aht_dp);
+		}
+	}
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
 SinkResultType
 PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkInput &input)
 {
 	auto &global = static_cast<HashAggGlobalSinkState &>(input.global_state);
 	auto &local = static_cast<HashAggLocalSinkState &>(input.local_state);
 	if (local.has_distinct_count)
+	{
+		if (local.layout->aggregate_count == 1)
+			return SinkChunkDistinctLocal(ctx, local, global, in);
 		return SinkChunkDistinctCountShared(ctx, local, global, in);
-	if (local.layout->column_count == 0 && local.layout->aggregate_count > 0)
+	}
+	if (pg_yaap_trace_hooks && local.layout->column_count == 0 && local.layout->aggregate_count > 0)
 		elog(LOG,
 		     "pg_yaap: HashAgg.SinkChunk in_count=%u partitions=%u perfect=%d",
 		     in.count,
@@ -2133,7 +2418,8 @@ PhysicalHashAggregate::SinkChunk(ExecCtx &ctx, PipelineChunk &in, OperatorSinkIn
 		while (PartitionNeedsGrowForChunkBatch(local.layout, tdc, in, part_rows, probe_count))
 		{
 			GrowLocalTdc(ctx,
-				local,
+				local.layout,
+				local.layout_dp,
 				part,
 				RequiredHeapBytesForChunkRows(local.layout, in, part_rows, probe_count),
 				probe_count);
@@ -2284,6 +2570,179 @@ CombineTdcIntoGlobal(ExecCtx &ctx, HashAggGlobalSinkState &global,
 }
 
 static void
+IncrementDistinctGroupsInGlobal(ExecCtx &ctx,
+                                HashAggGlobalSinkState &global,
+                                HashAggPartition &group_part,
+                                const TupleDataCollection *src_tdc,
+                                const uint32_t *new_row_indices,
+                                uint32_t new_count,
+                                uint16_t distinct_agg_idx)
+{
+	if (new_count == 0)
+		return;
+	const bool has_group_strings = LayoutHasStringRef(global.layout);
+	uint64_t req_group_heap = 0;
+	if (has_group_strings)
+	{
+		for (uint32_t j = 0; j < new_count; ++j)
+		{
+			const uint8_t *r = TupleDataCollectionGetRowConst(src_tdc, new_row_indices[j]);
+			req_group_heap += TupleDataCollectionRequiredHeapBytesForRow(global.layout, src_tdc, r);
+		}
+	}
+	const uint32_t req_heap = req_group_heap > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(req_group_heap);
+	TupleDataCollection *group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
+	while (static_cast<uint64_t>(pg_atomic_read_u32(&group_tdc->row_count)) + new_count > group_tdc->row_capacity ||
+		   !TupleDataCollectionHasSpaceForAppend(group_tdc, req_heap))
+	{
+		GrowTdcForPartition(ctx, global.layout_dp, global.layout, group_part, req_heap, new_count);
+		group_tdc = ResolveTdc(ctx.dsa, group_part.tdc_dp);
+	}
+	ResizeAhtForTdc(ctx, group_part.tdc_dp, group_tdc, global.layout, &group_part.aht_dp, new_count);
+	AggregateHashTable *group_aht = ResolveAht(ctx.dsa, group_part.aht_dp);
+	const uint32_t mask = group_aht->capacity_mask;
+	const uint16_t agg_off = global.layout->aggregates[distinct_agg_idx].offset;
+
+	constexpr uint32_t kPrefetchBatch = 64;
+	std::array<const uint8_t *, kPrefetchBatch> src_rows;
+	std::array<uint64_t, kPrefetchBatch> group_hashes;
+	for (uint32_t base = 0; base < new_count; base += kPrefetchBatch)
+	{
+		const uint32_t batch = std::min(kPrefetchBatch, new_count - base);
+		for (uint32_t k = 0; k < batch; ++k)
+		{
+			const uint8_t *src_row = TupleDataCollectionGetRowConst(src_tdc, new_row_indices[base + k]);
+			src_rows[k] = src_row;
+			const uint64_t gh = HashGroupRow(global.layout, src_tdc, src_row);
+			group_hashes[k] = gh;
+			__builtin_prefetch(&group_aht->entries[static_cast<uint32_t>(gh) & mask], 1, 3);
+		}
+		for (uint32_t k = 0; k < batch; ++k)
+		{
+			const uint8_t *src_row = src_rows[k];
+			const uint64_t gh = group_hashes[k];
+			const uint16_t salt = AggregateHashTableSalt(gh);
+			const uint32_t step = AggregateHashTableProbeStep(gh);
+			uint32_t slot = static_cast<uint32_t>(gh) & mask;
+			bool done = false;
+			for (uint32_t tries = 0; tries < group_aht->capacity; ++tries)
+			{
+				AggHtEntry &e = group_aht->entries[slot];
+				if (e.value == AHT_EMPTY_ENTRY_VALUE)
+				{
+					uint8_t *new_row = nullptr;
+					const uint32_t new_idx = TupleDataCollectionAppendRow(group_tdc, &new_row);
+					if (new_idx == TDC_INVALID_ROW_INDEX)
+						elog(ERROR, "pg_yaap: global distinct group TDC full");
+					CopyTdcGroupColumns(global.layout, src_tdc, src_row, group_tdc, new_row);
+					int64_t one = 1;
+					std::memcpy(new_row + agg_off, &one, sizeof(one));
+					e.value = (static_cast<uint64_t>(salt) << 48) |
+						(static_cast<uint64_t>(new_idx) & AHT_ROW_INDEX_MASK);
+					done = true;
+					break;
+				}
+				if (static_cast<uint16_t>(e.value >> 48) == salt)
+				{
+					const uint32_t existing_idx = static_cast<uint32_t>(e.value & AHT_ROW_INDEX_MASK);
+					uint8_t *existing_ptr = TupleDataCollectionGetRow(group_tdc, existing_idx);
+					if (MatchGroupRow(global.layout, src_tdc, src_row, group_tdc, existing_ptr))
+					{
+						int64_t cur = 0;
+						std::memcpy(&cur, existing_ptr + agg_off, sizeof(cur));
+						cur += 1;
+						std::memcpy(existing_ptr + agg_off, &cur, sizeof(cur));
+						done = true;
+						break;
+					}
+				}
+				slot = (slot + step) & mask;
+			}
+			if (!done)
+				elog(ERROR, "pg_yaap: global distinct group AHT full (capacity=%u)", group_aht->capacity);
+		}
+	}
+}
+
+static void
+CombineDistinctTdcIntoGlobal(ExecCtx &ctx,
+                             HashAggGlobalSinkState &global,
+                             uint32_t part_idx,
+                             const TupleDataCollection *local_distinct_tdc)
+{
+	if (local_distinct_tdc == nullptr || global.distinct_partitions == nullptr ||
+		global.distinct_layout == nullptr)
+		return;
+	const uint32_t count = pg_atomic_read_u32(
+		const_cast<pg_atomic_uint32 *>(&local_distinct_tdc->row_count));
+	if (count == 0)
+		return;
+
+	uint16_t distinct_agg_idx = UINT16_MAX;
+	(void) GetSingleDistinctCountAgg(global.layout, &distinct_agg_idx);
+	const bool keyed = (global.layout->column_count > 0);
+	const bool has_strings = LayoutHasStringRef(global.distinct_layout);
+	HashAggPartition &distinct_part = global.distinct_partitions[part_idx];
+	TupleDataCollection *distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+	AggregateHashTable *distinct_aht = ResolveAht(ctx.dsa, distinct_part.aht_dp);
+	if (distinct_tdc == nullptr || distinct_aht == nullptr)
+		elog(ERROR, "pg_yaap: global distinct partition missing");
+
+	constexpr uint32_t kCombineBatch = 64;
+	std::array<uint64_t, kCombineBatch> hashes;
+	std::array<uint8_t, kCombineBatch> inserted_flags;
+	std::array<uint32_t, kCombineBatch> new_row_indices;
+
+	for (uint32_t base = 0; base < count; base += kCombineBatch)
+	{
+		if (PipelineCancelRequested(ctx))
+			return;
+		const uint32_t batch = std::min(kCombineBatch, count - base);
+		uint64_t req_heap_total = 0;
+		for (uint32_t i = 0; i < batch; ++i)
+		{
+			const uint8_t *row = TupleDataCollectionGetRowConst(local_distinct_tdc, base + i);
+			hashes[i] = HashGroupRow(global.distinct_layout, local_distinct_tdc, row);
+			if (has_strings)
+				req_heap_total += TupleDataCollectionRequiredHeapBytesForRow(
+					global.distinct_layout, local_distinct_tdc, row);
+		}
+		const uint32_t req_heap = req_heap_total > UINT32_MAX ? UINT32_MAX
+			: static_cast<uint32_t>(req_heap_total);
+		while (static_cast<uint64_t>(pg_atomic_read_u32(&distinct_tdc->row_count)) + batch > distinct_tdc->row_capacity ||
+			   !TupleDataCollectionHasSpaceForAppend(distinct_tdc, req_heap))
+		{
+			GrowTdcForPartition(ctx, global.distinct_layout_dp, global.distinct_layout,
+				distinct_part, req_heap, batch);
+			distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+			distinct_aht = ResolveAht(ctx.dsa, distinct_part.aht_dp);
+		}
+		while (static_cast<uint64_t>(pg_atomic_read_u32(&distinct_tdc->row_count) + batch) * 3u >=
+			   static_cast<uint64_t>(distinct_aht->capacity) * 2u)
+		{
+			ResizeAhtForTdc(ctx, distinct_part.tdc_dp, distinct_tdc, global.distinct_layout,
+				&distinct_part.aht_dp, batch);
+			distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+			distinct_aht = ResolveAht(ctx.dsa, distinct_part.aht_dp);
+		}
+		AggregateHashTableCombineRowBatchFlat(distinct_aht, distinct_tdc, global.distinct_layout,
+			local_distinct_tdc, base, batch, hashes.data(),
+			keyed ? inserted_flags.data() : nullptr);
+
+		if (keyed)
+		{
+			uint32_t new_count = 0;
+			for (uint32_t i = 0; i < batch; ++i)
+				if (inserted_flags[i] != 0)
+					new_row_indices[new_count++] = base + i;
+			if (new_count > 0)
+				IncrementDistinctGroupsInGlobal(ctx, global, global.partitions[part_idx],
+					local_distinct_tdc, new_row_indices.data(), new_count, distinct_agg_idx);
+		}
+	}
+}
+
+static void
 FlushLocalPartitionToGlobal(ExecCtx &ctx,
                             HashAggGlobalSinkState &global,
                             HashAggLocalSinkState &local,
@@ -2299,12 +2758,20 @@ FlushLocalPartitionToGlobal(ExecCtx &ctx,
 	if (prev_rows == 0)
 		return;
 
-	HashAggPartition &global_part =
-		global.partitions[part_idx & global.payload->partition_mask];
+	const bool distinct_local_mode = local.has_distinct_count &&
+		local.layout->aggregate_count == 1;
+	const TupleDataLayout *local_layout = distinct_local_mode ? local.distinct_layout : local.layout;
+	const dsa_pointer local_layout_dp = distinct_local_mode ? global.distinct_layout_dp : global.layout_dp;
+
+	const uint32_t global_idx = part_idx & global.payload->partition_mask;
+	HashAggPartition &global_part = global.partitions[global_idx];
 	LWLockAcquire(&global_part.mutex, LW_EXCLUSIVE);
 	PG_TRY();
 	{
-		CombineTdcIntoGlobal(ctx, global, global_part, tdc);
+		if (distinct_local_mode)
+			CombineDistinctTdcIntoGlobal(ctx, global, global_idx, tdc);
+		else
+			CombineTdcIntoGlobal(ctx, global, global_part, tdc);
 	}
 	PG_CATCH();
 	{
@@ -2333,12 +2800,12 @@ FlushLocalPartitionToGlobal(ExecCtx &ctx,
 	ReleasePartitionBacking(ctx, local_part);
 	const uint32_t init_rows = local.initial_partition_rows > 0
 		? local.initial_partition_rows : 256u;
-	const uint32_t init_heap = TupleDataCollectionDefaultHeapCapacity(local.layout, init_rows);
+	const uint32_t init_heap = TupleDataCollectionDefaultHeapCapacity(local_layout, init_rows);
 	local_part.tdc_dp = TupleDataCollectionAllocate(ctx.dsa, init_rows,
-		local.layout->row_width, init_heap);
+		local_layout->row_width, init_heap);
 	auto *fresh_tdc = ResolveTdc(ctx.dsa, local_part.tdc_dp);
-	TupleDataCollectionInit(fresh_tdc, init_rows, local.layout->row_width,
-		global.layout_dp, init_heap);
+	TupleDataCollectionInit(fresh_tdc, init_rows, local_layout->row_width,
+		local_layout_dp, init_heap);
 	AggregateHashTable *fresh_aht = nullptr;
 	AllocAhtForTdc(ctx, local_part.tdc_dp, init_rows, &local_part.aht_dp, &fresh_aht);
 }
@@ -2399,7 +2866,8 @@ SinkCombineResultType
 PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 {
 	auto &global = static_cast<HashAggGlobalSinkState &>(input.global_state);
-	if (GetSingleDistinctCountAgg(global.layout))
+	const bool is_distinct = GetSingleDistinctCountAgg(global.layout);
+	if (is_distinct && global.layout->aggregate_count > 1)
 		return SinkCombineResultType::FINISHED;
 
 	if (input.partition_id == UINT32_MAX)
@@ -2411,13 +2879,23 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 		{
 			if (PipelineCancelRequestedEvery(ctx, idx))
 				return SinkCombineResultType::FINISHED;
-			auto &part = global.partitions[idx & global.payload->partition_mask];
+			const uint32_t global_idx = idx & global.payload->partition_mask;
+			auto &part = global.partitions[global_idx];
 			/* Allocation, spill I/O and ERROR are legal under LWLock, never
 			 * under a spinlock.  This path can overlap worker combines. */
 			LWLockAcquire(&part.mutex, LW_EXCLUSIVE);
 			PG_TRY();
 			{
-				CombineLocalPartition(ctx, global, part, local.local_partitions[idx], idx);
+				if (is_distinct)
+				{
+					HashAggPartition &lp = local.local_partitions[idx];
+					const auto *tdc = ResolveTdc(ctx.dsa, lp.tdc_dp);
+					if (tdc != nullptr)
+						CombineDistinctTdcIntoGlobal(ctx, global, global_idx, tdc);
+					ReleasePartitionBacking(ctx, lp);
+				}
+				else
+					CombineLocalPartition(ctx, global, part, local.local_partitions[idx], idx);
 			}
 			PG_CATCH();
 			{
@@ -2441,27 +2919,78 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 	{
 		/* Pre-size the global partition AHT once using the known total incoming
 		 * local rows so high-cardinality combine avoids repeated rehash waves. */
-		uint64_t total_incoming_rows = 0;
-		for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
+		if (is_distinct && global.distinct_partitions != nullptr &&
+			global.distinct_layout != nullptr)
 		{
-			if (!DsaPointerIsValid(registry[slot]))
-				continue;
-			auto *parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
-			const HashAggPartition &lp = parts[input.partition_id];
-			if (lp.segment_backed)
-				total_incoming_rows += lp.segment_row_count;
-			else if (const auto *ltdc = ResolveTdc(ctx.dsa, lp.tdc_dp); ltdc != nullptr)
-				total_incoming_rows += pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&ltdc->row_count));
+			uint64_t total_incoming_rows = 0;
+			uint64_t total_incoming_heap = 0;
+			for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
+			{
+				if (!DsaPointerIsValid(registry[slot]))
+					continue;
+				auto *parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
+				const HashAggPartition &lp = parts[input.partition_id];
+				if (const auto *ltdc = ResolveTdc(ctx.dsa, lp.tdc_dp); ltdc != nullptr)
+				{
+					total_incoming_rows += pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&ltdc->row_count));
+					total_incoming_heap += pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&ltdc->heap_used));
+				}
+			}
+			if (total_incoming_rows > 0)
+			{
+				HashAggPartition &distinct_part = global.distinct_partitions[input.partition_id];
+				TupleDataCollection *distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+				const uint32_t incoming_rows_u32 = static_cast<uint32_t>(
+					std::min<uint64_t>(total_incoming_rows, UINT32_MAX / 2u));
+				const uint32_t incoming_heap_u32 = static_cast<uint32_t>(
+					std::min<uint64_t>(total_incoming_heap, 128ULL * 1024ULL * 1024ULL));
+				if (distinct_tdc != nullptr &&
+					(static_cast<uint64_t>(pg_atomic_read_u32(&distinct_tdc->row_count)) + incoming_rows_u32 > distinct_tdc->row_capacity ||
+					 !TupleDataCollectionHasSpaceForAppend(distinct_tdc, incoming_heap_u32)))
+				{
+					GrowTdcForPartition(ctx, global.distinct_layout_dp, global.distinct_layout,
+						distinct_part, incoming_heap_u32, incoming_rows_u32);
+					distinct_tdc = ResolveTdc(ctx.dsa, distinct_part.tdc_dp);
+				}
+				if (distinct_tdc != nullptr)
+					ResizeAhtForTdc(ctx, distinct_part.tdc_dp, distinct_tdc,
+						global.distinct_layout, &distinct_part.aht_dp, incoming_rows_u32);
+				if (global.layout->column_count > 0)
+				{
+					TupleDataCollection *group_tdc = ResolveTdc(ctx.dsa, global_part.tdc_dp);
+					if (group_tdc != nullptr)
+					{
+						const uint32_t est_new_groups = std::min<uint32_t>(incoming_rows_u32, 1u << 20);
+						ResizeAhtForTdc(ctx, global_part.tdc_dp, group_tdc,
+							global.layout, &global_part.aht_dp, est_new_groups);
+					}
+				}
+			}
 		}
-		if (total_incoming_rows > 0 && global_part.segment_backed)
+		else if (!is_distinct)
 		{
-			AggregateHashTable *aht = ResolveAht(ctx.dsa, global_part.aht_dp);
-			const uint32_t desired_cap = ChooseCombineAhtCapacity(
-				ctx, global_part.segment_row_count + total_incoming_rows,
-				EffectiveWorkerCount(ctx));
-			if (aht != nullptr && desired_cap > aht->capacity)
-				GrowSegmentedAhtToCapacity(ctx, global_part, global_part.segment_row_count,
-					global.layout, desired_cap);
+			uint64_t total_incoming_rows = 0;
+			for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
+			{
+				if (!DsaPointerIsValid(registry[slot]))
+					continue;
+				auto *parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
+				const HashAggPartition &lp = parts[input.partition_id];
+				if (lp.segment_backed)
+					total_incoming_rows += lp.segment_row_count;
+				else if (const auto *ltdc = ResolveTdc(ctx.dsa, lp.tdc_dp); ltdc != nullptr)
+					total_incoming_rows += pg_atomic_read_u32(const_cast<pg_atomic_uint32 *>(&ltdc->row_count));
+			}
+			if (total_incoming_rows > 0 && global_part.segment_backed)
+			{
+				AggregateHashTable *aht = ResolveAht(ctx.dsa, global_part.aht_dp);
+				const uint32_t desired_cap = ChooseCombineAhtCapacity(
+					ctx, global_part.segment_row_count + total_incoming_rows,
+					EffectiveWorkerCount(ctx));
+				if (aht != nullptr && desired_cap > aht->capacity)
+					GrowSegmentedAhtToCapacity(ctx, global_part, global_part.segment_row_count,
+						global.layout, desired_cap);
+			}
 		}
 		for (uint32_t slot = 0; slot < global.payload->local_state_slot_count; ++slot)
 		{
@@ -2473,10 +3002,19 @@ PhysicalHashAggregate::Combine(ExecCtx &ctx, OperatorSinkCombineInput &input)
 			if (!DsaPointerIsValid(registry[slot]))
 				continue;
 			auto *parts = static_cast<HashAggPartition *>(dsa_get_address(ctx.dsa, registry[slot]));
-			CombineLocalPartition(ctx, global, global_part, parts[input.partition_id], input.partition_id);
+			if (is_distinct)
+			{
+				HashAggPartition &lp = parts[input.partition_id];
+				const auto *tdc = ResolveTdc(ctx.dsa, lp.tdc_dp);
+				if (tdc != nullptr)
+					CombineDistinctTdcIntoGlobal(ctx, global, input.partition_id, tdc);
+				ReleasePartitionBacking(ctx, lp);
+			}
+			else
+				CombineLocalPartition(ctx, global, global_part, parts[input.partition_id], input.partition_id);
 		}
 
-		if (!cancelled)
+		if (!cancelled && !is_distinct)
 		{
 			SealPublishHashAggGlobalTail(ctx, global_part);
 			SpillHashAggGlobalPartition(ctx, global_part, input.partition_id);
@@ -2514,6 +3052,42 @@ SinkFinalizeType
 PhysicalHashAggregate::Finalize(ExecCtx &ctx, GlobalSinkState &gstate)
 {
 	auto &global = static_cast<HashAggGlobalSinkState &>(gstate);
+	uint16_t distinct_agg_idx = UINT16_MAX;
+	if (GetSingleDistinctCountAgg(global.layout, &distinct_agg_idx) &&
+		global.layout->aggregate_count == 1 &&
+		global.layout->column_count == 0 &&
+		global.distinct_partitions != nullptr)
+	{
+		int64_t total_distinct = 0;
+		for (uint32_t part_idx = 0; part_idx < global.partition_count; ++part_idx)
+		{
+			const TupleDataCollection *dtdc = ResolveTdc(ctx.dsa,
+				global.distinct_partitions[part_idx].tdc_dp);
+			if (dtdc != nullptr)
+				total_distinct += pg_atomic_read_u32(
+					const_cast<pg_atomic_uint32 *>(&dtdc->row_count));
+		}
+		if (total_distinct > 0 ||
+			(global.payload != nullptr &&
+			 pg_atomic_read_u32(&global.payload->distinct_saw_input) != 0))
+		{
+			TupleDataCollection *out_tdc = ResolveTdc(global.dsa, global.partitions[0].tdc_dp);
+			if (out_tdc != nullptr)
+			{
+				uint8_t *row_ptr = nullptr;
+				if (pg_atomic_read_u32(&out_tdc->row_count) == 0)
+				{
+					const uint32_t row_idx = TupleDataCollectionAppendRow(out_tdc, &row_ptr);
+					if (row_idx == TDC_INVALID_ROW_INDEX || row_ptr == nullptr)
+						elog(ERROR, "pg_yaap: distinct aggregate output row allocation failed");
+				}
+				else
+					row_ptr = TupleDataCollectionGetRow(out_tdc, 0);
+				std::memcpy(row_ptr + global.layout->aggregates[distinct_agg_idx].offset,
+					&total_distinct, sizeof(total_distinct));
+			}
+		}
+	}
 	for (uint32_t part_idx = 0; part_idx < global.partition_count; ++part_idx)
 	{
 		if (PipelineCancelRequestedEvery(ctx, part_idx))

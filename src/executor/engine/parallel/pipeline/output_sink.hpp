@@ -35,6 +35,7 @@ public:
 	bool                    finalized = false;
 	uint16_t                n_sort_keys = 0;
 	uint64                  max_emit_rows = 0;
+	uint64                  skip_emit_rows = 0;
 	buffer::YaapSegmentedTdc segmented_writer;
 	bool                    segmented_writer_initialized = false;
 };

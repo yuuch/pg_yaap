@@ -1166,7 +1166,8 @@ AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
 									  const TupleDataCollection *src_tdc,
 									  uint32_t start_row,
 									  uint32_t count,
-									  const uint64_t *hashes)
+									  const uint64_t *hashes,
+									  uint8_t *inserted_out)
 {
 	Assert(aht != nullptr && tdc != nullptr && layout != nullptr && src_tdc != nullptr && hashes != nullptr);
 	const uint32_t mask = aht->capacity_mask;
@@ -1197,6 +1198,8 @@ AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
 					         errmsg("pg_yaap: AggregateHashTableCombineRowBatchFlat TDC full")));
 				CopyWholeAggregateRow(layout, has_strings, src_tdc, src_row, tdc, new_row);
 				e.value = PackEntry(our_salt, new_idx);
+				if (inserted_out != nullptr)
+					inserted_out[i] = 1;
 				done = true;
 				break;
 			}
@@ -1206,7 +1209,10 @@ AggregateHashTableCombineRowBatchFlat(AggregateHashTable *aht,
 				uint8_t *existing_ptr = TupleDataCollectionGetRow(tdc, existing_idx);
 				if (MatchGroupRow(layout, src_tdc, src_row, tdc, existing_ptr))
 				{
-					CombineAggregates(layout, existing_ptr, src_row, tdc, src_tdc);
+					if (layout->aggregate_count > 0)
+						CombineAggregates(layout, existing_ptr, src_row, tdc, src_tdc);
+					if (inserted_out != nullptr)
+						inserted_out[i] = 0;
 					done = true;
 					break;
 				}
@@ -1287,14 +1293,17 @@ AggregateHashTableCombineRowBatchSegmented(AggregateHashTable *aht,
 				TupleDataCollection *store = nullptr;
 				uint8_t *canonical_row = nullptr;
 
-				if (active_store != nullptr &&
-					pg_atomic_read_u32(&active_store->row_count) < active_store->row_capacity &&
-					(!has_strings || TupleDataCollectionHasSpaceForAppend(active_store, req_heap)))
+				if (active_store != nullptr)
 				{
-					const uint32_t seg_row_idx = TupleDataCollectionAppendRow(active_store, &canonical_row);
-					if (seg_row_idx != TDC_INVALID_ROW_INDEX)
+					const uint32_t cur_rows = pg_atomic_read_u32(&active_store->row_count);
+					if (cur_rows < active_store->row_capacity &&
+						(!has_strings || TupleDataCollectionHasSpaceForAppend(active_store, req_heap)))
 					{
-						handle = buffer::YaapSegmentedRowHandle{active_handle, seg_row_idx};
+						/* Global partition LWLock is held exclusively by combine;
+						 * avoid a per-row spinlock on active_store. */
+						pg_atomic_write_u32(&active_store->row_count, cur_rows + 1u);
+						canonical_row = TupleDataCollectionGetRow(active_store, cur_rows);
+						handle = buffer::YaapSegmentedRowHandle{active_handle, cur_rows};
 						store = active_store;
 						++segmented_tdc->row_count;
 					}
