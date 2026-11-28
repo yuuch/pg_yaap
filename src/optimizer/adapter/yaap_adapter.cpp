@@ -1272,7 +1272,9 @@ std::unique_ptr<Expression> RewriteToProducedBinding(LogicalOperator* input, std
         for (size_t idx = 0; idx < aggregate->groups.size(); ++idx) {
             if (ExpressionSemanticKey(aggregate->groups[idx].get()) == fingerprint) {
                 auto* source = aggregate->groups[idx].get();
-                auto* source_ref = static_cast<BoundColumnRefExpression*>(source);
+                auto* source_ref = (source != nullptr && source->type == ExpressionType::BOUND_COLUMN_REF)
+                    ? static_cast<BoundColumnRefExpression*>(source)
+                    : nullptr;
                 std::string table_name = source_ref ? source_ref->table_name : "group";
                 std::string column_name = idx < aggregate->group_names.size()
                     ? aggregate->group_names[idx]
@@ -2443,9 +2445,12 @@ std::unique_ptr<LogicalOperator> YaapAdapter::TranslatePGQuery(::Query* pg_query
     if (pg_query->setOperations != nullptr) {
         plan = TranslateSetOperation(pg_query, pg_query->setOperations);
     } else {
+        if (pg_query->jointree->fromlist == nullptr || list_length(pg_query->jointree->fromlist) == 0) {
+            throw std::runtime_error("Unsupported query shape: empty FROM list");
+        }
         plan = TranslateFromExprList(pg_query->jointree->fromlist);
         if (!plan) {
-             throw std::runtime_error("Failed to translate FROM list (e.g., empty FROM)");
+             throw std::runtime_error("Failed to translate FROM list");
         }
     }
 

@@ -131,9 +131,9 @@ if pg_has_llvm
   common_c_args += llvm_cppflags
 endif
 
-pg_yaap_link_args = pg_ldflags + pg_ldflags_sl + pg_libs + llvm_ldflags + llvm_libs
+pg_yaap_link_args = pg_ldflags_sl + llvm_ldflags + llvm_libs
 if host_machine.system() == 'darwin'
-  pg_yaap_link_args += ['-bundle_loader', join_paths(pg_bindir, 'postgres')]
+  pg_yaap_link_args += pg_ldflags + ['-bundle_loader', join_paths(pg_bindir, 'postgres')]
 endif
 
 pg_yaap = shared_module(
